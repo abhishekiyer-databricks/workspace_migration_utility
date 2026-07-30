@@ -1,0 +1,128 @@
+"""
+IdentityCollector — reads users, groups, service principals from THIS (source) workspace.
+
+Reads WORKSPACE SCIM (not account). Captures, per identity, the fields the target-side
+importer + classifier need:
+  • users: userName, displayName, emails, active, externalId, entitlements, roles, groups
+  • service_principals: applicationId, displayName, active, externalId, entitlements, roles
+  • groups: displayName, externalId, entitlements, roles, members (with type + ref), nesting
+
+`externalId` is preserved verbatim — it is the classifier's primary signal (present on
+Entra/SCIM-provisioned identities, absent on Databricks-managed/workspace-local ones).
+"""
+from __future__ import annotations
+
+from src.collectors.base_collector import BaseCollector
+from src.utils.helpers import safe_str
+
+# SCIM $ref substrings → member kind (API-reliable per the migrate review).
+_MEMBER_KIND = (("ServicePrincipals/", "service_principal"),
+                ("Groups/", "group"),
+                ("Users/", "user"))
+
+
+def _member_kind(member: dict) -> str:
+    ref = member.get("$ref", "") or ""
+    for needle, kind in _MEMBER_KIND:
+        if needle in ref:
+            return kind
+    # Fallback: infer from the display value when $ref is absent.
+    return "user" if "@" in safe_str(member.get("display")) else "unknown"
+
+
+def _entitlements(obj: dict) -> list:
+    return [e.get("value") for e in obj.get("entitlements", []) if e.get("value")]
+
+
+def _roles(obj: dict) -> list:
+    return [r.get("value") for r in obj.get("roles", []) if r.get("value")]
+
+
+class IdentityCollector(BaseCollector):
+    """Collects all three SCIM identity types. `object_type` is 'identity' (multi-type)."""
+
+    object_type = "identity"
+
+    def discover(self) -> list[dict]:
+        max_scim = int(getattr(self.config, "max_scim", 0) or 0)
+        out: list[dict] = []
+        out.extend(self._users(max_scim))
+        out.extend(self._service_principals(max_scim))
+        out.extend(self._groups(max_scim))
+        return out
+
+    # natural_key differs per identity type; override the base helper.
+    def natural_key(self, obj: dict) -> str:
+        t = obj.get("identity_type")
+        if t == "user":
+            return safe_str(obj.get("userName"))
+        if t == "service_principal":
+            return safe_str(obj.get("applicationId"))
+        if t == "group":
+            return safe_str(obj.get("displayName"))
+        return safe_str(obj.get("id"))
+
+    # ── per-type mappers ──────────────────────────────────────────────────
+    def _users(self, max_scim: int) -> list[dict]:
+        raw = self.client.get_scim("Users", max_items=max_scim)
+        return [self._map_user(u) for u in raw]
+
+    def _service_principals(self, max_scim: int) -> list[dict]:
+        raw = self.client.get_scim("ServicePrincipals", max_items=max_scim)
+        return [self._map_sp(s) for s in raw]
+
+    def _groups(self, max_scim: int) -> list[dict]:
+        raw = self.client.get_scim("Groups", max_items=max_scim)
+        return [self._map_group(g) for g in raw]
+
+    def _map_user(self, u: dict) -> dict:
+        emails = u.get("emails", []) or []
+        primary = next((e.get("value") for e in emails if e.get("primary")),
+                       emails[0].get("value") if emails else "")
+        return {
+            "identity_type": "user",
+            "id": safe_str(u.get("id")),                 # source SCIM id (stripped on import)
+            "userName": safe_str(u.get("userName")),
+            "displayName": safe_str(u.get("displayName")),
+            "email": safe_str(primary),
+            "active": u.get("active", True),
+            "externalId": safe_str(u.get("externalId")),  # classifier signal
+            "entitlements": _entitlements(u),
+            "roles": _roles(u),
+            "group_memberships": [g.get("display") for g in u.get("groups", [])],
+            "_raw": u,
+        }
+
+    def _map_sp(self, s: dict) -> dict:
+        return {
+            "identity_type": "service_principal",
+            "id": safe_str(s.get("id")),
+            "applicationId": safe_str(s.get("applicationId")),
+            "displayName": safe_str(s.get("displayName")),
+            "active": s.get("active", True),
+            "externalId": safe_str(s.get("externalId")),  # classifier signal
+            "entitlements": _entitlements(s),
+            "roles": _roles(s),
+            "_raw": s,
+        }
+
+    def _map_group(self, g: dict) -> dict:
+        members = []
+        for m in g.get("members", []) or []:
+            members.append({
+                "value": safe_str(m.get("value")),        # source id (remapped on import)
+                "display": safe_str(m.get("display")),    # name/email — the stable key
+                "kind": _member_kind(m),
+            })
+        return {
+            "identity_type": "group",
+            "id": safe_str(g.get("id")),
+            "displayName": safe_str(g.get("displayName")),
+            "externalId": safe_str(g.get("externalId")),  # classifier signal
+            "entitlements": _entitlements(g),
+            "roles": _roles(g),
+            "members": members,
+            "member_count": len(members),
+            "has_nested_groups": any(m["kind"] == "group" for m in members),
+            "_raw": g,
+        }

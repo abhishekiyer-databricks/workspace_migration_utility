@@ -1,0 +1,120 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 01 — Inventory (SOURCE side)
+# MAGIC Read-only enumeration + identity classification of the **source** workspace. Writes
+# MAGIC `inventory.{json,html,xlsx}` + `identity_classification.json` + `config_resolved.json`
+# MAGIC into the run's staging bundle. Does **not** mutate anything and does **not** talk to
+# MAGIC the target workspace.
+# MAGIC
+# MAGIC **Runs on the `source` side** (air-gapped model — see `plans/PLAN_0_master.md`).
+# MAGIC Run as a Job whose **run-as identity is a workspace-admin SP** on the source workspace.
+# MAGIC All config is via widgets (or job params).
+
+# COMMAND ----------
+
+# MAGIC %md ## Widgets  ( `role` MUST be **source** )
+
+# COMMAND ----------
+
+dbutils.widgets.dropdown("role", "source", ["source", "target"], "Role (must be source)")
+dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
+dbutils.widgets.text("source_staging_location", "", "Source staging (UC Volume path /Volumes/...)")
+dbutils.widgets.text("run_id", "", "Run id (blank = auto YYYYMMDD_HHMMSS)")
+dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
+dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
+dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
+dbutils.widgets.dropdown("verbose", "false", ["true", "false"], "Verbose API logging")
+
+# COMMAND ----------
+
+# MAGIC %md ## Bootstrap `src/` onto sys.path + install requirements
+
+# COMMAND ----------
+
+# MAGIC %pip install -q databricks-sdk openpyxl requests
+
+# COMMAND ----------
+
+import os
+import sys
+
+
+def _add_repo_root_to_syspath() -> str:
+    """Find the repo root (the dir containing `src/`) and prepend it to sys.path.
+
+    Tries several strategies because Databricks' cwd varies by runtime/compute:
+      1. the notebook's own path from the notebook context (most reliable),
+      2. the current working directory and its parents,
+      3. common Git-folder mount prefixes.
+    """
+    candidates = []
+
+    # 1. Derive from this notebook's workspace path via the notebook context.
+    try:
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        nb_path = ctx.notebookPath().get()  # e.g. /Repos/<user>/<repo>/notebooks/01_Inventory
+        repo_dir = os.path.dirname(os.path.dirname(nb_path))  # .../<repo>
+        candidates += [repo_dir, "/Workspace" + repo_dir]
+    except Exception:
+        pass
+
+    # 2. cwd and its parents.
+    here = os.getcwd()
+    candidates += [here, os.path.dirname(here), os.path.dirname(os.path.dirname(here))]
+
+    for cand in candidates:
+        if cand and os.path.isdir(os.path.join(cand, "src")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            return cand
+    raise RuntimeError(
+        "Could not locate the repo root (dir containing `src/`). Tried: "
+        + ", ".join(repr(c) for c in candidates)
+        + ". Ensure the whole Git folder (notebooks/ + src/) is connected."
+    )
+
+
+_REPO_ROOT = _add_repo_root_to_syspath()
+print(f"repo root on sys.path: {_REPO_ROOT}")
+
+from src.config.config_manager import Config, ROLE_SOURCE
+from src.auth.token_manager import build_client
+from src.exporters.artifact_writer import ArtifactWriter
+from src.collectors.inventory_runner import InventoryRunner
+from src.utils import logger as _logger
+
+# COMMAND ----------
+
+# MAGIC %md ## Build config + client (this workspace only)
+
+# COMMAND ----------
+
+cfg = Config.from_dbutils(dbutils, spark)  # reads role, staging, safety caps, toggles
+assert cfg.role == ROLE_SOURCE, f"This notebook must run with role=source (got {cfg.role!r})"
+
+client = build_client(cfg, dbutils=dbutils, spark=spark)  # context token for THIS workspace
+print(f"Source workspace : {cfg.ctx.workspace_url}")
+print(f"Run id           : {cfg.run_id}")
+print(f"Staging          : {cfg.output_path}")
+
+# COMMAND ----------
+
+# MAGIC %md ## Run inventory (read-only) → write reports to staging
+
+# COMMAND ----------
+
+aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
+_logger.set_log_file(os.path.join(aw.ensure_output_path(), "execution_export.log"))
+
+result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
+
+print("\n=== Inventory complete ===")
+for k, v in sorted(result["counts"].items()):
+    print(f"  {k:<22} {v:>6}")
+print("\nIdentity classification:", result["identity_summary"])
+if result["warnings"]:
+    print("\nWarnings:")
+    for w in result["warnings"]:
+        print("  -", w)
+print(f"\nArtifacts: {result['output_path']}")
+print("  inventory.json / inventory.html / inventory.xlsx / identity_classification.json")
