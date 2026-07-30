@@ -25,12 +25,14 @@ class GenieCollector(BaseCollector):
         )
         items = []
         for s in raw:
+            sid = safe_str(s.get("space_id") or s.get("id"))
             items.append({
-                "space_id": safe_str(s.get("space_id") or s.get("id")),
+                "space_id": sid,
                 "title": safe_str(s.get("title")),
                 "description": safe_str(s.get("description")),
                 "warehouse_id": safe_str(s.get("warehouse_id")),
                 "migratable": False,   # serialized_space not exportable → manual
+                "acl": self.fetch_acl("genie", sid),   # ACLs (Plan 1a §1)
                 "_raw": s,
             })
         return items

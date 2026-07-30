@@ -64,15 +64,18 @@ class ComputeCollector(BaseCollector):
             name = safe_str(c.get("cluster_name"))
             src = c.get("cluster_source", "")
             ephemeral = bool(_EPHEMERAL_CLUSTER.match(name)) or src in ("JOB", "PIPELINE", "MODELS")
+            if ephemeral:
+                # Job/DLT/model clusters are ephemeral and never migrated — omit entirely from
+                # inventory (only all-purpose clusters are relevant). (Plan 1a §8.)
+                continue
             items.append({
                 "compute_type": "cluster",
                 "cluster_id": safe_str(c.get("cluster_id")),
                 "cluster_name": name,
                 "cluster_source": safe_str(src),
-                "ephemeral": ephemeral,   # Export/Import exclude these (all-purpose only migrates)
                 "pinned": bool(c.get("pinned_by_user_name")),
                 "_natural_key": name,
-                "acl": None if ephemeral else self.fetch_acl("clusters", c.get("cluster_id")),
+                "acl": self.fetch_acl("clusters", c.get("cluster_id")),
                 "_raw": c,
             })
         return items

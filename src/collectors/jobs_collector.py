@@ -37,11 +37,19 @@ class JobsCollector(BaseCollector):
                 "creator_user_name": safe_str(j.get("creator_user_name")),
                 "run_as": settings.get("run_as") or settings.get("run_as_user_name"),
                 "has_owner_acl": self._has_owner(acl),
+                # DAB-deployed jobs carry settings.deployment.kind == "BUNDLE" → should be
+                # redeployed to the target via their bundle, not migrated by this tool (Plan 1a §4).
+                "deployed_by_dab": self._is_dab(settings),
                 "acl": acl,
                 "settings": settings,   # full spec (tasks, job_clusters, schedule, continuous)
                 "_raw": j,
             })
         return items
+
+    @staticmethod
+    def _is_dab(settings: dict) -> bool:
+        dep = settings.get("deployment") or {}
+        return safe_str(dep.get("kind")) == "BUNDLE"
 
     @staticmethod
     def _has_owner(acl) -> bool:

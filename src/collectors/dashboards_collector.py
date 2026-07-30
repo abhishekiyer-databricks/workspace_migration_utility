@@ -35,6 +35,7 @@ class DashboardsCollector(BaseCollector):
                 "warehouse_id": safe_str(full.get("warehouse_id")),
                 "parent_path": safe_str(full.get("parent_path")),
                 "serialized_dashboard": full.get("serialized_dashboard"),
+                "acl": self.fetch_acl("dashboards", did),   # ACLs (Plan 1a §1)
                 "_raw": d,
             })
         return items

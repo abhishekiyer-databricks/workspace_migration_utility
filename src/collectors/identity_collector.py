@@ -71,6 +71,24 @@ class IdentityCollector(BaseCollector):
         raw = self.client.get_scim("ServicePrincipals", max_items=max_scim)
         return [self._map_sp(s) for s in raw]
 
+    def _sp_has_secrets(self, scim_id: str) -> bool:
+        """Whether an SP has OAuth client secrets (workspace proxy; metadata only — never values).
+
+        Verified: GET /api/2.0/accounts/servicePrincipals/{SCIM_ID}/credentials/secrets works for
+        a workspace-admin and returns secret metadata (id/hash/status), never the value. Client
+        secrets CANNOT be migrated → flags the SP for manual secret recreation on target (Plan 1a §6).
+        Best-effort: any failure → False (never aborts the collector).
+        """
+        if not scim_id:
+            return False
+        try:
+            data = self.client.get(
+                f"api/2.0/accounts/servicePrincipals/{scim_id}/credentials/secrets")
+            return bool(data.get("secrets")) if isinstance(data, dict) else False
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("sp secrets check failed", scim_id=scim_id, error=str(exc))
+            return False
+
     def _groups(self, max_scim: int) -> list[dict]:
         raw = self.client.get_scim("Groups", max_items=max_scim)
         return [self._map_group(g) for g in raw]
@@ -94,15 +112,17 @@ class IdentityCollector(BaseCollector):
         }
 
     def _map_sp(self, s: dict) -> dict:
+        scim_id = safe_str(s.get("id"))
         return {
             "identity_type": "service_principal",
-            "id": safe_str(s.get("id")),
+            "id": scim_id,
             "applicationId": safe_str(s.get("applicationId")),
             "displayName": safe_str(s.get("displayName")),
             "active": s.get("active", True),
             "externalId": safe_str(s.get("externalId")),  # classifier signal
             "entitlements": _entitlements(s),
             "roles": _roles(s),
+            "has_secrets": self._sp_has_secrets(scim_id),  # OAuth secrets → manual on target
             "_raw": s,
         }
 

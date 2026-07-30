@@ -117,6 +117,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_managed",      "Managed By",    "badge_managed"),
         ("active",        "Active",        "badge_bool"),
         ("_entitlements", "Entitlements",  "plain"),
+        ("_has_secrets",  "Has Secrets",   "badge_bool"),
         ("id",            "SCIM ID",       "mono"),
     ],
     "notebooks": [
@@ -137,7 +138,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("display_name",      "Query Name",   "plain"),
         ("id",                "ID",           "mono"),
         ("owner_user_name",   "Owner",        "plain"),
-        ("lifecycle_state",   "State",        "badge_state"),
         ("warehouse_id",      "Warehouse ID", "mono"),
         ("update_time",       "Updated",      "iso_ts"),
     ],
@@ -145,6 +145,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("settings.name",     "Job Name",      "plain"),
         ("job_id",            "Job ID",        "mono"),
         ("_format",           "Format",        "badge_type"),
+        ("_deployed_by_dab",  "Deployed by DAB","badge_bool"),
         ("settings.schedule", "Schedule",      "schedule"),
         ("_run_as",           "Run As",        "plain"),
         ("_has_owner_acl",    "Owner ACL",     "badge_bool"),
@@ -156,7 +157,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("cluster_id",      "Cluster ID",      "mono"),
         ("state",           "State",           "badge_state"),
         ("cluster_source",  "Source",          "plain"),
-        ("_ephemeral",      "Ephemeral",       "badge_bool"),
         ("_pinned",         "Pinned",          "badge_bool"),
         ("spark_version",   "Spark Version",   "plain"),
         ("node_type_id",    "Node Type",       "plain"),
@@ -202,14 +202,15 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("cluster_size",      "Size",           "plain"),
         ("num_clusters",      "Clusters",       "plain"),
         ("auto_stop_mins",    "Auto-Stop (min)","plain"),
+        ("_acls",             "ACL Grants",     "plain"),
         ("creator_name",      "Creator",        "plain"),
     ],
     "sql_alerts": [
         ("display_name",      "Alert Name",   "plain"),
         ("id",                "ID",           "mono"),
         ("owner_user_name",   "Owner",        "plain"),
-        ("lifecycle_state",   "State",        "badge_state"),
         ("parent_path",       "Parent Path",  "path"),
+        ("_acls",             "ACL Grants",   "plain"),
         ("create_time",       "Created",      "iso_ts"),
     ],
     "sql_dashboards": [
@@ -217,12 +218,14 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("id",                "ID",             "mono"),
         ("user.name",         "Owner",          "plain"),
         ("parent",            "Parent",         "path"),
+        ("_acls",             "ACL Grants",     "plain"),
         ("updated_at",        "Updated",        "iso_ts"),
     ],
     "dlt_pipelines": [
         ("name",              "Pipeline Name",  "plain"),
         ("pipeline_id",       "Pipeline ID",    "mono"),
         ("state",             "State",          "badge_state"),
+        ("_deployed_by_dab",  "Deployed by DAB","badge_bool"),
         ("cluster_label",     "Cluster",        "plain"),
         ("creator_user_name", "Creator",        "plain"),
         ("continuous",        "Continuous",     "badge_bool"),
@@ -232,6 +235,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("display_name",      "Dashboard Name", "plain"),
         ("dashboard_id",      "Dashboard ID",   "mono"),
         ("lifecycle_state",   "State",          "badge_state"),
+        ("_acls",             "ACL Grants",     "plain"),
         ("create_time",       "Created",        "iso_ts"),
         ("update_time",       "Updated",        "iso_ts"),
     ],
@@ -241,6 +245,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("description",       "Description",    "trunc"),
         ("warehouse_id",      "Warehouse ID",   "mono"),
         ("_migratable",       "Auto-Migratable","badge_bool"),
+        ("_acls",             "ACL Grants",     "plain"),
         ("created_timestamp", "Created",        "epoch_ms"),
     ],
     "serving_endpoints": [
@@ -448,7 +453,8 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         for i in _by(identity, "identity_type", "user")]
     data["service_principals"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),
-               _managed=_sp_managed(i.get("classification")))
+               _managed=_sp_managed(i.get("classification")),
+               _has_secrets=bool(i.get("has_secrets")))
         for i in _by(identity, "identity_type", "service_principal")]
     data["groups"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),
@@ -466,8 +472,9 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         _merge(w, _acls=_acl_count(w)) for w in ws if w.get("object_type") == "REPO"]
 
     # ── Compute → clusters / instance_pools / cluster_policies ───────────
+    # (Ephemeral job/DLT/model clusters are dropped by the collector — Plan 1a §8.)
     data["clusters"] = [
-        _merge(c, _ephemeral=c.get("ephemeral"), _pinned=c.get("pinned"), _acls=_acl_count(c))
+        _merge(c, _pinned=bool(c.get("pinned")), _acls=_acl_count(c))
         for c in _by(compute, "compute_type", "cluster")]
     data["instance_pools"] = [
         _merge(c, _acls=_acl_count(c)) for c in _by(compute, "compute_type", "instance_pool")]
@@ -476,24 +483,28 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
     # ── Jobs / DLT / dashboards / genie ──────────────────────────────────
     data["jobs"] = [
-        _merge(j, _format=j.get("format"), _has_owner_acl=j.get("has_owner_acl"),
-               _run_as=_run_as_str(j.get("run_as")), _acls=_acl_count(j))
+        _merge(j, _format=j.get("format"), _has_owner_acl=bool(j.get("has_owner_acl")),
+               _run_as=_run_as_str(j.get("run_as")), _acls=_acl_count(j),
+               _deployed_by_dab=bool(j.get("deployed_by_dab")))
         for j in objects_by_type.get("job", []) or []]
     data["dlt_pipelines"] = [
-        _merge(p, _acls=_acl_count(p)) for p in objects_by_type.get("dlt_pipeline", []) or []]
+        _merge(p, _acls=_acl_count(p), _deployed_by_dab=bool(p.get("deployed_by_dab")))
+        for p in objects_by_type.get("dlt_pipeline", []) or []]
     data["lakeview_dashboards"] = [
-        _merge(d, warehouse_id=d.get("warehouse_id"), parent_path=d.get("parent_path"))
+        _merge(d, warehouse_id=d.get("warehouse_id"), parent_path=d.get("parent_path"),
+               _acls=_acl_count(d))
         for d in objects_by_type.get("lakeview_dashboard", []) or []]
     data["genie_spaces"] = [
-        _merge(g, warehouse_id=g.get("warehouse_id"), _migratable=g.get("migratable"))
+        _merge(g, warehouse_id=g.get("warehouse_id"), _migratable=bool(g.get("migratable")),
+               _acls=_acl_count(g))
         for g in objects_by_type.get("genie_space", []) or []]
 
     # ── SQL → warehouses / legacy queries / alerts / dashboards ──────────
     data["sql_warehouses"] = [
         _merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "warehouse")]
-    data["sql_queries"] = [_merge(s) for s in _by(sql, "sql_type", "legacy_query")]
-    data["sql_alerts"] = [_merge(s) for s in _by(sql, "sql_type", "legacy_alert")]
-    data["sql_dashboards"] = [_merge(s) for s in _by(sql, "sql_type", "legacy_dashboard")]
+    data["sql_queries"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_query")]
+    data["sql_alerts"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_alert")]
+    data["sql_dashboards"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_dashboard")]
 
     # ── Serving (split agent vs model-serving by task in _resolve_items) ─
     data["serving_endpoints"] = [
@@ -571,8 +582,9 @@ def _flatten_acls(objects_by_type: Dict[str, List[dict]]) -> List[dict]:
     def _obj_name(rec: dict) -> str:
         return safe_str_local(
             rec.get("cluster_name") or rec.get("instance_pool_name") or rec.get("name")
-            or rec.get("path") or rec.get("displayName")
-            or (rec.get("settings") or {}).get("name") or rec.get("job_id"))
+            or rec.get("title") or rec.get("display_name") or rec.get("path")
+            or rec.get("displayName") or (rec.get("settings") or {}).get("name")
+            or rec.get("job_id"))
 
     def _emit_object_acl(otype_label: str, rec: dict):
         for entry in rec.get("acl") or []:
@@ -596,9 +608,14 @@ def _flatten_acls(objects_by_type: Dict[str, List[dict]]) -> List[dict]:
         _emit_object_acl(c.get("compute_type", "compute"), c)
     for s in objects_by_type.get("sql", []) or []:
         if s.get("acl"):
-            _emit_object_acl("sql_warehouse", s)
+            # warehouse / legacy_query / legacy_alert / legacy_dashboard
+            _emit_object_acl(safe_str_local(s.get("sql_type")) or "sql", s)
     for p in objects_by_type.get("dlt_pipeline", []) or []:
         _emit_object_acl("dlt_pipeline", p)
+    for d in objects_by_type.get("lakeview_dashboard", []) or []:
+        _emit_object_acl("lakeview_dashboard", d)
+    for g in objects_by_type.get("genie_space", []) or []:
+        _emit_object_acl("genie_space", g)
     for e in objects_by_type.get("serving_endpoint", []) or []:
         _emit_object_acl("serving_endpoint", e)
     for w in objects_by_type.get("workspace_object", []) or []:

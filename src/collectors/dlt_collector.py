@@ -34,6 +34,8 @@ class DltCollector(BaseCollector):
                 "pipeline_id": pid,
                 "name": safe_str(p.get("name")),
                 "acl": self.fetch_acl("pipelines", pid),
+                # DAB-deployed pipelines carry spec.deployment.kind == "BUNDLE" (Plan 1a §4).
+                "deployed_by_dab": safe_str((spec.get("deployment") or {}).get("kind")) == "BUNDLE",
                 "spec": spec,
                 "_raw": p,
             })

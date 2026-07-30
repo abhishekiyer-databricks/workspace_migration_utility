@@ -78,6 +78,7 @@ class MiscCollector(BaseCollector):
                     "library": lib,
                     "_natural_key": f"{cid}:{json.dumps(lib, sort_keys=True)}",
                     "status": safe_str(ls.get("status")),
+                    "is_library_for_all_clusters": bool(ls.get("is_library_for_all_clusters", False)),
                 })
         return items
 

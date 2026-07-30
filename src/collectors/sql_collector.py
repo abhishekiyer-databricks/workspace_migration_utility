@@ -17,8 +17,11 @@ class SqlCollector(BaseCollector):
     def natural_key(self, obj: dict) -> str:
         return safe_str(obj.get("_natural_key"))
 
-    # endpoint segment -> singular sql_type label
-    _LEGACY = {"queries": "legacy_query", "alerts": "legacy_alert", "dashboards": "legacy_dashboard"}
+    # endpoint segment -> (singular sql_type label, permissions-API object type)
+    # permissions object types verified live: queries / alerts / dashboards (Plan 1a §1).
+    _LEGACY = {"queries": ("legacy_query", "queries"),
+               "alerts": ("legacy_alert", "alerts"),
+               "dashboards": ("legacy_dashboard", "dashboards")}
 
     def discover(self) -> list[dict]:
         out: list[dict] = []
@@ -56,14 +59,17 @@ class SqlCollector(BaseCollector):
             else:
                 self.log.warning("legacy sql fetch failed", kind=kind, error=str(exc))
             return []
+        sql_type, perm_type = self._LEGACY[kind]
         items = []
         for o in raw:
             name = safe_str(o.get("name") or o.get("title"))
+            oid = safe_str(o.get("id"))
             items.append({
-                "sql_type": self._LEGACY[kind],   # legacy_query / legacy_alert / legacy_dashboard
-                "id": safe_str(o.get("id")),
+                "sql_type": sql_type,   # legacy_query / legacy_alert / legacy_dashboard
+                "id": oid,
                 "name": name,
-                "_natural_key": name or safe_str(o.get("id")),
+                "_natural_key": name or oid,
+                "acl": self.fetch_acl(perm_type, oid),   # ACLs (Plan 1a §1)
                 "_raw": o,
             })
         return items
