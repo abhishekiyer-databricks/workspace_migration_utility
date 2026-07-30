@@ -1,10 +1,9 @@
 """
 GenieCollector — Genie spaces (SOURCE workspace).
 
-Metadata only: `serialized_space` is an internal protobuf NOT exposed by GET, so auto-create
-is impossible → import emits manual-recreation instructions (master §6). We capture title,
-description, warehouse_id (for target warehouse remap) and the backing Lakeview dashboard's
-serialized content for best-effort manual recreation. natural_key = title.
+Captures title, description, warehouse_id (for target warehouse remap) and ACLs. natural_key
+= title. (Migration approach for Genie is being defined with the customer — no migratability
+flag is asserted here.)
 """
 from __future__ import annotations
 
@@ -31,7 +30,6 @@ class GenieCollector(BaseCollector):
                 "title": safe_str(s.get("title")),
                 "description": safe_str(s.get("description")),
                 "warehouse_id": safe_str(s.get("warehouse_id")),
-                "migratable": False,   # serialized_space not exportable → manual
                 "acl": self.fetch_acl("genie", sid),   # ACLs (Plan 1a §1)
                 "_raw": s,
             })

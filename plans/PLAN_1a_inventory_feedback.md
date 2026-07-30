@@ -97,3 +97,46 @@ provide the process.** Leave Genie's flag/handling unchanged until that process 
 
 ## Out of scope for 1a
 Genie automation (item 9, pending customer process); any target-side/import work.
+
+---
+
+# Plan 1a — round 3 (fvm1 review)
+
+Customer ran on fvm1 (`adb-7405612178414773`) and raised 7 more points + an "ACL on every
+page" ask. Verified live on fvm1.
+
+1. **Multi- vs single-task jobs (BUG).** The Jobs API returns `format=MULTI_TASK` even for
+   single-task jobs, so `[dev abhishek_iyer] jb_customer_orders_join` (1 task) showed as multi.
+   FIX: derive an honest `job_type` from the actual **task count** (`SINGLE_TASK` if 1 task,
+   `MULTI_TASK` if >1). Jobs card now shows **Type** (from task count) + **Tasks** count; raw
+   `format` kept in data for fidelity.
+2. **Model serving = 0.** Correct — fvm1 has only 22 `databricks-*` platform-managed foundation
+   model endpoints, which we deliberately skip (not user assets). No user serving endpoints
+   exist. No change.
+3. **SP CAN_USE/CAN_MANAGE permissions.** Not captured, and correctly so: SPs are NOT
+   object-permission targets — `/api/2.0/permissions/service-principals/{id}` returns
+   ENDPOINT_NOT_FOUND (verified fvm1 + fvm2). SP access = its SCIM entitlements/roles (shown)
+   + its appearances as a principal in the Object Permissions sheet. No change.
+4. **Notebook language.** We capture the API's `language` verbatim (PYTHON/SCALA/SQL/R). fvm1
+   happens to have only PYTHON notebooks, so only PYTHON showed. The column already handles all
+   languages (badge_lang formats PYTHON/SCALA/SQL/R). No change.
+5. **Workspace file ACLs = 0 (BUG).** `_object_acl` mapped only NOTEBOOK/DIRECTORY, missing
+   FILE. Files DO have permissions (`/api/2.0/permissions/files/{id}` → 200, verified). FIX:
+   added FILE→files. (Seeded 2 file ACLs on fvm1 for the next run.)
+6. **Jobs "Owner ACL".** Every job always has an IS_OWNER grant, so the column was always Yes —
+   meaningless. REMOVED the Owner ACL column.
+7. **Genie Auto-Migratable.** Removed the migratability flag/column entirely (collector no longer
+   asserts `migratable`; card has no Auto-Migratable column). Genie still appears as a card in
+   HTML + Excel; migration approach TBD with customer.
+
+**"ACL on every page" audit (customer ask).** Added ACL Grants column to SQL Queries and Apps
+(both support permissions — verified 200). Cards that legitimately have NO object ACL (flagged):
+users/groups/service_principals (principals, not targets), cluster_libraries + global_init_scripts
++ workspace_conf + ip_access_lists (admin/global settings — no per-object ACL; GIS perm returns
+400), lakebase_projects (no perms endpoint), and Object Permissions itself (it IS the ACL list).
+
+**Seeding on fvm1 (for the customer's next run):** created a global init script, a cluster
+library (pandas on the all-purpose cluster), a SQL query + SQL alert, and 2 workspace-file ACLs.
+**AKV secret scope + agent endpoint could NOT be created via REST** (AKV needs a userAADToken
+from the UI flow; agent endpoint needs a served model) — customer to create via UI. IP access
+list also blocked (would lock out the caller's IP).

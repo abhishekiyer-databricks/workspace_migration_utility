@@ -30,10 +30,18 @@ class JobsCollector(BaseCollector):
             settings = j.get("settings", {}) or {}
             job_id = safe_str(j.get("job_id"))
             acl = self.fetch_acl("jobs", job_id)
+            # The API's `format` is unreliable — modern jobs report MULTI_TASK even with a single
+            # task. The true signal is the task count, so derive an honest type from it (point 1).
+            task_count = len(settings.get("tasks", []) or [])
+            api_format = safe_str(settings.get("format"))
+            derived = "SINGLE_TASK" if task_count == 1 else (
+                "MULTI_TASK" if task_count > 1 else api_format)
             items.append({
                 "job_id": job_id,
                 "name": safe_str(settings.get("name")),
-                "format": safe_str(settings.get("format")),   # SINGLE_TASK | MULTI_TASK
+                "format": api_format,                 # raw API value (kept for fidelity)
+                "task_count": task_count,
+                "job_type": derived,                  # honest type from task count
                 "creator_user_name": safe_str(j.get("creator_user_name")),
                 "run_as": settings.get("run_as") or settings.get("run_as_user_name"),
                 "has_owner_acl": self._has_owner(acl),

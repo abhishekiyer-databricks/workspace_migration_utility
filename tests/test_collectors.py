@@ -102,13 +102,19 @@ def test_jobs_multitask():
         {"job_id": "j1", "settings": {"name": "nightly", "format": "MULTI_TASK",
                                       "tasks": [{"task_key": "t"}]}},
         {"job_id": "j2", "settings": {"name": "bundle-job", "format": "MULTI_TASK",
-                                      "deployment": {"kind": "BUNDLE"}}}]}
+                                      "deployment": {"kind": "BUNDLE"}}},
+        {"job_id": "j3", "settings": {"name": "real-multi", "format": "MULTI_TASK",
+                                      "tasks": [{"task_key": "a"}, {"task_key": "b"}]}}]}
     gt = {"api/2.0/permissions/jobs/j1": {"access_control_list": [
               {"all_permissions": [{"permission_level": "IS_OWNER"}]}]},
-          "api/2.0/permissions/jobs/j2": {"access_control_list": []}}
+          "api/2.0/permissions/jobs/j2": {"access_control_list": []},
+          "api/2.0/permissions/jobs/j3": {"access_control_list": []}}
     objs = _run_ok(JobsCollector(FakeClient(get_table=gt, paginated_table=pag), _cfg()))
     byname = {o["name"]: o for o in objs}
-    assert byname["nightly"]["format"] == "MULTI_TASK" and byname["nightly"]["has_owner_acl"]
+    # nightly has 1 task → honest job_type SINGLE_TASK even though the API says MULTI_TASK (point 1).
+    assert byname["nightly"]["format"] == "MULTI_TASK"
+    assert byname["nightly"]["task_count"] == 1 and byname["nightly"]["job_type"] == "SINGLE_TASK"
+    assert byname["real-multi"]["task_count"] == 2 and byname["real-multi"]["job_type"] == "MULTI_TASK"
     # DAB detection (Plan 1a §4).
     assert byname["nightly"]["deployed_by_dab"] is False
     assert byname["bundle-job"]["deployed_by_dab"] is True
@@ -149,7 +155,7 @@ def test_dlt_dashboards_genie_serving():
     assert _run_ok(DltCollector(c, _cfg()))[0]["spec"]["name"] == "bronze"
     assert _run_ok(DashboardsCollector(c, _cfg()))[0]["serialized_dashboard"] == "{}"
     g = _run_ok(GenieCollector(c, _cfg()))[0]
-    assert g["migratable"] is False and g["warehouse_id"] == "w1"
+    assert g["warehouse_id"] == "w1" and "migratable" not in g  # no migratability flag asserted
     serv = _run_ok(ServingCollector(c, _cfg()))
     assert [o["name"] for o in serv] == ["my-ep"]
 
@@ -188,6 +194,7 @@ def test_workspace_special_paths_and_git_folders():
         if p == "/Users/a@x.com":
             return {"objects": [
                 {"path": "/Users/a@x.com/nb", "object_type": "NOTEBOOK", "language": "PYTHON", "object_id": "30"},
+                {"path": "/Users/a@x.com/data.csv", "object_type": "FILE", "object_id": "32"},
                 {"path": "/Users/a@x.com/user-repo", "object_type": "DIRECTORY", "object_id": "31",
                  "directory_info": {"is_git_folder": True}}]}
         return {"objects": []}
@@ -197,6 +204,9 @@ def test_workspace_special_paths_and_git_folders():
           "api/2.0/permissions/directories/3": {"access_control_list": []},
           "api/2.0/permissions/notebooks/10": {"access_control_list": []},
           "api/2.0/permissions/notebooks/30": {"access_control_list": []},
+          # FILE objects DO have permissions (point 5 fix).
+          "api/2.0/permissions/files/32": {"access_control_list": [
+              {"group_name": "eng", "all_permissions": [{"permission_level": "CAN_READ"}]}]},
           # per-git-folder detail (list API returns empty on purpose)
           "api/2.0/repos/21": {"id": "21", "path": "/Repos/a@x.com/legacy-repo",
                                "url": "https://g/legacy", "provider": "gitHub", "branch": "main",
@@ -217,6 +227,9 @@ def test_workspace_special_paths_and_git_folders():
     assert {r["path"] for r in repos} == {"/Repos/a@x.com/legacy-repo", "/Users/a@x.com/user-repo"}
     assert all(r["url"] and r["provider"] and r["branch"] and r["head_commit_id"] for r in repos)
     assert next(o for o in objs if o["path"] == "/Users/a@x.com")["is_user_root"] is True
+    # FILE ACLs are now fetched (point 5).
+    f = next(o for o in objs if o["path"] == "/Users/a@x.com/data.csv")
+    assert f["acl"] and f["acl"][0]["group_name"] == "eng"
 
 
 def test_apps_and_lakebase_inventory_only():

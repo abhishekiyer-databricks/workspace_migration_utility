@@ -139,16 +139,17 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("id",                "ID",           "mono"),
         ("owner_user_name",   "Owner",        "plain"),
         ("warehouse_id",      "Warehouse ID", "mono"),
+        ("_acls",             "ACL Grants",   "plain"),
         ("update_time",       "Updated",      "iso_ts"),
     ],
     "jobs": [
         ("settings.name",     "Job Name",      "plain"),
         ("job_id",            "Job ID",        "mono"),
-        ("_format",           "Format",        "badge_type"),
+        ("_job_type",         "Type",          "badge_type"),
+        ("_task_count",       "Tasks",         "plain"),
         ("_deployed_by_dab",  "Deployed by DAB","badge_bool"),
         ("settings.schedule", "Schedule",      "schedule"),
         ("_run_as",           "Run As",        "plain"),
-        ("_has_owner_acl",    "Owner ACL",     "badge_bool"),
         ("_acls",             "ACL Grants",    "plain"),
         ("creator_user_name", "Creator",       "plain"),
     ],
@@ -244,7 +245,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("space_id",          "Space ID",       "mono"),
         ("description",       "Description",    "trunc"),
         ("warehouse_id",      "Warehouse ID",   "mono"),
-        ("_migratable",       "Auto-Migratable","badge_bool"),
         ("_acls",             "ACL Grants",     "plain"),
         ("created_timestamp", "Created",        "epoch_ms"),
     ],
@@ -286,6 +286,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("app_status.state",  "State",          "badge_state"),
         ("creator",           "Creator",        "plain"),
         ("_migratable",       "Auto-Migratable","badge_bool"),
+        ("_acls",             "ACL Grants",     "plain"),
         ("url",               "URL",            "url_link"),
     ],
     "lakebase_projects": [
@@ -483,7 +484,7 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
     # ── Jobs / DLT / dashboards / genie ──────────────────────────────────
     data["jobs"] = [
-        _merge(j, _format=j.get("format"), _has_owner_acl=bool(j.get("has_owner_acl")),
+        _merge(j, _job_type=j.get("job_type"), _task_count=j.get("task_count"),
                _run_as=_run_as_str(j.get("run_as")), _acls=_acl_count(j),
                _deployed_by_dab=bool(j.get("deployed_by_dab")))
         for j in objects_by_type.get("job", []) or []]
@@ -495,8 +496,7 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
                _acls=_acl_count(d))
         for d in objects_by_type.get("lakeview_dashboard", []) or []]
     data["genie_spaces"] = [
-        _merge(g, warehouse_id=g.get("warehouse_id"), _migratable=bool(g.get("migratable")),
-               _acls=_acl_count(g))
+        _merge(g, warehouse_id=g.get("warehouse_id"), _acls=_acl_count(g))
         for g in objects_by_type.get("genie_space", []) or []]
 
     # ── SQL → warehouses / legacy queries / alerts / dashboards ──────────
@@ -520,7 +520,7 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
     # ── Apps / Lakebase (inventory-only, migration manual) ───────────────
     data["apps"] = [
-        _merge(a, _migratable=a.get("migratable"))
+        _merge(a, _migratable=a.get("migratable"), _acls=_acl_count(a))
         for a in objects_by_type.get("app", []) or []]
     data["lakebase_projects"] = [
         _merge(p, _migratable=p.get("migratable"))
@@ -618,6 +618,8 @@ def _flatten_acls(objects_by_type: Dict[str, List[dict]]) -> List[dict]:
         _emit_object_acl("genie_space", g)
     for e in objects_by_type.get("serving_endpoint", []) or []:
         _emit_object_acl("serving_endpoint", e)
+    for a in objects_by_type.get("app", []) or []:
+        _emit_object_acl("app", a)
     for w in objects_by_type.get("workspace_object", []) or []:
         if w.get("acl"):
             _emit_object_acl(w.get("object_type", "workspace_object").lower(), w)

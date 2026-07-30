@@ -59,6 +59,10 @@ class BaseCollector(ABC):
     def run(self) -> list[dict]:
         """discover → enrich → validate → tag natural keys. Records errors; never raises."""
         t0 = time.time()
+        # The client's `warnings` list is SHARED across all collectors; snapshot its length so
+        # this collector only attributes warnings raised DURING its own run (else one truncation
+        # warning gets duplicated onto every collector's stats).
+        warn_start = len(getattr(self.client, "warnings", []))
         try:
             raw = self.discover()
             self.log.info("discovered", object_type=self.object_type, count=len(raw))
@@ -71,8 +75,8 @@ class BaseCollector(ABC):
             self._objects = []
         finally:
             self._elapsed = time.time() - t0
-        # Surface any client-side pagination-truncation warnings into this collector's errors.
-        for w in getattr(self.client, "warnings", []):
+        # Surface only the client-side warnings raised during THIS collector's run.
+        for w in getattr(self.client, "warnings", [])[warn_start:]:
             if w not in self._errors:
                 self._errors.append(f"INCOMPLETE — {w}")
         return self._objects

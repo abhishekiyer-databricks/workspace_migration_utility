@@ -66,8 +66,9 @@ def _objects_by_type() -> dict:
                       "provider": "gitHub", "branch": "main", "head_commit_id": "abcdef123456"}},
         ],
         "job": [
-            {"job_id": "j1", "name": "nightly", "format": "MULTI_TASK", "has_owner_acl": True,
-             "run_as": {"service_principal_name": "app-dbx"}, "deployed_by_dab": True, "acl": _ACL,
+            {"job_id": "j1", "name": "nightly", "format": "MULTI_TASK", "job_type": "MULTI_TASK",
+             "task_count": 3, "run_as": {"service_principal_name": "app-dbx"},
+             "deployed_by_dab": True, "acl": _ACL,
              "settings": {"name": "nightly", "schedule": {"quartz_cron_expression": "0 0 * * *",
                                                           "timezone_id": "UTC"}},
              "_raw": {"job_id": "j1", "creator_user_name": "alice@corp.com",
@@ -104,8 +105,7 @@ def _objects_by_type() -> dict:
                       "create_time": "2026-01-01T00:00:00", "update_time": "2026-01-02T00:00:00"}},
         ],
         "genie_space": [
-            {"space_id": "gs1", "title": "Sales Genie", "warehouse_id": "w1", "migratable": False,
-             "acl": _ACL,
+            {"space_id": "gs1", "title": "Sales Genie", "warehouse_id": "w1", "acl": _ACL,
              "_raw": {"space_id": "gs1", "title": "Sales Genie", "description": "ask sales",
                       "warehouse_id": "w1", "created_timestamp": 1700000000000}},
         ],
@@ -127,7 +127,7 @@ def _objects_by_type() -> dict:
         ],
         "app": [
             {"name": "my-app", "description": "demo app", "creator": "alice@corp.com",
-             "url": "https://app", "migratable": False,
+             "url": "https://app", "migratable": False, "acl": _ACL,
              "_raw": {"name": "my-app", "description": "demo app", "creator": "alice@corp.com",
                       "app_status": {"state": "RUNNING"}, "url": "https://app"}},
         ],

@@ -29,12 +29,14 @@ class AppsCollector(BaseCollector):
             return []
         items = []
         for a in raw:
+            name = safe_str(a.get("name"))
             items.append({
-                "name": safe_str(a.get("name")),
+                "name": name,
                 "description": safe_str(a.get("description")),
                 "creator": safe_str(a.get("creator")),
                 "url": safe_str(a.get("url")),
                 "migratable": False,   # v1: manual (app source + resource bindings)
+                "acl": self.fetch_acl("apps", name),   # apps support permissions (verified live)
                 "_raw": a,
             })
         return items

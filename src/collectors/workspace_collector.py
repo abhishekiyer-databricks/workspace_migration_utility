@@ -100,7 +100,9 @@ class WorkspaceCollector(BaseCollector):
 
     def _object_acl(self, otype: str, object_id) -> list | None:
         # /Shared ACL is immutable on target (handled at import); still inventory others.
-        perm_type = {"NOTEBOOK": "notebooks", "DIRECTORY": "directories"}.get(otype)
+        # FILE objects DO have permissions (/api/2.0/permissions/files/{id}) — verified live.
+        perm_type = {"NOTEBOOK": "notebooks", "DIRECTORY": "directories",
+                     "FILE": "files"}.get(otype)
         if not perm_type:
             return None
         return self.fetch_acl(perm_type, object_id)
