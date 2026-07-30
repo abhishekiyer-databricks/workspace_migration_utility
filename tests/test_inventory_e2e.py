@@ -32,7 +32,6 @@ def _client() -> FakeClient:
         "api/2.0/serving-endpoints": {"endpoints": []},
         "api/2.0/global-init-scripts": {"scripts": []},
         "api/2.0/libraries/all-cluster-statuses": {"statuses": []},
-        "api/2.0/ip-access-lists": {"ip_access_lists": []},
         "api/2.0/workspace/list": ws_list,
         "api/2.0/workspace-conf": lambda p: {p["keys"]: "true"},
     }

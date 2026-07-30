@@ -42,9 +42,11 @@ customer.
   `verbose`. Target side: `target_staging_location`, `dry_run`, `account_id`, transform options.
 - Per-asset toggles (all default TRUE; flip to FALSE to skip), set on both sides. Same values
   usable as Job params. **No credentials in any widget** (run-as SP context token).
-- Asset scope decisions: INCLUDE legacy SQL (queries/alerts/dashboards), IP access lists,
+- Asset scope decisions: INCLUDE legacy SQL (queries/alerts/dashboards),
   workspace conf, Excel output, global init scripts, cluster libraries. EXCLUDE PATs/tokens
-  (disabled). REMOVE UC assets (registered models, connections, delta sharing, clean rooms) +
+  (disabled) and **IP access lists** (account-level in this customer — configured in the
+  account console / account API; a workspace-scoped tool can't see or migrate them → customer/
+  account-admin manual task). REMOVE UC assets (registered models, connections, delta sharing, clean rooms) +
   MLflow. Apps / Lakebase / Vector Search = inventory-only, migration flagged manual for v1.
 
 ## Account-level preflight (decided) — VERIFY only, run once before workspace #1
@@ -155,7 +157,7 @@ Identity (users → SPs → groups incl. nested + entitlements) → Compute (poo
 clusters) → Workspace content (dirs → notebooks → files → repos → ACLs) → Secrets (scopes +
 ACLs; values manual) → Jobs → SQL (warehouses, queries, alerts, legacy dashboards) → DLT →
 AI/BI dashboards → Genie (manual) → model serving → misc (global init scripts, cluster
-libraries, IP access lists, workspace conf). PATs excluded.
+libraries, workspace conf). PATs + IP access lists (account-level) excluded.
 
 ## Identity model (decided — the core of this utility)
 

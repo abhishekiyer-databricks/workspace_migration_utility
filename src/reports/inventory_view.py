@@ -55,7 +55,6 @@ _ICONS = {
     "repos":              ("📦",  "#1d4ed8"),
     "apps":               ("📱",  "#2563eb"),
     "lakebase_projects":  ("🐘",  "#336791"),
-    "ip_access_lists":    ("🛡️",  "#0f766e"),
     "workspace_conf":     ("🔧",  "#475569"),
     "object_permissions": ("🔐",  "#9333ea"),
 }
@@ -85,7 +84,6 @@ _LABELS = {
     "repos":              "Git Repos",
     "apps":               "Databricks Apps",
     "lakebase_projects":  "Lakebase Instances",
-    "ip_access_lists":    "IP Access Lists",
     "workspace_conf":     "Workspace Conf",
     "object_permissions": "Object Permissions (ACLs)",
 }
@@ -296,13 +294,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_migratable",         "Auto-Migratable", "badge_bool"),
     ],
     # ── Added by this utility (not in the reference script) ──────────────────
-    "ip_access_lists": [
-        ("label",             "Label",          "plain"),
-        ("list_id",           "List ID",        "mono"),
-        ("list_type",         "Type",           "badge_type"),
-        ("ip_addresses",      "Addresses",      "count"),
-        ("enabled",           "Enabled",        "badge_bool"),
-    ],
     "workspace_conf": [
         ("key",               "Setting Key",    "plain"),
         ("value",             "Value",          "plain"),
@@ -332,7 +323,7 @@ _SUMMARY_CARD_KEYS = [
     # AI
     "serving_endpoints", "agent_endpoints",
     # Platform
-    "secret_scopes", "repos", "ip_access_lists", "workspace_conf",
+    "secret_scopes", "repos", "workspace_conf",
     # Permissions (every ACL grant, countable)
     "object_permissions",
     # Inventory-only (migration flagged manual for v1)
@@ -531,7 +522,6 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         _merge(m) for m in _by(misc, "misc_type", "global_init_script")]
     data["cluster_libraries"] = [
         _flatten_library(m) for m in _by(misc, "misc_type", "cluster_library")]
-    data["ip_access_lists"] = _by(misc, "misc_type", "ip_access_list")
     data["workspace_conf"] = _by(misc, "misc_type", "workspace_conf")
 
     # ── Object permissions (ACLs) — flattened to countable grant rows ────

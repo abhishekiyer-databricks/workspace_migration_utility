@@ -90,7 +90,7 @@ JSON — because the inventory is the reconciliation baseline for the final resu
 | 3 | **Secret scope ACLs** | ACL Grants column on Secret Scopes + rows in the ACL card | reference gets scope names only |
 | 4 | **Secret scope `backend_type` + Key Vault metadata** | Backend / Key Vault / Secret Keys columns | AKV-backed scopes need a different create payload |
 | 5 | **Group membership + nesting** | Members / Nested Groups columns | needed by the identity engine (nested-first recreate) |
-| 6 | **IP access lists** | own card | INCLUDED per decision; reference omits |
+| 6 | ~~IP access lists~~ | — | **DROPPED (2026-07-30):** account-level in this customer (account console / account API); a workspace-scoped tool can't see/migrate them → customer/account-admin manual task |
 | 7 | **Workspace conf** (admin settings toggles) | own card | INCLUDED per decision; reference omits |
 | 8 | **Legacy SQL dashboards** | own card | reference has queries+alerts but not legacy dashboards |
 | 9 | **Identity classification / "Managed By"** (Entra vs Databricks-managed) | **"Managed By" column** on Users/SPs/Groups + classification summary section | the core enhancement; drives create-vs-assign on target |

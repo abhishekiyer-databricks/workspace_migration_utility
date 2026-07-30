@@ -1,9 +1,12 @@
 """
-MiscCollector — global init scripts, cluster libraries, IP access lists, workspace conf.
+MiscCollector — global init scripts, cluster libraries, workspace conf.
 
-PATs/tokens are EXCLUDED (disabled in the customer workspace). Each sub-fetch is independent
-and best-effort so one failing (e.g. a feature disabled) never drops the others.
-natural_key varies by misc_type (script name / list label / conf key / cluster+library).
+PATs/tokens are EXCLUDED (disabled in the customer workspace). IP access lists are EXCLUDED
+too: in this customer's setup they are configured at the ACCOUNT level (account console /
+account API), which a workspace-scoped tool cannot see or migrate — they are a customer /
+account-admin manual task, not a workspace asset. Each sub-fetch is independent and
+best-effort so one failing (e.g. a feature disabled) never drops the others.
+natural_key varies by misc_type (script name / conf key / cluster+library).
 """
 from __future__ import annotations
 
@@ -31,8 +34,7 @@ class MiscCollector(BaseCollector):
         out: list[dict] = []
         out.extend(self._global_init_scripts())
         out.extend(self._cluster_libraries())
-        out.extend(self._ip_access_lists())
-        out.extend(self._workspace_conf())
+        out.extend(self._workspace_conf())   # IP access lists dropped — account-level (see module docstring)
         return out
 
     def _global_init_scripts(self) -> list[dict]:
@@ -80,26 +82,6 @@ class MiscCollector(BaseCollector):
                     "status": safe_str(ls.get("status")),
                     "is_library_for_all_clusters": bool(ls.get("is_library_for_all_clusters", False)),
                 })
-        return items
-
-    def _ip_access_lists(self) -> list[dict]:
-        try:
-            raw = self.client.get("api/2.0/ip-access-lists").get("ip_access_lists", []) or []
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("ip-access-lists failed", error=str(exc))
-            return []
-        items = []
-        for l in raw:
-            items.append({
-                "misc_type": "ip_access_list",
-                "list_id": safe_str(l.get("list_id")),
-                "label": safe_str(l.get("label")),
-                "_natural_key": safe_str(l.get("label")),
-                "list_type": safe_str(l.get("list_type")),
-                "ip_addresses": l.get("ip_addresses", []),
-                "enabled": l.get("enabled"),
-                "_raw": l,
-            })
         return items
 
     def _workspace_conf(self) -> list[dict]:

@@ -143,8 +143,6 @@ def _objects_by_type() -> dict:
             {"misc_type": "cluster_library", "cluster_id": "c1",
              "library": {"pypi": {"package": "pandas"}}, "status": "INSTALLED",
              "is_library_for_all_clusters": False},
-            {"misc_type": "ip_access_list", "list_id": "ip1", "label": "corp-allow",
-             "list_type": "ALLOW", "ip_addresses": ["1.2.3.4"], "enabled": True},
             {"misc_type": "workspace_conf", "key": "enableIpAccessLists", "value": "true"},
         ],
     }

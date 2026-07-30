@@ -165,10 +165,11 @@ def test_misc():
     gt = {"api/2.0/global-init-scripts": {"scripts": [{"script_id": "g1", "name": "gis", "position": 0, "enabled": True}]},
           "api/2.0/global-init-scripts/g1": {"script": "ZWNobw=="},
           "api/2.0/libraries/all-cluster-statuses": {"statuses": [{"cluster_id": "c1", "library_statuses": [{"library": {"pypi": {"package": "requests"}}, "status": "INSTALLED"}]}]},
-          "api/2.0/ip-access-lists": {"ip_access_lists": [{"list_id": "i1", "label": "corp", "list_type": "ALLOW", "ip_addresses": ["1.2.3.4"], "enabled": True}]},
           "api/2.0/workspace-conf": lambda p: {p["keys"]: "true"}}
     objs = _run_ok(MiscCollector(FakeClient(get_table=gt), _cfg()))
-    assert {o["misc_type"] for o in objs} == {"global_init_script", "cluster_library", "ip_access_list", "workspace_conf"}
+    # IP access lists are EXCLUDED (account-level, not a workspace asset).
+    assert {o["misc_type"] for o in objs} == {"global_init_script", "cluster_library", "workspace_conf"}
+    assert not any(o["misc_type"] == "ip_access_list" for o in objs)
     assert any(o["misc_type"] == "workspace_conf" and o["key"] == "enableTokensConfig" for o in objs)
 
 
