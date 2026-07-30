@@ -7,12 +7,14 @@ config_resolved.json into the run's staging bundle dir. Nothing here mutates the
 """
 from __future__ import annotations
 
+from src.collectors.apps_collector import AppsCollector
 from src.collectors.compute_collector import ComputeCollector
 from src.collectors.dashboards_collector import DashboardsCollector
 from src.collectors.dlt_collector import DltCollector
 from src.collectors.genie_collector import GenieCollector
 from src.collectors.identity_collector import IdentityCollector
 from src.collectors.jobs_collector import JobsCollector
+from src.collectors.lakebase_collector import LakebaseCollector
 from src.collectors.misc_collector import MiscCollector
 from src.collectors.secrets_collector import SecretsCollector
 from src.collectors.serving_collector import ServingCollector
@@ -29,6 +31,7 @@ _COLLECTORS = [
     IdentityCollector, ComputeCollector, WorkspaceCollector, SecretsCollector,
     JobsCollector, SqlCollector, DltCollector, DashboardsCollector,
     GenieCollector, ServingCollector, MiscCollector,
+    AppsCollector, LakebaseCollector,   # inventory-only (migration flagged manual, v1)
 ]
 
 
@@ -72,19 +75,19 @@ class InventoryRunner:
         })
         self.aw.write_json("config_resolved.json", self.config.redacted())
 
-        self._write_html(counts, stats, id_summary, warnings)
+        self._write_html(objects_by_type, counts, stats, id_summary, warnings)
         self._write_excel(objects_by_type, counts)
 
         _LOG.info("inventory complete", total=sum(counts.values()), warnings=len(warnings))
         return {"counts": counts, "identity_summary": id_summary,
                 "warnings": warnings, "output_path": self.aw.root}
 
-    def _write_html(self, counts, stats, id_summary, warnings) -> None:
+    def _write_html(self, objects_by_type, counts, stats, id_summary, warnings) -> None:
         from src.reports.html_generator import render_inventory
         html_doc = render_inventory(
-            counts=counts, collector_stats=stats, identity_summary=id_summary,
-            warnings=warnings, workspace_url=self.config.ctx.workspace_url,
-            generated_at=now_iso(),
+            objects_by_type=objects_by_type, counts=counts, collector_stats=stats,
+            identity_summary=id_summary, warnings=warnings,
+            workspace_url=self.config.ctx.workspace_url, generated_at=now_iso(),
         )
         # HTML is plain text — safe to write directly to the Volume.
         self.aw.write_bytes("inventory.html", html_doc.encode("utf-8"))

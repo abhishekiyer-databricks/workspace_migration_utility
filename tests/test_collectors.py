@@ -169,6 +169,57 @@ def test_workspace_special_paths():
     assert next(o for o in objs if o["path"] == "/Users/a@x.com")["is_user_root"] is True
 
 
+def test_apps_and_lakebase_inventory_only():
+    from src.collectors.apps_collector import AppsCollector
+    from src.collectors.lakebase_collector import LakebaseCollector
+
+    pag = {
+        "api/2.0/apps": [{"name": "my-app", "description": "d", "creator": "a@x.com",
+                          "url": "https://app", "app_status": {"state": "RUNNING"}}],
+        "api/2.0/postgres/projects": [{"name": "lb1", "status": {"display_name": "pg",
+                                                                 "pg_version": "15"}}],
+    }
+    apps = _run_ok(AppsCollector(FakeClient(paginated_table=pag), _cfg()))
+    assert len(apps) == 1 and apps[0]["migratable"] is False and apps[0]["_raw"]["name"] == "my-app"
+    lb = _run_ok(LakebaseCollector(FakeClient(paginated_table=pag), _cfg()))
+    assert len(lb) == 1 and lb[0]["migratable"] is False and lb[0]["pg_version"] == "15"
+
+
+def test_view_adapter_acls_and_managed_metadata():
+    """The report adapter must (a) flatten every ACL grant into a countable row and
+    (b) surface Entra-vs-Databricks-managed + ephemeral/owner metadata as columns."""
+    from src.reports.inventory_view import adapt, build_counts
+
+    acl = [{"user_name": "a@x.com",
+            "all_permissions": [{"permission_level": "CAN_MANAGE", "inherited": False}]},
+           {"group_name": "eng",
+            "all_permissions": [{"permission_level": "CAN_VIEW", "inherited": False}]}]
+    obt = {
+        "identity": [
+            {"identity_type": "group", "id": "3", "displayName": "eng", "classification":
+             "db_managed_group", "member_count": 5, "has_nested_groups": True,
+             "entitlements": ["databricks-sql-access"], "roles": [], "_raw": {"id": "3"}},
+            {"identity_type": "service_principal", "id": "2", "applicationId": "app-2",
+             "classification": "umi_or_entra_sp", "entitlements": [], "_raw": {"id": "2"}},
+        ],
+        "compute": [{"compute_type": "cluster", "cluster_id": "c1", "cluster_name": "cl",
+                     "ephemeral": False, "pinned": True, "acl": acl, "_raw": {"cluster_id": "c1"}}],
+        "secret_scope": [{"name": "s", "acls": [{"principal": "eng", "permission": "MANAGE"}],
+                          "_raw": {"name": "s"}}],
+    }
+    data = adapt(obt)
+    # ACL rows: 2 (cluster) + 1 (secret scope) = 3 countable grants.
+    assert len(data["object_permissions"]) == 3
+    assert {r["principal"] for r in data["object_permissions"]} == {"a@x.com", "eng"}
+    # Managed-by surfaced.
+    assert data["groups"][0]["_managed"] == "Databricks-managed"
+    assert data["service_principals"][0]["_managed"] == "Entra / UMI"
+    # Cluster metadata surfaced.
+    assert data["clusters"][0]["_pinned"] is True and data["clusters"][0]["_acls"] == 2
+    counts = build_counts(data)
+    assert counts["object_permissions"] == 3
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

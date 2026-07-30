@@ -78,16 +78,17 @@ def test_inventory_end_to_end():
     cr = json.load(open(f"{root}/config_resolved.json"))
     assert "SECRET-TOKEN" not in json.dumps(cr)
 
-    # HTML exists and is non-trivial
+    # HTML exists and is the clickable reference-style app (sidebar + tabs + classification)
     html = open(f"{root}/inventory.html").read()
-    assert "Source Inventory" in html and "Identity classification" in html and len(html) > 1000
+    assert "Workspace Inventory" in html and "Identity classification" in html and len(html) > 1000
+    assert 'class="sidebar"' in html and "function showTab" in html  # reference app shell
 
-    # Excel exists, non-zero, and opens (valid zip/xlsx)
+    # Excel exists, non-zero, and opens (valid zip/xlsx) with the fine-grained sheets
     xlsx = f"{root}/inventory.xlsx"
     assert os.path.getsize(xlsx) > 0
     from openpyxl import load_workbook
     wb = load_workbook(xlsx)
-    assert "Summary" in wb.sheetnames and "Migration Plan" in wb.sheetnames and "identity" in wb.sheetnames
+    assert {"Summary", "Migration Plan", "Users", "Groups", "Service Principals"} <= set(wb.sheetnames)
 
     # manifest verifies clean
     aw.write_manifest(result["counts"])
