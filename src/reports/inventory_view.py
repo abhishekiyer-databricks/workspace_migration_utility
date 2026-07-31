@@ -50,7 +50,6 @@ _ICONS = {
     "lakeview_dashboards":("📊",  "#be185d"),
     "genie_spaces":       ("✨",  "#7c3aed"),
     "serving_endpoints":  ("🚀",  "#b91c1c"),
-    "agent_endpoints":    ("🧠",  "#db2777"),
     "secret_scopes":      ("🔒",  "#0f766e"),
     "repos":              ("📦",  "#1d4ed8"),
     "apps":               ("📱",  "#2563eb"),
@@ -79,7 +78,6 @@ _LABELS = {
     "lakeview_dashboards":"AI/BI Dashboards",
     "genie_spaces":       "Genie AI Spaces",
     "serving_endpoints":  "Model Serving Endpoints",
-    "agent_endpoints":    "Agent Bricks / Agents",
     "secret_scopes":      "Secret Scopes",
     "repos":              "Git Repos",
     "apps":               "Databricks Apps",
@@ -254,13 +252,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("creation_timestamp","Created",        "epoch_ms"),
         ("last_updated_timestamp","Updated",    "epoch_ms"),
     ],
-    "agent_endpoints": [
-        ("name",               "Agent Endpoint", "plain"),
-        ("task",               "Task",           "badge_type"),
-        ("state.ready",        "Ready",          "plain"),
-        ("creator",            "Creator",        "plain"),
-        ("creation_timestamp", "Created",        "epoch_ms"),
-    ],
     "secret_scopes": [
         ("name",              "Scope Name",     "plain"),
         ("backend_type",      "Backend",        "badge_type"),
@@ -321,7 +312,7 @@ _SUMMARY_CARD_KEYS = [
     "sql_warehouses", "sql_alerts", "sql_dashboards", "dlt_pipelines",
     "lakeview_dashboards", "genie_spaces",
     # AI
-    "serving_endpoints", "agent_endpoints",
+    "serving_endpoints",
     # Platform
     "secret_scopes", "repos", "workspace_conf",
     # Permissions (every ACL grant, countable)
@@ -349,15 +340,6 @@ def _esc(s: Any) -> str:
     s = str(s)
     return (s.replace("&", "&amp;").replace("<", "&lt;")
              .replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def _is_agent_endpoint(endpoint: Dict[str, Any]) -> bool:
-    """True if a serving endpoint is an Agent Bricks / agent endpoint.
-
-    Agent endpoints carry a `task` beginning with "agent/"; plain model-serving
-    endpoints use llm/v1/* or have no task.
-    """
-    return str(endpoint.get("task") or "").startswith("agent/")
 
 
 def _flatten_library(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -497,7 +479,8 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
     data["sql_alerts"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_alert")]
     data["sql_dashboards"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_dashboard")]
 
-    # ── Serving (split agent vs model-serving by task in _resolve_items) ─
+    # ── Model serving endpoints (Agent Bricks agents are excluded at the collector —
+    #    not recreatable via workspace REST) ─
     data["serving_endpoints"] = [
         _merge(e, _acls=_acl_count(e)) for e in objects_by_type.get("serving_endpoint", []) or []]
 
@@ -636,15 +619,11 @@ def _resolve_items(data: Dict[str, Any], key: str) -> List[Dict]:
         return [x for x in data.get("workspace_items", []) if x.get("object_type") == "NOTEBOOK"]
     if key == "workspace_files":
         return [x for x in data.get("workspace_items", []) if x.get("object_type") == "FILE"]
-    if key == "serving_endpoints":
-        return [e for e in data.get("serving_endpoints", []) if not _is_agent_endpoint(e)]
-    if key == "agent_endpoints":
-        return [e for e in data.get("serving_endpoints", []) if _is_agent_endpoint(e)]
     return data.get(key, []) or []
 
 
 def build_counts(data: Dict[str, Any]) -> Dict[str, int]:
-    """Per-card counts (in-scope keys only), with the notebook/file + serving/agent splits."""
+    """Per-card counts (in-scope keys only), with the notebook/file split."""
     counts: Dict[str, int] = {}
     for key in _SUMMARY_CARD_KEYS:
         counts[key] = len(_resolve_items(data, key))

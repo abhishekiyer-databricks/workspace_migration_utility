@@ -113,9 +113,6 @@ def _objects_by_type() -> dict:
             {"name": "model-a", "acl": _ACL,
              "_raw": {"name": "model-a", "state": {"ready": "READY"}, "creator": "alice@corp.com",
                       "creation_timestamp": 1700000000000, "last_updated_timestamp": 1700000000000}},
-            {"name": "agent-a", "acl": _ACL,
-             "_raw": {"name": "agent-a", "task": "agent/v1/responses", "state": {"ready": "READY"},
-                      "creator": "alice@corp.com", "creation_timestamp": 1700000000000}},
         ],
         "secret_scope": [
             {"name": "kv-scope", "backend_type": "AZURE_KEYVAULT",

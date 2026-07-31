@@ -47,7 +47,11 @@ customer.
   (disabled) and **IP access lists** (account-level in this customer — configured in the
   account console / account API; a workspace-scoped tool can't see or migrate them → customer/
   account-admin manual task). REMOVE UC assets (registered models, connections, delta sharing, clean rooms) +
-  MLflow. Apps / Lakebase / Vector Search = inventory-only, migration flagged manual for v1.
+  MLflow. **Agent Bricks agents EXCLUDED** (Multi-Agent Supervisor / Knowledge Assistant /
+  Custom LLM / Information Extraction): no workspace REST recreate path — a deployed agent is
+  backed by a UC-registered MLflow ResponsesAgent model + UC assets + UI-only orchestration
+  (all out of scope); IE agents are a UC Beta `agent-services` object. Model serving endpoints
+  (non-agent) still INCLUDED. Apps / Lakebase / Vector Search = inventory-only, migration flagged manual for v1.
 
 ## Account-level preflight (decided) — VERIFY only, run once before workspace #1
 - Migration is done **one workspace at a time**, but there may be **one-time account-level

@@ -145,7 +145,10 @@ def test_dlt_dashboards_genie_serving():
     from src.collectors.serving_collector import ServingCollector
     gt = {"api/2.0/pipelines/dp1": {"spec": {"name": "bronze"}},
           "api/2.0/lakeview/dashboards/d1": {"display_name": "KPIs", "warehouse_id": "w1", "serialized_dashboard": "{}"},
-          "api/2.0/serving-endpoints": {"endpoints": [{"name": "my-ep", "id": "e1", "config": {}}, {"name": "databricks-x"}]},
+          "api/2.0/serving-endpoints": {"endpoints": [
+              {"name": "my-ep", "id": "e1", "config": {}},
+              {"name": "databricks-x"},                                  # platform FM — skipped
+              {"name": "mas-abc-endpoint", "id": "e2", "task": "agent/v1/responses"}]},  # Agent Bricks — skipped
           "api/2.0/permissions/pipelines/dp1": {"access_control_list": []},
           "api/2.0/permissions/serving-endpoints/e1": {"access_control_list": []}}
     pag = {"api/2.0/pipelines": [{"pipeline_id": "dp1", "name": "bronze"}],
@@ -157,6 +160,7 @@ def test_dlt_dashboards_genie_serving():
     g = _run_ok(GenieCollector(c, _cfg()))[0]
     assert g["warehouse_id"] == "w1" and "migratable" not in g  # no migratability flag asserted
     serv = _run_ok(ServingCollector(c, _cfg()))
+    # databricks-* (platform FM) AND Agent Bricks agent endpoints (task=agent/*) are excluded.
     assert [o["name"] for o in serv] == ["my-ep"]
 
 

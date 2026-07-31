@@ -32,7 +32,7 @@ Every one of these is collected here and appears as a card/sheet in the HTML + E
 | 14 | genie_spaces | ✅ | GenieCollector | migration flagged manual |
 | 15 | secret_scopes | ✅ | SecretsCollector | + backend_type + ACLs + key names |
 | 16 | repos | ✅ | WorkspaceCollector | `/Repos` + `/Workspace` union |
-| 17 | serving_endpoints (→ + agent_endpoints) | ✅ | ServingCollector | model vs agent split, same as reference |
+| 17 | serving_endpoints | ✅ | ServingCollector | model serving only; **Agent Bricks agents excluded** (see §2) |
 | 18 | global_init_scripts | ✅ | MiscCollector | |
 | 19 | cluster_libraries | ✅ | MiscCollector | flattened per (cluster, library) |
 
@@ -54,6 +54,7 @@ Intentionally not collected — this utility migrates **non-UC workspace assets 
 | 5 | delta_providers | Delta Sharing (UC) — out of scope |
 | 6 | clean_rooms | UC / account-level — out of scope |
 | 7 | mlflow_experiments | MLflow — separate tooling, never migrated |
+| 8 | **Agent Bricks agents** (Multi-Agent Supervisor, Knowledge Assistant, Custom LLM, Information Extraction) | **NOT recreatable via workspace REST** — no create/export API for any Agent Bricks type. A deployed agent (serving endpoint `task=agent/*`) is backed by a UC-registered MLflow ResponsesAgent model + UC volumes/tables/functions/indexes + UI-only orchestration metadata (all UC/UI, out of scope). Information Extraction agents are a UC `agent-services` object (Beta, registry-only). The reference script's `task=agent/*` "agent_endpoints" card was **removed**: since import can't stand one up on target, we don't inventory them. |
 
 ---
 
