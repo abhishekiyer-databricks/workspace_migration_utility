@@ -2,13 +2,14 @@
 SqlCollector — SQL warehouses + legacy SQL (queries, alerts, dashboards) (SOURCE workspace).
 
 Warehouses: /api/2.0/sql/warehouses (not paginated today — verify). Legacy queries/alerts/
-dashboards: cursor-paginated /api/2.0/sql/{queries,alerts,dashboards}. natural_key = name
-(warehouse/query/alert) or dashboard name.
+dashboards: cursor-paginated /api/2.0/sql/{queries,alerts,dashboards}. Alerts V2 (the current
+alert surface; legacy-alert creation is disabled): /api/2.0/alerts. natural_key = display_name
+(query/alert) or name (warehouse/dashboard). Alerts carry sql_type legacy_alert vs alert.
 """
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import safe_str
+from src.utils.helpers import dab_path_info, safe_str
 
 
 class SqlCollector(BaseCollector):
@@ -28,6 +29,7 @@ class SqlCollector(BaseCollector):
         out.extend(self._warehouses())
         for kind in self._LEGACY:
             out.extend(self._legacy(kind, "results"))
+        out.extend(self._alerts_v2())
         return out
 
     def _warehouses(self) -> list[dict]:
@@ -62,14 +64,63 @@ class SqlCollector(BaseCollector):
         sql_type, perm_type = self._LEGACY[kind]
         items = []
         for o in raw:
-            name = safe_str(o.get("name") or o.get("title"))
+            # /api/2.0/sql/{queries,alerts} name the object `display_name`; only
+            # /api/2.0/sql/dashboards uses `name`. Check display_name first so the
+            # natural_key and the ACL-tab Object column are never blank.
+            name = safe_str(o.get("display_name") or o.get("name") or o.get("title"))
             oid = safe_str(o.get("id"))
-            items.append({
+            item = {
                 "sql_type": sql_type,   # legacy_query / legacy_alert / legacy_dashboard
                 "id": oid,
                 "name": name,
                 "_natural_key": name or oid,
                 "acl": self.fetch_acl(perm_type, oid),   # ACLs (Plan 1a §1)
+                "_raw": o,
+            }
+            # Legacy alerts/queries expose no workspace path and aren't a DAB resource type
+            # (only Alerts V2 is) → always Manual. Legacy dashboards can be DAB-deployed and
+            # carry a `parent` path, so classify those.
+            if kind == "dashboards":
+                dab = dab_path_info(o.get("parent") or o.get("parent_path"))
+            else:
+                dab = {"deployed_by_dab": False, "dab_scope": ""}
+            item["deployed_by_dab"] = dab["deployed_by_dab"]
+            item["dab_scope"] = dab["dab_scope"]
+            items.append(item)
+        return items
+
+    def _alerts_v2(self) -> list[dict]:
+        """Alerts V2 (/api/2.0/alerts) — the current alert surface (legacy-alert creation
+        is disabled). Distinct from legacy alerts; permissions object type is `alertsv2`."""
+        try:
+            # Live fvm1 (2026-07-31): GET /api/2.0/alerts returns the list under `alerts`
+            # (NOT `results` as some docs state); pagination token is `next_page_token`.
+            raw = self.client.get_paginated(
+                "api/2.0/alerts", "alerts",
+                token_key="next_page_token", params={"page_size": 100},
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "404" in str(exc):
+                self.log.info("alerts v2 endpoint absent (skipping)")
+            else:
+                self.log.warning("alerts v2 fetch failed", error=str(exc))
+            return []
+        items = []
+        for o in raw:
+            name = safe_str(o.get("display_name") or o.get("name"))
+            oid = safe_str(o.get("id"))
+            # Alerts V2 IS a DAB resource type; a bundle-deployed one sits under `.bundle/`
+            # (exposed via `parent_path`). Hand-made alerts return no parent_path → Manual.
+            dab = dab_path_info(o.get("parent_path"))
+            items.append({
+                "sql_type": "alert",   # Alerts V2 (vs legacy_alert)
+                "id": oid,
+                "name": name,
+                "_natural_key": name or oid,
+                "parent_path": safe_str(o.get("parent_path")),
+                "deployed_by_dab": dab["deployed_by_dab"],
+                "dab_scope": dab["dab_scope"],
+                "acl": self.fetch_acl("alertsv2", oid),
                 "_raw": o,
             })
         return items

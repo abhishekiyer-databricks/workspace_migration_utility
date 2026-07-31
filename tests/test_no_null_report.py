@@ -110,7 +110,8 @@ def _objects_by_type() -> dict:
                       "warehouse_id": "w1", "created_timestamp": 1700000000000}},
         ],
         "serving_endpoint": [
-            {"name": "model-a", "acl": _ACL,
+            {"name": "model-a", "acl": _ACL, "migratable": True,
+             "migration_note": "Non-UC served model — auto-migratable.",
              "_raw": {"name": "model-a", "state": {"ready": "READY"}, "creator": "alice@corp.com",
                       "creation_timestamp": 1700000000000, "last_updated_timestamp": 1700000000000}},
         ],

@@ -51,7 +51,12 @@ customer.
   Custom LLM / Information Extraction): no workspace REST recreate path — a deployed agent is
   backed by a UC-registered MLflow ResponsesAgent model + UC assets + UI-only orchestration
   (all out of scope); IE agents are a UC Beta `agent-services` object. Model serving endpoints
-  (non-agent) still INCLUDED. Apps / Lakebase / Vector Search = inventory-only, migration flagged manual for v1.
+  (non-agent) still INVENTORIED but **DOWNGRADED to migration-manual/conditional**: an endpoint
+  only points at a model — if it serves a UC-registered model (out of scope) it can't be
+  auto-recreated on target; only external-model endpoints are auto-migratable. Collector flags
+  `migratable` + `migration_note` per endpoint. Apps / Lakebase / Vector Search = inventory-only,
+  migration flagged manual for v1. **Genie spaces**: customer has a SEPARATE repo for Genie
+  recreation (to be pointed to at import time) — inventory still captures them + a DAB flag.
 
 ## Account-level preflight (decided) — VERIFY only, run once before workspace #1
 - Migration is done **one workspace at a time**, but there may be **one-time account-level

@@ -11,7 +11,7 @@ inventory script). natural_key = workspace path.
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import safe_str
+from src.utils.helpers import dab_path_info, safe_str
 
 # /Projects is not inventoried as workspace content. /Repos IS descended (to discover git
 # folders) but its container dirs are not emitted as content — see _walk.
@@ -86,12 +86,20 @@ class WorkspaceCollector(BaseCollector):
                 if otype == "DIRECTORY":
                     self._walk(p, out)
                 continue
+            # DAB classification (customer: code is redeployed to the target via an Azure
+            # DevOps script that runs each bundle, NOT migrated file-by-file by this tool). So
+            # each item records whether it lives under a `.bundle/` folder and, if so, whether
+            # the bundle is shared (/Shared/.bundle — current staging + all prod) or user-scoped
+            # (/Users/<email>/.bundle or /Workspace/<uuid>/.bundle — legacy staging pattern).
+            dab = dab_path_info(p)
             record = {
                 "path": p,
                 "object_type": otype,
                 "language": safe_str(obj.get("language")),
                 "object_id": safe_str(obj.get("object_id")),
                 "is_user_root": self._is_user_root(p),
+                "deployed_by_dab": dab["deployed_by_dab"],
+                "dab_scope": dab["dab_scope"],
                 "acl": self._object_acl(otype, obj.get("object_id")),
             }
             out.append(record)

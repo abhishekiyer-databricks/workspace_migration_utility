@@ -120,6 +120,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("path",        "Path",          "path"),
         ("object_type", "Type",          "badge_type"),
         ("language",    "Language",      "badge_lang"),
+        ("_dab",        "Deployed by DAB","badge_type"),
         ("_acls",       "ACL Grants",    "plain"),
         ("object_id",   "Object ID",     "mono"),
     ],
@@ -127,6 +128,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("path",        "Path",          "path"),
         ("object_type", "Type",          "badge_type"),
         ("language",    "Language",      "badge_lang"),
+        ("_dab",        "Deployed by DAB","badge_type"),
         ("_acls",       "ACL Grants",    "plain"),
         ("object_id",   "Object ID",     "mono"),
     ],
@@ -204,6 +206,8 @@ _COLUMNS: Dict[str, List[tuple]] = {
     ],
     "sql_alerts": [
         ("display_name",      "Alert Name",   "plain"),
+        ("_alert_kind",       "Kind",         "badge_type"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("id",                "ID",           "mono"),
         ("owner_user_name",   "Owner",        "plain"),
         ("parent_path",       "Parent Path",  "path"),
@@ -232,6 +236,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("display_name",      "Dashboard Name", "plain"),
         ("dashboard_id",      "Dashboard ID",   "mono"),
         ("lifecycle_state",   "State",          "badge_state"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
         ("create_time",       "Created",        "iso_ts"),
         ("update_time",       "Updated",        "iso_ts"),
@@ -241,6 +246,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("space_id",          "Space ID",       "mono"),
         ("description",       "Description",    "trunc"),
         ("warehouse_id",      "Warehouse ID",   "mono"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
         ("created_timestamp", "Created",        "epoch_ms"),
     ],
@@ -248,6 +254,8 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("name",              "Endpoint Name",  "plain"),
         ("state.ready",       "Ready",          "plain"),
         ("creator",           "Creator",        "plain"),
+        ("_migratable",       "Auto-Migratable","badge_bool"),
+        ("_migration_note",   "Migration Note", "trunc"),
         ("_acls",             "ACL Grants",     "plain"),
         ("creation_timestamp","Created",        "epoch_ms"),
         ("last_updated_timestamp","Updated",    "epoch_ms"),
@@ -440,7 +448,8 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
     # ── Workspace content ────────────────────────────────────────────────
     # Notebooks/files: our records carry path/type/language/object_id + is_user_root + acl.
     data["workspace_items"] = [
-        _merge(w, _acls=_acl_count(w), _is_user_root=w.get("is_user_root"))
+        _merge(w, _acls=_acl_count(w), _is_user_root=w.get("is_user_root"),
+               _dab=_dab_label(w))
         for w in ws if w.get("object_type") in ("NOTEBOOK", "FILE")]
     data["repos"] = [
         _merge(w, _acls=_acl_count(w)) for w in ws if w.get("object_type") == "REPO"]
@@ -466,23 +475,31 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         for p in objects_by_type.get("dlt_pipeline", []) or []]
     data["lakeview_dashboards"] = [
         _merge(d, warehouse_id=d.get("warehouse_id"), parent_path=d.get("parent_path"),
-               _acls=_acl_count(d))
+               _acls=_acl_count(d), _dab=_dab_label(d))
         for d in objects_by_type.get("lakeview_dashboard", []) or []]
     data["genie_spaces"] = [
-        _merge(g, warehouse_id=g.get("warehouse_id"), _acls=_acl_count(g))
+        _merge(g, warehouse_id=g.get("warehouse_id"), _acls=_acl_count(g), _dab=_dab_label(g))
         for g in objects_by_type.get("genie_space", []) or []]
 
     # ── SQL → warehouses / legacy queries / alerts / dashboards ──────────
     data["sql_warehouses"] = [
         _merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "warehouse")]
     data["sql_queries"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_query")]
-    data["sql_alerts"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_alert")]
+    # Alerts tab shows BOTH legacy (/api/2.0/sql/alerts) and Alerts V2 (/api/2.0/alerts),
+    # each tagged with a "Kind" so migration can tell them apart (only legacy migrate via
+    # the legacy path; V2 alerts use the Alerts V2 API).
+    data["sql_alerts"] = [
+        _merge(s, _acls=_acl_count(s), _alert_kind=_alert_kind(s.get("sql_type")),
+               _dab=_dab_label(s))
+        for s in sql if s.get("sql_type") in ("legacy_alert", "alert")]
     data["sql_dashboards"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_dashboard")]
 
     # ── Model serving endpoints (Agent Bricks agents are excluded at the collector —
     #    not recreatable via workspace REST) ─
     data["serving_endpoints"] = [
-        _merge(e, _acls=_acl_count(e)) for e in objects_by_type.get("serving_endpoint", []) or []]
+        _merge(e, _acls=_acl_count(e), _migratable=e.get("migratable"),
+               _migration_note=e.get("migration_note"))
+        for e in objects_by_type.get("serving_endpoint", []) or []]
 
     # ── Secrets ──────────────────────────────────────────────────────────
     data["secret_scopes"] = [
@@ -528,6 +545,22 @@ def _group_managed(classification: Any) -> str:
             "builtin_group": "Built-in"}.get(classification, "")
 
 
+def _dab_label(rec: Dict[str, Any]) -> str:
+    """'Deployed by DAB' cell: Manual / DAB (Shared) / DAB (User). See helpers.dab_deploy_label.
+
+    The (Shared) vs (User) split matters to this customer: shared bundles are current staging +
+    all prod; user-scoped bundles (username/uuid in path) are the legacy staging pattern."""
+    from src.utils.helpers import dab_deploy_label
+    return dab_deploy_label(rec.get("deployed_by_dab"), rec.get("dab_scope"))
+
+
+def _alert_kind(sql_type: Any) -> str:
+    """Human 'Kind' label for the SQL Alerts tab: Legacy (/api/2.0/sql/alerts) vs
+    Alerts V2 (/api/2.0/alerts). Databricks stopped new legacy-alert creation and steers
+    to V2, so migration treats the two differently."""
+    return {"legacy_alert": "Legacy", "alert": "Alerts V2"}.get(str(sql_type), "")
+
+
 def _run_as_str(run_as: Any) -> str:
     if isinstance(run_as, dict):
         return safe_str_local(run_as.get("service_principal_name")
@@ -553,11 +586,15 @@ def _flatten_acls(objects_by_type: Dict[str, List[dict]]) -> List[dict]:
     rows: List[dict] = []
 
     def _obj_name(rec: dict) -> str:
+        raw = rec.get("_raw") if isinstance(rec.get("_raw"), dict) else {}
         return safe_str_local(
             rec.get("cluster_name") or rec.get("instance_pool_name") or rec.get("name")
             or rec.get("title") or rec.get("display_name") or rec.get("path")
             or rec.get("displayName") or (rec.get("settings") or {}).get("name")
-            or rec.get("job_id"))
+            or rec.get("job_id")
+            # Fall back into the raw API object (legacy SQL alerts/queries keep the
+            # human name only under _raw.display_name).
+            or raw.get("display_name") or raw.get("name") or raw.get("title"))
 
     def _emit_object_acl(otype_label: str, rec: dict):
         for entry in rec.get("acl") or []:
