@@ -35,6 +35,11 @@ _LOG = get_logger("export")
 # Statuses that mean "the payload/content was actually produced" (counted as done).
 _PRODUCED = {"success", "skipped_oversize"}
 
+# How many fetched content items to accumulate before rewriting checkpoint.json. A deliberate
+# middle ground, NOT a tunable — see the rationale in `_fetch_content`. 200 keeps the Volume
+# writes negligible (~25 rewrites for 5k notebooks) while capping what a crash re-fetches.
+CHECKPOINT_BATCH = 200
+
 
 class ExportRunner:
     def __init__(self, client, config, artifact_writer, dbutils=None,
@@ -135,6 +140,11 @@ class ExportRunner:
             return []
 
         prior = self._prior_index_by_key()
+        # Outcomes recorded in the checkpoint by earlier batches of THIS run (or a crashed one).
+        # Preferred over the prior index: export_index.json is only written after the whole pass,
+        # so after a crash it is absent/stale and cannot resume anything — which made the
+        # checkpoint's done-list dead weight for exactly the case it existed for.
+        cp_results = {} if self.force_full else self.aw.get_results("export:content")
         fetcher = ContentFetcher(self.client, self.aw)
         shared = Locked({"oversize": []})
 
@@ -142,7 +152,9 @@ class ExportRunner:
         to_fetch = []
         for u in content_units:
             done = (not self.force_full) and self.aw.is_done("export:content", u["natural_key"])
-            row = prior.get((u["asset_type"], u["natural_key"])) if done else None
+            row = cp_results.get(u["natural_key"]) if done else None
+            if row is None and done:
+                row = prior.get((u["asset_type"], u["natural_key"]))
             if done and row and row.get("export_status") in _PRODUCED:
                 # reuse prior result — bytes already on the Volume
                 u["export_status"] = row["export_status"]
@@ -158,12 +170,19 @@ class ExportRunner:
         _LOG.info("content pass", to_fetch=len(to_fetch), resumed=len(content_units) - len(to_fetch),
                   workers=self.workers)
 
-        # parallel_map returns (item, result, error); here item IS the unit and result is the
-        # FetchResult (a worker that raised puts the exception in `error`, result stays None). The
-        # loop runs on the MAIN thread after the pool joins, so unit mutation + the checkpoint
-        # flush need no lock. Done-keys are collected and flushed ONCE (mark_done_bulk) to avoid
-        # rewriting the whole checkpoint file per notebook (§7c).
+        # parallel_map YIELDS (item, result, error) as each fetch completes; here item IS the unit
+        # and result is the FetchResult (a worker that raised puts the exception in `error`, result
+        # stays None). The loop body runs on the MAIN thread (the generator hands results over
+        # one at a time), so unit mutation + the checkpoint flush need no lock.
+        #
+        # Done-keys AND their outcomes are flushed in BATCHES of CHECKPOINT_BATCH. Every flush
+        # rewrites the whole checkpoint file — append doesn't work on a UC Volume — so per-file
+        # flushing is O(n²) bytes (~750 MB for 5k notebooks), while one flush at the very end means
+        # a crash mid-pass loses ALL download progress and re-fetches everything. Batching costs
+        # ~25 rewrites for 5k files and caps the re-fetch on a crash at one batch (§7c).
         done_keys: list[str] = []
+        pending: list[str] = []
+        pending_results: dict = {}
         for unit, res, err in parallel_map(to_fetch, fetcher.fetch, self.workers):
             if err is not None:
                 unit["export_status"] = "failure"
@@ -183,8 +202,23 @@ class ExportRunner:
                 with shared as s:
                     s["oversize"].append(oversize_row)
             if res.status in _PRODUCED:
-                done_keys.append(unit["natural_key"])
-        self.aw.mark_done_bulk("export:content", done_keys)
+                key = unit["natural_key"]
+                done_keys.append(key)
+                pending.append(key)
+                # Exactly the fields the resume branch above reads back — enough to rebuild the
+                # unit without re-fetching, and small enough that the checkpoint stays a few
+                # hundred KB even for thousands of notebooks.
+                pending_results[key] = {"export_status": res.status,
+                                        "content_ref": res.content_ref,
+                                        "content_route": res.content_route,
+                                        "note": res.note or "",
+                                        "oversize": unit.get("oversize")}
+                if len(pending) >= CHECKPOINT_BATCH:
+                    self.aw.mark_done_bulk("export:content", pending, pending_results)
+                    _LOG.info("content checkpoint", done=len(done_keys), of=len(to_fetch))
+                    pending, pending_results = [], {}
+        # Final flush for the remainder (and the whole batch when to_fetch < CHECKPOINT_BATCH).
+        self.aw.mark_done_bulk("export:content", pending, pending_results)
 
         return shared.value["oversize"]
 

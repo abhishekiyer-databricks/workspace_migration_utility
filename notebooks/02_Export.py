@@ -138,3 +138,8 @@ print(f"\nManifest self-check: {'OK' if _verify['ok'] else 'PROBLEM'}")
 if not _verify["ok"]:
     print("  missing:", _verify["missing"][:10])
     print("  mismatched:", _verify["mismatched"][:10])
+
+# Push the last log records to the Volume (the log is appended locally, then mirrored — append
+# straight onto a UC Volume silently fails, which used to truncate the log to one line). Runs
+# AFTER the manifest, which is why the manifest deliberately excludes execution_*.log.
+_logger.flush_log_file()

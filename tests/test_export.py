@@ -435,6 +435,344 @@ def test_parallel_map_failsoft_and_complete():
     assert box.value["n"] == 10
 
 
+def test_parallel_map_streams_incrementally():
+    """parallel_map must YIELD as results complete, not return one list at the end — the content
+    pass relies on that to checkpoint mid-flight. Guards against a revert to an eager list."""
+    import threading
+    from src.exporters.parallel import parallel_map
+
+    # A generator does no work until first iteration.
+    started = threading.Event()
+    gen = parallel_map(range(4), lambda i: started.set() or i, max_workers=2)
+    assert not started.is_set(), "parallel_map ran work at call time — it must be lazy"
+
+    # Consuming ONE item must not require all items to have finished. Item 0 blocks until
+    # released, so if we can pull a result before releasing it, results are genuinely streamed.
+    release = threading.Event()
+
+    def fn(i):
+        if i == 0:
+            release.wait(timeout=5)
+        return i
+
+    got = []
+    for item, res, err in parallel_map(range(6), fn, max_workers=4):
+        got.append(res)
+        if len(got) == 1:
+            # We have a result while item 0 is still blocked → streaming, not batched.
+            assert not release.is_set()
+            release.set()
+    assert sorted(got) == list(range(6))
+
+
+def test_content_pass_checkpoints_in_batches(monkeypatch=None):
+    """A crash mid-content-pass must not lose ALL download progress: the checkpoint is rewritten
+    every CHECKPOINT_BATCH items, and every fetched key lands in it exactly once."""
+    import json
+    import os
+    import tempfile
+    from src.exporters import export_runner as er
+
+    tmp = tempfile.mkdtemp()
+
+    class FakeAW:
+        def __init__(self):
+            self.root = tmp
+            self.writes = 0
+            self.cp = {}
+
+        def is_done(self, component, key):
+            return key in self.cp.get(component, [])
+
+        def get_results(self, component):
+            return self.cp.get(f"{component}:results", {})
+
+        def mark_done_bulk(self, component, keys, results=None):
+            keys = list(keys)
+            if not keys and not results:
+                return
+            self.writes += 1
+            self.cp.setdefault(component, []).extend(keys)
+            if results:
+                self.cp.setdefault(f"{component}:results", {}).update(results)
+
+        def read_json(self, rel):
+            return None
+
+        def write_json(self, rel, data):
+            pass
+
+    n = 450                      # > 2 batches at CHECKPOINT_BATCH=200
+    units = {"notebook": [{"asset_type": "notebook", "natural_key": f"/nb/{i}",
+                           "export_status": "success", "payload": {"language": "PYTHON"}}
+                          for i in range(n)]}
+
+    class FakeFetch:
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch(self, unit):
+            from src.exporters.content_fetcher import FetchResult
+            return FetchResult(status="success", content_ref="x", content_route="direct_download")
+
+    orig = er.ContentFetcher
+    er.ContentFetcher = FakeFetch
+    try:
+        aw = FakeAW()
+        runner = er.ExportRunner(client=None, config=_FakeCfg(), artifact_writer=aw,
+                                 content_fetch_workers=4)
+        runner._fetch_content(units)
+    finally:
+        er.ContentFetcher = orig
+
+    done = aw.cp["export:content"]
+    assert len(done) == n, f"expected {n} checkpointed keys, got {len(done)}"
+    assert len(set(done)) == n, "a key was checkpointed twice"
+    # 450 items → flushes at 200 and 400, plus the final remainder flush = 3.
+    expected = n // er.CHECKPOINT_BATCH + 1
+    assert aw.writes == expected, f"expected {expected} checkpoint writes, got {aw.writes}"
+    # And crucially NOT one write per item (the O(n²)-bytes failure mode).
+    assert aw.writes < n
+
+
+class _FakeCfg:
+    """Minimal config for the content-pass test (toggles/ids unused by _fetch_content)."""
+    class _T:
+        def __getattr__(self, name):
+            return True
+    toggles = _T()
+    run_id = "t"
+    source_workspace_id = "1"
+    output_path = ""
+
+
+def test_content_pass_resumes_after_a_crash():
+    """THE regression test for mid-run failure.
+
+    A crash mid-content-pass must leave a checkpoint that a re-run can actually use. Batching the
+    checkpoint is not enough on its own: resume also needs each item's OUTCOME, and the
+    export_index.json that used to supply it is written only after the pass — so after a crash it
+    is absent and every file was re-fetched regardless of the checkpoint. The outcome now rides in
+    the checkpoint itself. Asserts the re-fetch is bounded AND that resumed units keep their data.
+    """
+    import json
+    import os
+    import tempfile
+    from src.exporters import export_runner as er
+    from src.exporters.artifact_writer import ArtifactWriter
+    from src.exporters.content_fetcher import FetchResult
+
+    tmp = tempfile.mkdtemp()
+
+    class Cfg(_FakeCfg):
+        output_path = tmp
+    aw = ArtifactWriter(Cfg())
+    aw.ensure_output_path()
+
+    n, crash_at = 450, 320
+
+    def mkunits():
+        return {"notebook": [{"asset_type": "notebook", "natural_key": f"/nb/{i}",
+                              "export_status": "success", "payload": {"language": "PYTHON"}}
+                             for i in range(n)]}
+
+    class Crashy:
+        def __init__(self, *a, **k):
+            self.n = 0
+
+        def fetch(self, unit):
+            self.n += 1
+            if self.n > crash_at:
+                raise KeyboardInterrupt("cluster died")
+            return FetchResult(status="success", content_ref="orig",
+                               content_route="direct_download")
+
+    orig = er.ContentFetcher
+    er.ContentFetcher = Crashy
+    try:
+        try:
+            # workers=1 keeps the crash point deterministic.
+            er.ExportRunner(None, Cfg(), aw, content_fetch_workers=1)._fetch_content(mkunits())
+            raise AssertionError("the fake fetcher should have crashed the pass")
+        except KeyboardInterrupt:
+            pass
+    finally:
+        er.ContentFetcher = orig
+
+    cp = json.load(open(os.path.join(tmp, "checkpoint.json")))
+    batch = er.CHECKPOINT_BATCH
+    assert len(cp["export:content"]) == batch, "checkpoint did not survive the crash"
+    assert len(cp["export:content:results"]) == batch, "outcomes not persisted → cannot resume"
+
+    refetched = []
+
+    class Counting:
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch(self, unit):
+            refetched.append(unit["natural_key"])
+            return FetchResult(status="success", content_ref="new",
+                               content_route="direct_download")
+
+    er.ContentFetcher = Counting
+    try:
+        units = mkunits()
+        er.ExportRunner(None, Cfg(), aw, content_fetch_workers=4)._fetch_content(units)
+    finally:
+        er.ContentFetcher = orig
+
+    assert len(refetched) == n - batch, \
+        f"re-run re-fetched {len(refetched)}, expected {n - batch} (resume not working)"
+    # Resumed units must carry the ORIGINAL fetch's data, not a blank/overwritten row.
+    resumed = [u for u in units["notebook"] if u["natural_key"] in set(cp["export:content"])]
+    assert len(resumed) == batch
+    assert all(u["export_status"] == "success" and u["content_ref"] == "orig" for u in resumed), \
+        "resumed units lost their content_ref"
+    cp2 = json.load(open(os.path.join(tmp, "checkpoint.json")))
+    assert len(cp2["export:content"]) == len(set(cp2["export:content"])) == n
+
+    # force_full_export must ignore the checkpoint entirely.
+    refetched.clear()
+    er.ContentFetcher = Counting
+    try:
+        er.ExportRunner(None, Cfg(), aw, content_fetch_workers=4,
+                        force_full_export=True)._fetch_content(mkunits())
+    finally:
+        er.ContentFetcher = orig
+    assert len(refetched) == n, "force_full_export must re-fetch everything"
+
+
+def test_checkpoint_results_roundtrip_and_backcompat():
+    """mark_done_bulk stores outcomes atomically with the keys; an older checkpoint (keys only,
+    no results) must not crash get_results."""
+    import json
+    import os
+    import tempfile
+    from src.exporters.artifact_writer import ArtifactWriter
+
+    tmp = tempfile.mkdtemp()
+
+    class Cfg(_FakeCfg):
+        output_path = tmp
+    aw = ArtifactWriter(Cfg())
+    aw.ensure_output_path()
+
+    aw.mark_done_bulk("c", ["a", "b"], {"a": {"export_status": "success"}})
+    assert aw.is_done("c", "a") and aw.is_done("c", "b")
+    assert aw.get_results("c")["a"]["export_status"] == "success"
+    # Second batch merges rather than replacing.
+    aw.mark_done_bulk("c", ["d"], {"d": {"export_status": "skipped_oversize"}})
+    assert sorted(aw.get_results("c")) == ["a", "d"]
+    assert len(json.load(open(os.path.join(tmp, "checkpoint.json")))["c"]) == 3
+    # Re-marking an existing key must not duplicate it.
+    aw.mark_done_bulk("c", ["a"], None)
+    assert json.load(open(os.path.join(tmp, "checkpoint.json")))["c"].count("a") == 1
+    # Old-format checkpoint: keys but no ":results" → empty dict, no exception.
+    aw.write_json("checkpoint.json", {"c": ["a", "b"]})
+    assert aw.get_results("c") == {}
+    assert aw.is_done("c", "a")
+
+
+def test_manifest_excludes_execution_log():
+    """The log is flushed AFTER the manifest, so checksumming it would fail verify on every run."""
+    from src.exporters.artifact_writer import _excluded_from_manifest
+    assert _excluded_from_manifest("manifest.json")
+    assert _excluded_from_manifest("execution_export.log")
+    assert _excluded_from_manifest("execution_inventory.log")
+    assert not _excluded_from_manifest("export_index.json")
+    assert not _excluded_from_manifest("inventory.json")
+    # Not over-broad: a real artifact that merely contains "log" stays in the manifest.
+    assert not _excluded_from_manifest("changelog.json")
+
+
+def test_logger_survives_a_filesystem_that_rejects_append():
+    """THE regression test for the truncated log.
+
+    A UC Volume rejects `open(path, "a")` once the file exists. The logger swallowed that (so
+    logging could never break the pipeline), which meant a whole live export produced a ONE-LINE
+    execution log. Simulate that filesystem exactly and require every record to survive.
+    Verified against the pre-fix logger: it writes 1 line here.
+    """
+    import builtins
+    import json as _j
+    import os
+    import tempfile
+    from src.utils import logger as lg
+
+    real_open = builtins.open
+    dest = os.path.join(tempfile.mkdtemp(), "execution_export.log")
+
+    def hostile_open(file, mode="r", *a, **k):
+        if str(file) == dest and "a" in mode and os.path.exists(str(file)):
+            raise OSError(95, "Operation not supported")   # what the Volume does
+        return real_open(file, mode, *a, **k)
+
+    builtins.open = hostile_open
+    try:
+        lg.set_log_file(dest)
+        log = lg.get_logger("probe")
+        for i in range(120):        # spans several mirror intervals
+            log.info("record", i=i)
+        log.warning("a warning")
+        lg.flush_log_file()
+    finally:
+        builtins.open = real_open
+        lg.set_log_file(None)
+
+    lines = [_j.loads(x) for x in real_open(dest, encoding="utf-8").read().strip().split("\n")]
+    assert len(lines) == 121, f"expected 121 records, got {len(lines)} (append-truncation bug)"
+    assert [r["i"] for r in lines if "i" in r] == list(range(120)), "records lost or reordered"
+    assert lines[-1]["level"] == "WARNING"
+
+
+def test_logger_survives_append_hostile_dest_and_verifies_manifest():
+    """End-to-end: many log records + a manifest build, then verify_manifest must pass.
+
+    Reproduces the live fvm1 bug two ways — (a) a log truncated to one line, (b) a manifest that
+    mismatches because the log grew after being checksummed.
+    """
+    import tempfile
+    import os
+    from src.utils import logger as lg
+    from src.exporters.artifact_writer import ArtifactWriter
+
+    tmp = tempfile.mkdtemp()
+
+    class Cfg:
+        run_id = "r"
+        source_workspace_id = "ws"
+        output_path = tmp
+    aw = ArtifactWriter(Cfg())
+    aw.ensure_output_path()
+
+    dest = os.path.join(tmp, "execution_export.log")
+    lg.set_log_file(dest)
+    log = lg.get_logger("t")
+    try:
+        for i in range(60):          # > _MIRROR_EVERY, so several mirrors happen mid-run
+            log.info("record", i=i)
+        aw.write_json("export_index.json", {"units": []})
+        aw.write_manifest({"notebook": 0})
+        log.info("after manifest")   # the real post-manifest flush case
+        log.warning("and a warning")
+        lg.flush_log_file()
+
+        import json as _j
+        lines = [_j.loads(x) for x in open(dest, encoding="utf-8").read().strip().split("\n")]
+        # 60 numbered records + write_manifest's own "manifest written" + 2 post-manifest records.
+        assert len(lines) == 63, f"expected 63 records, got {len(lines)} (append-truncation bug)"
+        assert [r.get("i") for r in lines if "i" in r] == list(range(60)), "records lost/reordered"
+        assert lines[-1]["level"] == "WARNING" and lines[-2]["msg"] == "after manifest"
+
+        v = aw.verify_manifest()
+        assert v["ok"], f"manifest must verify despite the log growing after it: {v}"
+        assert not any("execution" in p for p in
+                       [f["path"] for f in v["manifest"]["files"]])
+    finally:
+        lg.set_log_file(None)
+
+
 # ─────────────────────────── content_fetcher ───────────────────────────────
 
 def test_content_fetcher_success(tmp_path=None):

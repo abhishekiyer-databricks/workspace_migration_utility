@@ -547,7 +547,19 @@ concern, but Export's job is to make it possible and to flag the prerequisite:
   integrity).
 - **Auth / no cross-workspace:** same context-token client as inventory; content fetch hits only
   the source workspace. No target calls, no secrets, no OAuth M2M.
-- **Logging:** `execution_export.log` alongside inventory's log (separate `get_logger` sink).
+- **Logging:** `execution_export.log`, alongside inventory's `execution_inventory.log` (they used
+  to share one filename, interleaving two runs' records in one file).
+  **Records are appended to a LOCAL `/tmp` file and mirrored onto the Volume** every 25 records,
+  on every WARNING/ERROR, and on the final `flush_log_file()` the notebook calls. Reason: a UC
+  Volume rejects `open(path, "a")` once the file exists, and the logger deliberately swallows its
+  own errors (logging must never break the pipeline) — so a whole live export wrote a **one-line**
+  log with every subsequent record silently lost (observed on fvm1 2026-08-03, runs `20260803_131153`
+  and `20260803_150903`). Same local-then-copy pattern as the .xlsx writer. Regression-tested
+  against a simulated append-rejecting filesystem in
+  `test_export::test_logger_survives_a_filesystem_that_rejects_append`.
+  `manifest.json` **excludes** `execution_*.log`: the log is still being written after the manifest
+  is built (the final flush), so checksumming it would fail `verify_manifest()` on every run. The
+  log is a diagnostic, not part of the handoff.
 
 ### 7a. Resumable checkpointing — read state from the Volume, pick up where it left off (review)
 
@@ -559,12 +571,25 @@ bundle in the Volume** and continue. Mechanism:
   local `/tmp`) — so it survives job death and is the same file a re-run reads. `ArtifactWriter`
   already has `is_done(component, item_key)` / `mark_done(...)` backed by a JSON file on the
   Volume; Export uses it keyed by `component="export:<asset_type>"`, `item_key=natural_key`.
-- **Per-unit granularity.** After each unit's artifact (payload row, and content bytes if any) is
-  fully written **and flushed**, `mark_done` records it. A unit is only marked done once its bytes
-  are on disk — so an interruption mid-write never marks a partial unit complete.
-- **Re-run flow:** on start, `export_runner` loads `export_checkpoint.json` from the Volume; for
-  every unit it first checks `is_done(...)` and **skips** already-completed units (their prior
-  index row is retained), only exporting the remainder. Content bytes already in `content/` are
+- **Content-pass granularity, flushed in BATCHES (`CHECKPOINT_BATCH = 200`).** Only the content
+  pass is checkpointed — everything else is an in-memory transform of `inventory.json`, rebuilt in
+  seconds, so tracking it would cost more than redoing it. A unit is recorded only once its bytes
+  are on disk, so an interruption mid-write never marks a partial unit complete.
+  **Why batches:** every flush REWRITES the whole checkpoint (append does not work on a UC
+  Volume), so a flush per file is O(n²) bytes — ~3.7 GB for 5k notebooks — while a single flush at
+  the end of the pass loses all download progress on a crash. 200 costs ~26 rewrites (~20 MB) for
+  5k files and bounds the re-fetch after a crash to one batch.
+- **The checkpoint stores each item's OUTCOME, not just its key** (`"export:content:results"`,
+  written atomically with the key list). Without this, resume was **dead code for the case it
+  existed for**: rebuilding a resumed unit needs its `export_status`/`content_ref`, which used to
+  come from the previous `export_index.json` — but the index is written only AFTER the content
+  pass, so following a crash it is absent and every file was re-fetched despite a valid
+  checkpoint. Caught by simulating a real mid-pass crash; regression-tested in
+  `test_export::test_content_pass_resumes_after_a_crash`. The prior index is still consulted as a
+  fallback so checkpoints from older runs keep working.
+- **Re-run flow:** on start, `export_runner` loads `checkpoint.json` from the Volume; for
+  every unit it first checks `is_done(...)` and **skips** already-completed units (their recorded
+  outcome is restored), only exporting the remainder. Content bytes already in `content/` are
   left untouched. The final `export_index.json`, `export_status.xlsx`, and `manifest.json` are
   always regenerated at the end so they reflect the **complete** bundle (done-before + done-now).
 - **Fingerprint interplay:** because the fingerprint is deterministic, a resumed unit produces the

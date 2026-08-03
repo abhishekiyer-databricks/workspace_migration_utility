@@ -122,7 +122,9 @@ except Exception as _exc:  # noqa: BLE001
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-_logger.set_log_file(os.path.join(aw.ensure_output_path(), "execution_export.log"))
+# Inventory gets its OWN log file — it used to share `execution_export.log` with 02_Export, so
+# the two runs' records landed in one file with no way to tell them apart.
+_logger.set_log_file(os.path.join(aw.ensure_output_path(), "execution_inventory.log"))
 
 result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
 
@@ -136,3 +138,7 @@ if result["warnings"]:
         print("  -", w)
 print(f"\nArtifacts: {result['output_path']}")
 print("  inventory.json / inventory.html / inventory.xlsx / identity_classification.json")
+
+# Push the last log records to the Volume (the log is appended locally, then mirrored — append
+# straight onto a UC Volume silently fails, which used to truncate the log to one line).
+_logger.flush_log_file()
