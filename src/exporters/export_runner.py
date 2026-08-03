@@ -1,0 +1,287 @@
+"""
+ExportRunner — orchestrates `02_Export` (SOURCE side). Mirrors InventoryRunner (Plan 2 §6).
+
+Flow:
+  1. Load `inventory.json` from the resolved run's bundle dir (Export reuses inventory — it does
+     NOT re-list the source; §2). If absent, run inventory first so the run is self-consistent.
+  2. Build create-ready per-unit export records from the inventory (`asset_export.build_all`).
+  3. Apply per-asset toggles → toggled-off families become `skip` rows (kept in the index).
+  4. Collect ACLs → `export/acls.json`; stamp `acl_grants` counts onto units (`acl_writer`).
+  5. Parallel content pass: fetch notebook/file BYTES (§7c) — the only slow step; resumable via
+     the checkpoint so a re-run skips already-fetched content (§7a).
+  6. Write per-asset payload files, `export_index.json` (the tie-back ledger), `oversize_
+     artifacts.json`, `manual_actions.md`, `export_status.xlsx`, then `manifest.json` LAST
+     (its presence = the bundle is complete, which drives resume detection).
+
+Fail-soft throughout: one unit's failure is recorded (status+note+WARNING log) and the run
+continues; the bundle is always finished + manifested. No target calls, no secrets.
+"""
+from __future__ import annotations
+
+from src.exporters.acl_writer import acl_counts, collect_acls
+from src.exporters.asset_export import TOGGLE_FOR, build_all, index_record
+from src.exporters.content_fetcher import ContentFetcher
+from src.exporters.parallel import Locked, parallel_map
+from src.utils.helpers import now_iso
+from src.utils.logger import get_logger
+
+_LOG = get_logger("export")
+
+# Statuses that mean "the payload/content was actually produced" (counted as done).
+_PRODUCED = {"success", "skipped_oversize"}
+
+
+class ExportRunner:
+    def __init__(self, client, config, artifact_writer, dbutils=None,
+                 content_fetch_workers: int = 8, force_full_export: bool = False) -> None:
+        self.client = client
+        self.config = config
+        self.aw = artifact_writer
+        self.dbutils = dbutils
+        self.workers = int(content_fetch_workers or 1)
+        self.force_full = bool(force_full_export)
+
+    # ── inventory input ────────────────────────────────────────────────────
+    def _load_inventory(self) -> dict:
+        inv = self.aw.read_json("inventory.json")
+        if inv is None:
+            _LOG.warning("inventory.json absent — running inventory first for a consistent bundle")
+            from src.collectors.inventory_runner import InventoryRunner
+            InventoryRunner(self.client, self.config, self.aw, self.dbutils).run()
+            inv = self.aw.read_json("inventory.json") or {}
+        return inv
+
+    def run(self) -> dict:
+        self.aw.ensure_output_path()
+        inventory = self._load_inventory()
+        objects_by_type = inventory.get("objects_by_type", {}) or {}
+
+        # 2. Build units (pure transform).
+        units_by_type = build_all(objects_by_type)
+
+        # 3. Toggles → skip toggled-off families (still recorded).
+        self._apply_toggles(units_by_type)
+
+        # 4. ACLs → acls.json + stamp counts.
+        acls = collect_acls(objects_by_type)
+        self.aw.write_json("export/acls.json", acls)
+        counts_by_key = acl_counts(acls)
+        for units in units_by_type.values():
+            for u in units:
+                u["acl_grants"] = counts_by_key.get((u["asset_type"], u["natural_key"]), 0)
+
+        # 5. Parallel content pass (resumable).
+        oversize_rows = self._fetch_content(units_by_type)
+
+        # 6. Write artifacts.
+        self._write_artifact_files(units_by_type)
+        self.aw.write_json("export/oversize_artifacts.json", oversize_rows)
+        self._write_manual_actions(units_by_type, oversize_rows)
+
+        index = self._build_index(units_by_type)
+        self.aw.write_json("export_index.json", index)
+        self._append_export_config()
+        self._write_excel(objects_by_type, index)
+
+        # manifest LAST — its presence marks the bundle complete (resume detection, §7a).
+        asset_counts = {t: len(u) for t, u in units_by_type.items()}
+        self.aw.write_manifest(asset_counts)
+
+        summary = self._summary(index)
+        _LOG.info("export complete", **{k: summary[k] for k in ("total", "success", "failure",
+                                                                 "skipped_oversize", "manual",
+                                                                 "dab", "skip")})
+        summary["output_path"] = self.aw.root
+        return summary
+
+    # ── toggles ──────────────────────────────────────────────────────────
+    def _apply_toggles(self, units_by_type: dict) -> None:
+        for asset_type, units in units_by_type.items():
+            toggle_name = TOGGLE_FOR.get(asset_type)
+            if not toggle_name:
+                continue   # inventory-only families (app/lakebase) have no toggle
+            if not getattr(self.config.toggles, toggle_name, True):
+                for u in units:
+                    u["export_status"] = "skip"
+                    u["note"] = f"toggle migrate_{toggle_name}=false"
+
+    # ── content fetch (parallel, resumable) ────────────────────────────────
+    def _fetch_content(self, units_by_type: dict) -> list[dict]:
+        """Fetch bytes for content units not toggled-off. Returns the oversize rows list.
+
+        Resume (§7a): a content unit already marked done in the checkpoint is skipped and its
+        prior index row (content_ref/status) reused from the previous export_index.json.
+        """
+        content_units = [u for at in ("notebook", "workspace_file")
+                         for u in units_by_type.get(at, [])
+                         if u["export_status"] != "skip"]
+        if not content_units:
+            return []
+
+        prior = self._prior_index_by_key()
+        fetcher = ContentFetcher(self.client, self.aw)
+        shared = Locked({"oversize": []})
+
+        # Split into resumable (already done) vs to-fetch.
+        to_fetch = []
+        for u in content_units:
+            done = (not self.force_full) and self.aw.is_done("export:content", u["natural_key"])
+            row = prior.get((u["asset_type"], u["natural_key"])) if done else None
+            if done and row and row.get("export_status") in _PRODUCED:
+                # reuse prior result — bytes already on the Volume
+                u["export_status"] = row["export_status"]
+                u["content_ref"] = row.get("content_ref")
+                u["content_route"] = row.get("content_route", "")
+                u["note"] = row.get("note", u.get("note", ""))
+                if row.get("export_status") == "skipped_oversize" and row.get("oversize"):
+                    with shared as s:
+                        s["oversize"].append(row["oversize"])
+            else:
+                to_fetch.append(u)
+
+        _LOG.info("content pass", to_fetch=len(to_fetch), resumed=len(content_units) - len(to_fetch),
+                  workers=self.workers)
+
+        # parallel_map returns (item, result, error); here item IS the unit and result is the
+        # FetchResult (a worker that raised puts the exception in `error`, result stays None). The
+        # loop runs on the MAIN thread after the pool joins, so unit mutation + the checkpoint
+        # flush need no lock. Done-keys are collected and flushed ONCE (mark_done_bulk) to avoid
+        # rewriting the whole checkpoint file per notebook (§7c).
+        done_keys: list[str] = []
+        for unit, res, err in parallel_map(to_fetch, fetcher.fetch, self.workers):
+            if err is not None:
+                unit["export_status"] = "failure"
+                unit["note"] = f"content fetch worker error: {err}"
+                _LOG.warning("content worker error", path=unit["natural_key"], error=str(err))
+                continue
+            unit["export_status"] = res.status
+            unit["content_ref"] = res.content_ref
+            unit["content_route"] = res.content_route
+            if res.note:
+                unit["note"] = res.note
+            if res.status == "skipped_oversize" and res.oversize:
+                oversize_row = dict(res.oversize)
+                oversize_row.update({"asset_type": unit["asset_type"],
+                                     "natural_key": unit["natural_key"]})
+                unit["oversize"] = oversize_row
+                with shared as s:
+                    s["oversize"].append(oversize_row)
+            if res.status in _PRODUCED:
+                done_keys.append(unit["natural_key"])
+        self.aw.mark_done_bulk("export:content", done_keys)
+
+        return shared.value["oversize"]
+
+    def _prior_index_by_key(self) -> dict:
+        prior = self.aw.read_json("export_index.json") or {}
+        out = {}
+        for row in prior.get("units", []) or []:
+            out[(row.get("asset_type"), row.get("natural_key"))] = row
+        return out
+
+    # ── artifact files ─────────────────────────────────────────────────────
+    def _write_artifact_files(self, units_by_type: dict) -> None:
+        """Group payload-bearing units by their artifact file and write each.
+
+        Only units with a real create payload (mode auto/content, not skipped) are written into
+        the per-asset files; skip/manual/dab units live only in the index (with their reason).
+        """
+        from src.exporters.asset_export import ARTIFACT_PATH
+        by_file: dict[str, list] = {}
+        for units in units_by_type.values():
+            for u in units:
+                if u["migration_mode"] not in ("auto", "content"):
+                    continue
+                if u["export_status"] == "skip":
+                    continue
+                path = u.get("artifact") or ARTIFACT_PATH.get(u["asset_type"], "")
+                if not path:
+                    continue
+                by_file.setdefault(path, []).append(self._artifact_unit(u))
+        for path, units in by_file.items():
+            self.aw.write_json(path, {"generated_utc": now_iso(), "units": units})
+
+    @staticmethod
+    def _artifact_unit(u: dict) -> dict:
+        """The unit as written into a per-asset payload file (payload kept; index-only noise out)."""
+        # `import_action` rides along with the payload, not just in the index: the importer
+        # reads these per-asset files to decide CREATE vs ASSIGN, and for an account-managed
+        # identity (Azure UMI / Entra SP) that distinction is load-bearing — creating one
+        # instead of assigning it mints a new applicationId and orphans its ACLs.
+        keep = ("asset_type", "natural_key", "source_id", "fingerprint", "migration_mode",
+                "content_ref", "content_route", "payload", "classification", "import_action",
+                "owner")
+        return {k: u[k] for k in keep if k in u}
+
+    # ── index (the ledger) ─────────────────────────────────────────────────
+    def _build_index(self, units_by_type: dict) -> dict:
+        units = [index_record(u) for units in units_by_type.values() for u in units]
+        units.sort(key=lambda r: (r["asset_type"], r["natural_key"]))
+        counts: dict[str, dict] = {}
+        for r in units:
+            at = r["asset_type"]
+            bucket = counts.setdefault(at, {"total": 0})
+            bucket["total"] += 1
+            st = r["export_status"]
+            bucket[st] = bucket.get(st, 0) + 1
+        return {
+            "run_id": self.config.run_id,
+            "source_workspace_id": self.config.source_workspace_id,
+            "generated_utc": now_iso(),
+            "tool_version": _tool_version(),
+            "units": units,
+            "counts": counts,
+        }
+
+    def _summary(self, index: dict) -> dict:
+        out = {"total": 0, "success": 0, "failure": 0, "skipped_oversize": 0,
+               "manual": 0, "dab": 0, "skip": 0, "covered": 0, "incomplete": 0}
+        for r in index["units"]:
+            out["total"] += 1
+            out[r["export_status"]] = out.get(r["export_status"], 0) + 1
+        out["counts"] = index["counts"]
+        return out
+
+    # ── manual actions + config append + excel ──────────────────────────────
+    def _write_manual_actions(self, units_by_type: dict, oversize_rows: list) -> None:
+        lines = ["# Manual actions required after import", "",
+                 "Generated by 02_Export. These units cannot be auto-recreated by this tool.", ""]
+        buckets: dict[str, list] = {}
+        for units in units_by_type.values():
+            for u in units:
+                if u["migration_mode"] == "manual" or u["export_status"] == "manual":
+                    buckets.setdefault(u["asset_type"], []).append(u)
+        for asset_type in sorted(buckets):
+            lines.append(f"## {asset_type} ({len(buckets[asset_type])})")
+            for u in sorted(buckets[asset_type], key=lambda x: x["natural_key"]):
+                note = f" — {u['note']}" if u.get("note") else ""
+                lines.append(f"- `{u['natural_key']}`{note}")
+            lines.append("")
+        if oversize_rows:
+            lines.append(f"## oversize — manual copy needed ({len(oversize_rows)})")
+            for o in oversize_rows:
+                lines.append(f"- `{o.get('natural_key', o.get('path'))}` "
+                             f"({o.get('size', 0)} bytes) — {o.get('recommended', '')}")
+            lines.append("")
+        self.aw.write_bytes("export/manual/manual_actions.md", "\n".join(lines).encode("utf-8"))
+
+    def _append_export_config(self) -> None:
+        cfg = self.aw.read_json("config_resolved.json") or {}
+        cfg["export_options"] = {"content_fetch_workers": self.workers,
+                                 "force_full_export": self.force_full}
+        self.aw.write_json("config_resolved.json", cfg)
+
+    def _write_excel(self, objects_by_type: dict, index: dict) -> None:
+        try:
+            from src.exporters.export_excel import generate_export_excel
+            self.aw.write_text_local_then_copy(
+                "export_status.xlsx",
+                lambda local: generate_export_excel(objects_by_type, index, local, self.config),
+            )
+        except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
+            _LOG.warning("export excel skipped", error=str(exc))
+
+
+def _tool_version() -> str:
+    from src.exporters.artifact_writer import TOOL_VERSION
+    return TOOL_VERSION

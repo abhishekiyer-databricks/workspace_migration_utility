@@ -29,6 +29,9 @@ class WorkspaceCollector(BaseCollector):
         self._max_calls = int(getattr(self.config, "max_ws_api_calls", 0) or 0)
         self._max_items = int(getattr(self.config, "max_workspace_items", 0) or 0)
         self._repo_ids: set[str] = set()   # git folders found during the walk (by object_id)
+        # DAB bundle state files seen during the walk → feed DabRegistry (pathless-asset DAB
+        # detection). Public so the runner can read it after the collector runs.
+        self.bundle_state_paths: set[str] = set()
         objs: list[dict] = []
         self._walk("/", objs)
         objs.extend(self._repos())
@@ -97,11 +100,26 @@ class WorkspaceCollector(BaseCollector):
                 "object_type": otype,
                 "language": safe_str(obj.get("language")),
                 "object_id": safe_str(obj.get("object_id")),
+                # DASHBOARD/ALERT entries carry the owning asset's id, which is how their
+                # on-disk twin is matched to its native unit (paths are unreliable: an Alerts V2
+                # record has parent_path=null even on a detail GET). For a DASHBOARD,
+                # `resource_id` IS the Lakeview dashboard_id; for an ALERT, `object_id` is the
+                # alert id (`resource_id` there is an unrelated uuid). Verified live on fvm1.
+                "resource_id": safe_str(obj.get("resource_id")),
                 "is_user_root": self._is_user_root(p),
                 "deployed_by_dab": dab["deployed_by_dab"],
                 "dab_scope": dab["dab_scope"],
                 "acl": self._object_acl(otype, obj.get("object_id")),
             }
+            # Remember bundle STATE files (`<root>/state/resources.json` or the legacy
+            # `terraform.tfstate`). They map each bundle-owned resource to the concrete workspace
+            # id it created, which is the only reliable way to tell that a PATHLESS asset (a
+            # cluster, warehouse, pool, secret scope, serving endpoint) is DAB-managed. See
+            # src/collectors/dab_registry.py for why tag-sniffing can't be used.
+            if otype == "FILE" and "/.bundle/" in p and "/state/" in p \
+                    and p.rsplit("/", 1)[-1] in ("resources.json", "terraform.tfstate"):
+                self.bundle_state_paths.add(p)
+
             out.append(record)
             if otype == "DIRECTORY":
                 self._walk(p, out)

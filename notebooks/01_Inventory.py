@@ -24,6 +24,8 @@ dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
 dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
 dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
 dbutils.widgets.dropdown("verbose", "false", ["true", "false"], "Verbose API logging")
+dbutils.widgets.dropdown("force_full", "false", ["true", "false"],
+                         "Force a fresh snapshot (ignore an incomplete bundle to resume)")
 
 # COMMAND ----------
 
@@ -92,10 +94,26 @@ from src.utils import logger as _logger
 cfg = Config.from_dbutils(dbutils, spark)  # reads role, staging, safety caps, toggles
 assert cfg.role == ROLE_SOURCE, f"This notebook must run with role=source (got {cfg.role!r})"
 
+# Resume model (Plan 2 §7a): with a blank run_id widget, reuse the newest INCOMPLETE bundle's
+# run_id (a whole-job re-run then continues that attempt) rather than minting a new snapshot.
+# An explicit run_id widget, or force_full=true, always wins → a fresh snapshot.
+from src.exporters.bundle_state import resolve_inventory_run_id
+_raw_run_id = (dbutils.widgets.get("run_id") or "").strip()
+_force_full = (dbutils.widgets.get("force_full") or "false").strip().lower() == "true"
+_resolved_run_id, _how = resolve_inventory_run_id(cfg, _raw_run_id, _force_full)
+cfg.run_id = _resolved_run_id
+
 client = build_client(cfg, dbutils=dbutils, spark=spark)  # context token for THIS workspace
 print(f"Source workspace : {cfg.ctx.workspace_url}")
-print(f"Run id           : {cfg.run_id}")
+print(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
 print(f"Staging          : {cfg.output_path}")
+
+# Publish the run_id to a 2-task job's Export task (harmless no-op outside a job). Wrapped so an
+# unusual runtime that doesn't expose jobs.taskValues can never break read-only inventory (§2b).
+try:
+    dbutils.jobs.taskValues.set(key="run_id", value=cfg.run_id)
+except Exception as _exc:  # noqa: BLE001
+    print(f"(taskValues.set skipped: {_exc})")
 
 # COMMAND ----------
 

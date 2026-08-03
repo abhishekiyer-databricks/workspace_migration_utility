@@ -163,3 +163,18 @@ class ArtifactWriter:
         if item_key not in cp[component]:
             cp[component].append(item_key)
         self.write_json("checkpoint.json", cp)
+
+    def mark_done_bulk(self, component: str, item_keys) -> None:
+        """Record many item_keys done in ONE checkpoint write (avoids O(n²) per-item rewrites on
+        the Volume when marking a large batch — e.g. thousands of fetched notebooks; Plan 2 §7c)."""
+        item_keys = [k for k in item_keys]
+        if not item_keys:
+            return
+        cp = self._load_checkpoint()
+        existing = cp.setdefault(component, [])
+        seen = set(existing)
+        for k in item_keys:
+            if k not in seen:
+                existing.append(k)
+                seen.add(k)
+        self.write_json("checkpoint.json", cp)

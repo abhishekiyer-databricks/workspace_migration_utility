@@ -60,6 +60,51 @@ def test_identity_and_classifier():
     assert byname["users"] == IdentityClass.BUILTIN_GROUP.value
 
 
+def test_azure_umi_sp_classifies_as_account_managed():
+    """A real Azure managed identity imported as a Databricks SP must be ASSIGN, not CREATE.
+
+    Verbatim SCIM shape of `ai27_umi` on fvm1 (a UMI created in Azure then imported into the
+    workspace) — the first genuinely account-managed SP available to test against. Two details
+    the synthetic fixture missed:
+      * the workspace SCIM API returns `externalId: null` (an explicit JSON null) for
+        Databricks-managed SPs, not an absent key — `_has_external_id` must treat both alike;
+      * classification must flow through to `import_action`, since recreating a UMI on the
+        target would mint a NEW appId and silently break every ACL that referenced it.
+    """
+    from src.identity.classifier import classify_all, IdentityClass
+    from src.exporters.asset_export import build_all
+    objs = [
+        {"identity_type": "service_principal", "id": "147404773209245",
+         "displayName": "ai27_umi", "applicationId": "5f491556-5401-4d38-b0b7-16ffd932f073",
+         "externalId": "8904a5fb-c70c-4d33-b6de-4a4db708a5b4", "active": True,
+         "_raw": {"applicationId": "5f491556-5401-4d38-b0b7-16ffd932f073",
+                  "displayName": "ai27_umi",
+                  "externalId": "8904a5fb-c70c-4d33-b6de-4a4db708a5b4", "active": True}},
+        # Databricks-managed: the API sends an explicit null here, not a missing field.
+        {"identity_type": "service_principal", "id": "147439412262841",
+         "displayName": "wsmig_test_db_sp", "applicationId": "18abea3e-5de8-4f74-b678-de67cf2270a2",
+         "externalId": None, "active": True,
+         "_raw": {"applicationId": "18abea3e-5de8-4f74-b678-de67cf2270a2",
+                  "displayName": "wsmig_test_db_sp", "externalId": None, "active": True}},
+    ]
+    classify_all(objs)
+    by_name = {o["displayName"]: o for o in objs}
+    assert by_name["ai27_umi"]["classification"] == IdentityClass.UMI_OR_ENTRA_SP.value
+    assert by_name["wsmig_test_db_sp"]["classification"] == IdentityClass.DB_MANAGED_SP.value
+
+    units = {u["natural_key"]: u for u in build_all({"identity": objs})["service_principal"]}
+    umi = units["5f491556-5401-4d38-b0b7-16ffd932f073"]
+    assert umi["import_action"] == "assign_on_target", \
+        "recreating a UMI would mint a new appId and orphan its ACLs"
+    assert units["18abea3e-5de8-4f74-b678-de67cf2270a2"]["import_action"] == "create"
+    # the stable Azure appId is what the target assigns by, so it must survive the export
+    assert umi["payload"]["applicationId"] == "5f491556-5401-4d38-b0b7-16ffd932f073"
+
+    # and the report labels it as Entra-managed rather than blank
+    from src.reports.inventory_view import _sp_managed
+    assert _sp_managed(by_name["ai27_umi"]["classification"]) == "Entra / UMI"
+
+
 def test_compute():
     from src.collectors.compute_collector import ComputeCollector
     gt = {

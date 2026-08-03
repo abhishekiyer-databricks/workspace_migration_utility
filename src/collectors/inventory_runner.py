@@ -47,11 +47,20 @@ class InventoryRunner:
         objects_by_type: dict[str, list] = {}
         stats: list[dict] = []
 
+        bundle_state_paths: set[str] = set()
         for cls in _COLLECTORS:
             coll = cls(self.client, self.config, self.dbutils)
             objs = coll.run()
             objects_by_type[coll.object_type] = objs
             stats.append(coll.stats())
+            # The workspace walk is what discovers DAB bundle state files.
+            bundle_state_paths |= getattr(coll, "bundle_state_paths", set()) or set()
+
+        # Stamp DAB ownership on assets that have NO workspace path (clusters, pools, warehouses,
+        # secret scopes, serving endpoints). Path-based detection already covered the workspace
+        # tree; this closes the gap for everything else. Fail-soft: an empty registry just means
+        # nothing is claimed, so assets export normally rather than being wrongly skipped.
+        self._stamp_dab_ownership(objects_by_type, bundle_state_paths)
 
         # Classify identities (annotates in place).
         identities = objects_by_type.get("identity", [])
@@ -78,9 +87,55 @@ class InventoryRunner:
         self._write_html(objects_by_type, counts, stats, id_summary, warnings)
         self._write_excel(objects_by_type, counts)
 
+        # Drop the LATEST_INVENTORY.json pointer at the wsmig root so 02_Export — even when run
+        # as a SEPARATE job/run — can resolve this run_id with a blank run_id widget (Plan 2 §2b).
+        # Best-effort: a pointer hiccup must never fail the read-only inventory.
+        try:
+            from src.exporters.bundle_state import write_latest_pointer
+            write_latest_pointer(self.config, self.config.run_id, counts)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("latest-inventory pointer not written", error=str(exc))
+
         _LOG.info("inventory complete", total=sum(counts.values()), warnings=len(warnings))
         return {"counts": counts, "identity_summary": id_summary,
                 "warnings": warnings, "output_path": self.aw.root}
+
+    # ── DAB ownership for pathless assets ─────────────────────────────────
+    # (collector bucket, id field, asset_type as the bundle state names it)
+    _DAB_STAMP_TARGETS = (
+        ("compute", "instance_pool_id", "instance_pool"),
+        ("compute", "cluster_id", "cluster"),
+        ("secret_scope", "name", "secret_scope"),
+        ("serving_endpoint", "name", "serving_endpoint"),
+        ("sql", "id", "sql_warehouse"),
+    )
+
+    def _stamp_dab_ownership(self, objects_by_type: dict, bundle_state_paths: set) -> None:
+        if not bundle_state_paths:
+            return
+        from src.collectors.dab_registry import DabRegistry
+        try:
+            reg = DabRegistry.build(self.client, sorted(bundle_state_paths))
+        except Exception as exc:  # noqa: BLE001 — never fail inventory over DAB detection
+            _LOG.warning("DAB registry build failed", error=str(exc))
+            return
+        if not len(reg):
+            return
+        stamped = 0
+        for bucket, id_field, asset_type in self._DAB_STAMP_TARGETS:
+            for rec in objects_by_type.get(bucket, []) or []:
+                # only consider records of the right kind within a mixed bucket
+                if bucket == "compute" and not str(rec.get(id_field) or "").strip():
+                    continue
+                if bucket == "sql" and rec.get("sql_type") != "warehouse":
+                    continue
+                if reg.owns(asset_type, rec.get(id_field)):
+                    rec["deployed_by_dab"] = True
+                    rec["dab_scope"] = ("shared" if "/Shared/" in reg.bundle_of(
+                        asset_type, rec.get(id_field)) else "user")
+                    stamped += 1
+        _LOG.info("DAB ownership stamped", bundles=len(reg.bundles),
+                  resources=len(reg), assets_flagged=stamped)
 
     def _write_html(self, objects_by_type, counts, stats, id_summary, warnings) -> None:
         from src.reports.html_generator import render_inventory
