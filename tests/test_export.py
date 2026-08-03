@@ -131,6 +131,10 @@ def test_dab_owned_pathless_assets_are_not_recreated():
         u = units[at][0]
         assert u["export_status"] == "dab", f"{at} should be dab, got {u['export_status']}"
         assert u["payload"] == {}, f"{at} must carry no create payload"
+        # `dab` on its own reads as "not exported" — the paired action is what tells the operator
+        # the bundle redeploy recreates it and import deliberately skips it.
+        assert u["import_action"] == "dab_redeploy", \
+            f"{at} action should be dab_redeploy, got {u['import_action']}"
     # the scope's VALUES are still a manual action even though DAB redeploys the scope
     assert units["secret_value"][0]["migration_mode"] == "manual"
 
@@ -160,6 +164,50 @@ def test_identity_import_action_create_vs_assign():
     assert sps["app2"]["import_action"] == "assign_on_target"
 
 
+def test_every_unit_has_a_known_import_action():
+    """The Import Action column is on EVERY sheet, so every unit must carry a valid action.
+
+    Previously only identity units got one; every other tab left the operator inferring intent
+    from the export status, which is how "DAB" got read as "not exported". A blank or unknown
+    action would render "—" and put us back there.
+    """
+    from src.exporters.asset_export import IMPORT_ACTIONS, build_all
+    units_by_type = build_all(_sample_inventory())
+    assert units_by_type, "sample inventory produced no units"
+    for asset_type, units in units_by_type.items():
+        for u in units:
+            act = u.get("import_action")
+            assert act, f"{asset_type}/{u['natural_key']} has no import_action"
+            assert act in IMPORT_ACTIONS, \
+                f"{asset_type}/{u['natural_key']} has unknown action {act!r} (would render '—')"
+    # spot-check the non-`create` verbs, which are the ones a refactor is likeliest to drop
+    by = {at: units_by_type.get(at, []) for at in
+          ("notebook", "workspace_file", "cluster_library", "workspace_conf", "secret_value")}
+    assert all(u["import_action"] == "create_and_upload" for u in by["notebook"] + by["workspace_file"])
+    assert all(u["import_action"] == "install" for u in by["cluster_library"])
+    assert all(u["import_action"] == "set_conf" for u in by["workspace_conf"])
+    assert all(u["import_action"] == "manual" for u in by["secret_value"])
+
+
+def test_import_action_follows_a_late_status_change():
+    """Toggles and the content pass change export_status AFTER build_all stamped the action.
+
+    A toggled-off or oversize unit must not still advertise "CREATE on target" — the runner
+    re-derives the action once statuses are final.
+    """
+    from src.exporters.asset_export import derive_import_action
+    u = {"asset_type": "notebook", "natural_key": "/n", "migration_mode": "content",
+         "export_status": "success"}
+    assert derive_import_action(u) == "create_and_upload"
+    # oversize: recorded, but the bytes never reached the bundle → a human must copy it
+    u["export_status"] = "skipped_oversize"
+    assert derive_import_action(u) == "manual"
+    # toggled off / failed: there is nothing for import to do at all
+    for st in ("skip", "failure"):
+        u["export_status"] = st
+        assert derive_import_action(u) == "none", f"status {st} should yield no action"
+
+
 # ─────────────────────────── asset_export ──────────────────────────────────
 
 def _sample_inventory():
@@ -167,8 +215,12 @@ def _sample_inventory():
         "identity": [
             {"identity_type": "user", "id": "u1", "userName": "alice@corp.com",
              "classification": "entra_user", "_raw": {"id": "u1", "userName": "alice@corp.com"}},
+            # `_raw` must carry applicationId: the report adapter reads the SP display row from
+            # `_raw`, and the workbook joins Export Status / Import Action on the natural key
+            # (= applicationId). Without it both columns rendered "—" for this row.
             {"identity_type": "service_principal", "id": "s1", "applicationId": "app-dbx",
-             "classification": "db_managed_sp", "has_secrets": True, "_raw": {"id": "s1"}},
+             "classification": "db_managed_sp", "has_secrets": True,
+             "_raw": {"id": "s1", "applicationId": "app-dbx", "displayName": "sp-one"}},
             {"identity_type": "group", "id": "g1", "displayName": "eng",
              "classification": "db_managed_group", "_raw": {"id": "g1", "displayName": "eng"}},
             {"identity_type": "group", "id": "g2", "displayName": "admins",

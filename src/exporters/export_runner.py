@@ -19,7 +19,12 @@ continues; the bundle is always finished + manifested. No target calls, no secre
 from __future__ import annotations
 
 from src.exporters.acl_writer import acl_counts, collect_acls
-from src.exporters.asset_export import TOGGLE_FOR, build_all, index_record
+from src.exporters.asset_export import (
+    TOGGLE_FOR,
+    build_all,
+    derive_import_action,
+    index_record,
+)
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
 from src.utils.helpers import now_iso
@@ -73,6 +78,11 @@ class ExportRunner:
         # 5. Parallel content pass (resumable).
         oversize_rows = self._fetch_content(units_by_type)
 
+        # Re-derive import_action now that every status is final. Toggles (step 3) and the
+        # content pass (step 5) can change a unit's export_status AFTER build_all stamped it —
+        # a toggled-off or oversize unit must not still advertise "CREATE on target".
+        self._refresh_import_actions(units_by_type)
+
         # 6. Write artifacts.
         self._write_artifact_files(units_by_type)
         self.aw.write_json("export/oversize_artifacts.json", oversize_rows)
@@ -104,6 +114,12 @@ class ExportRunner:
                 for u in units:
                     u["export_status"] = "skip"
                     u["note"] = f"toggle migrate_{toggle_name}=false"
+
+    @staticmethod
+    def _refresh_import_actions(units_by_type: dict) -> None:
+        for units in units_by_type.values():
+            for u in units:
+                u["import_action"] = derive_import_action(u)
 
     # ── content fetch (parallel, resumable) ────────────────────────────────
     def _fetch_content(self, units_by_type: dict) -> list[dict]:
@@ -218,12 +234,18 @@ class ExportRunner:
         units = [index_record(u) for units in units_by_type.values() for u in units]
         units.sort(key=lambda r: (r["asset_type"], r["natural_key"]))
         counts: dict[str, dict] = {}
+        # Per-asset_type status counts, plus a flat count by import_action — the latter answers
+        # "how much does the tool do vs. the bundle vs. a human?" in one glance, which no
+        # per-type status table can.
+        action_counts: dict[str, int] = {}
         for r in units:
             at = r["asset_type"]
             bucket = counts.setdefault(at, {"total": 0})
             bucket["total"] += 1
             st = r["export_status"]
             bucket[st] = bucket.get(st, 0) + 1
+            act = r.get("import_action") or ""
+            action_counts[act] = action_counts.get(act, 0) + 1
         return {
             "run_id": self.config.run_id,
             "source_workspace_id": self.config.source_workspace_id,
@@ -231,6 +253,7 @@ class ExportRunner:
             "tool_version": _tool_version(),
             "units": units,
             "counts": counts,
+            "action_counts": action_counts,
         }
 
     def _summary(self, index: dict) -> dict:
@@ -240,6 +263,7 @@ class ExportRunner:
             out["total"] += 1
             out[r["export_status"]] = out.get(r["export_status"], 0) + 1
         out["counts"] = index["counts"]
+        out["action_counts"] = index.get("action_counts", {})
         return out
 
     # ── manual actions + config append + excel ──────────────────────────────

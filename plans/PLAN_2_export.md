@@ -176,6 +176,7 @@ summarized in `export_index.json`):
   "migratable": true,
   "migration_mode": "auto",              // auto | content | manual | dab   (see §5)
   "export_status": "success",            // success | failure | skip | manual | dab | incomplete
+  "import_action": "create",             // what the TARGET side does with it — see §6a table
   "artifact": "export/jobs.json",         // file the payload lives in
   "content_ref": null,                    // for content assets: path to the bytes file
   "note": "",                             // reason for failure/skip/manual/dab/incomplete/partial
@@ -190,6 +191,13 @@ summarized in `export_index.json`):
 API size limit that even the streaming fallback can't carry — WARNING + listed in
 `oversize_artifacts.json`, NOT a failure; see §5a) · `incomplete` (a traversal cap cut a listing
 off mid-way — §7b).
+
+`import_action` answers the SEPARATE question "what will the target side do with this unit?" and is
+carried on **every** unit (not just identity), in both the index and the per-asset payload files.
+It is derived from `classification` (identity) → `migration_mode` → `asset_type` overrides, then
+overridden by a status that means "nothing to import" (`skip`/`failure` → `none`,
+`skipped_oversize` → `manual`). The runner **re-derives it after toggles and the content pass**, so
+a unit whose status changed late never advertises a stale action. Full value table in §6a.
 
 **`export_index.json`** (bundle root) — the ledger:
 ```jsonc
@@ -447,9 +455,11 @@ reviews right after export.
 ## 6a. Post-export Excel (`export_status.xlsx`) — review point 1
 
 The operator's checkpoint after export. Base = the **inventory Excel** (same sheets, order,
-icons, columns — reuse `reports/inventory_view.py` + `excel_generator.py`), with **one column
-added to every per-asset sheet**: **Export Status**, joined from `export_index.json` on
+icons, columns — reuse `reports/inventory_view.py` + `excel_generator.py`), with **two columns
+added to every per-asset sheet**, both joined from `export_index.json` on
 `(asset_type, natural_key)`:
+
+**(1) Export Status** — did EXPORT capture this unit?
 
 | Export Status | Meaning | Cell colour |
 |---|---|---|
@@ -457,16 +467,46 @@ added to every per-asset sheet**: **Export Status**, joined from `export_index.j
 | `Failure` | errored during export — cell shows the `note` (reason) | red |
 | `Skip` | asset toggle off (`migrate_<x>=false`) | grey |
 | `Manual` | Genie / secret values / app / lakebase / UC-backed serving | amber |
-| `DAB` | customer redeploys via Azure DevOps (not exported by design) | blue |
+| `Skipped (DAB)` | bundle-owned: recorded in the ledger, create payload deliberately **not** captured (the customer's bundle redeploy owns the definition) | blue |
+| `Covered (native)` | the on-disk twin of an asset exported via its native API (no double-create) | cyan |
 | `Skipped (oversize)` | workspace content over the API size limit → copy manually (§5a) | amber + ⚠ |
 | `Incomplete` | a traversal cap cut a listing off mid-way — partial, `note` explains | orange |
 
-Plus a **Summary sheet** roll-up: per asset_type counts of each status; a top **failures**
+**(2) Import Action** — what will the TARGET side DO with it? (`import_action` in the index)
+
+| Import Action | Meaning | Cell colour |
+|---|---|---|
+| `CREATE on target` | the utility creates it via REST | green |
+| `CREATE + UPLOAD content` | create the object, then push its bytes (notebooks / files) | green |
+| `INSTALL on target` | attached to an existing object (cluster libraries) | green |
+| `SET on target` | written via the workspace conf API | green |
+| `APPLY ACL on target` | permission grants replayed once the objects exist | green |
+| `ASSIGN (must pre-exist)` | account-level identity: assign + entitle, **never** create (creating an Azure UMI mints a new applicationId and orphans its ACLs) | blue |
+| `ADD MEMBERS (group exists)` | built-in group: PATCH members onto the existing group | green |
+| `DAB REDEPLOY (import skips)` | the customer's bundle pipeline recreates it | blue |
+| `NONE — via native asset` | created as a side effect of its native asset | cyan |
+| `MANUAL on target` | no REST path — a human does it | amber |
+| `REVIEW REQUIRED` | low-confidence classification; confirm before import | amber |
+| `NOT EXPORTED (nothing to import)` | toggled off, or export failed | grey |
+
+**Two columns because one cannot carry both meanings.** A bundle-owned job is `Skipped (DAB)` on
+export yet still lands on target — via the bundle redeploy, which only the action column says.
+The action column originally existed on the identity sheets alone, which left every other tab's
+intent to be inferred from its status (the customer read `DAB` as "not exported"). Actions are a
+closed vocabulary (`asset_export.IMPORT_ACTIONS`) and the Excel label map is asserted against it
+at import time, so a new action can't be added without a label and silently render `—`.
+
+Where a caveat exists the unit's `note` is appended to the action cell — e.g.
+`CREATE on target — UC tables in serialized_space must pre-exist on target`.
+
+Plus a **Summary sheet** roll-up: per asset_type counts of each status; an **Import Action
+roll-up** (how much the tool does vs. the bundle vs. a human — the one question the per-type
+status table can't answer, since one asset_type spans several actions); a top **failures**
 table (red rows, with reason) so real problems surface first; and a separate **"Oversize — manual
 copy needed"** table (the `skipped_oversize` rows with source path + size), kept apart from
 failures so the two aren't conflated.
-Every inventoried row gets a status — no blank cells — which is exactly the "True/False for
-exported" tie-back the review asked for, made human-readable.
+Every inventoried row gets **both** a status and an action — no blank cells — which is exactly the
+"True/False for exported" tie-back the review asked for, made human-readable.
 
 ---
 

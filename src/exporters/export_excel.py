@@ -2,10 +2,20 @@
 export_excel — `export_status.xlsx`: the inventory workbook + an Export Status column (Plan 2 §6a).
 
 The operator's post-export checkpoint. Base = the SAME per-asset sheets/columns/styling as the
-inventory workbook (reuses `inventory_view` metadata + `excel_generator` styling), with ONE column
-added to every per-asset sheet — **Export Status** — joined from `export_index.json` on
-`(asset_type, natural_key)`. Plus a leading **Export Summary** sheet: per-asset_type status counts,
-a failures table (red, reasons first), and a separate "Oversize — manual copy needed" table.
+inventory workbook (reuses `inventory_view` metadata + `excel_generator` styling), with TWO columns
+added to every per-asset sheet, both joined from `export_index.json` on `(asset_type, natural_key)`:
+
+  • **Export Status** — did EXPORT capture this unit? (Success / Skipped (DAB) / Manual / …)
+  • **Import Action** — what will the TARGET side DO with it? (CREATE / ASSIGN / DAB REDEPLOY / …)
+
+Two columns because one can't carry both meanings: a bundle-owned job is "Skipped (DAB)" on export
+yet still lands on target — via the customer's bundle redeploy, which only the action column says.
+Originally the action column existed on the identity sheets alone, which left every other tab's
+intent to be guessed from its status.
+
+Plus a leading **Export Summary** sheet: per-asset_type status counts, an Import Action roll-up
+(how much the tool does vs. the bundle vs. a human), a failures table (red, reasons first), and a
+separate "Oversize — manual copy needed" table.
 
 Every inventoried row gets a status (no blank cells) — the human-readable "exported True/False"
 tie-back. Rendered to a local /tmp path then byte-copied to the Volume (openpyxl-on-FUSE gotcha).
@@ -16,6 +26,7 @@ import json
 import re
 from datetime import datetime
 
+from src.exporters.asset_export import IMPORT_ACTIONS
 from src.reports.inventory_view import (
     _COLUMNS,
     _LABELS,
@@ -58,7 +69,10 @@ _STATUS_STYLE = {
     "failure": ("Failure", "FEE2E2"),
     "skip": ("Skip", "E5E7EB"),
     "manual": ("Manual", "FEF3C7"),
-    "dab": ("DAB", "DBEAFE"),
+    # Bundle-owned: the asset IS in the ledger, but its create payload is intentionally not
+    # captured (the customer's bundle redeploy owns the definition) — so it reads as a
+    # deliberate skip, with the Import Action column naming who recreates it.
+    "dab": ("Skipped (DAB)", "DBEAFE"),
     "covered": ("Covered (native)", "CFFAFE"),
     "skipped_oversize": ("Skipped (oversize) ⚠", "FDE68A"),
     "incomplete": ("Incomplete", "FED7AA"),
@@ -93,27 +107,54 @@ def _status_lookup(index: dict) -> dict:
     return out
 
 
-# Identity cards get an extra column: export_status only says "we captured it", which must not be
-# read as "the tool will create it on target". `import_action` carries that distinction.
-_IDENTITY_CARDS = {"users", "service_principals", "groups"}
+# EVERY per-asset sheet gets an Import Action column: `export_status` only says "we captured it",
+# which must not be read as "the tool will create it on target" — and for bundle-owned assets
+# (which now report Success like everything else) the action column is the ONLY place the
+# "your bundle redeploys this, import skips it" instruction appears.
 _IMPORT_ACTION_LABEL = {
     "create": "CREATE on target",
+    "create_and_upload": "CREATE + UPLOAD content",
     "assign_on_target": "ASSIGN (must pre-exist)",
     "add_members": "ADD MEMBERS (group exists)",
+    "dab_redeploy": "DAB REDEPLOY (import skips)",
+    "via_native_asset": "NONE — via native asset",
+    "install": "INSTALL on target",
+    "set_conf": "SET on target",
+    "apply_acl": "APPLY ACL on target",
+    "manual": "MANUAL on target",
     "review_required": "REVIEW REQUIRED",
+    "none": "NOT EXPORTED (nothing to import)",
     "": "—",
 }
 _IMPORT_ACTION_FILL = {
     "create": "DCFCE7",              # green — the utility does it
+    "create_and_upload": "DCFCE7",   # green — the utility does it (create + bytes)
     "add_members": "DCFCE7",         # green — the utility does it (PATCH members)
+    "install": "DCFCE7",             # green — the utility does it (attach to existing cluster)
+    "set_conf": "DCFCE7",            # green — the utility does it (conf API)
+    "apply_acl": "DCFCE7",           # green — the utility does it (permissions API)
     "assign_on_target": "DBEAFE",    # blue  — account/IT prerequisite
+    "dab_redeploy": "DBEAFE",        # blue  — the customer's bundle pipeline owns it
+    "via_native_asset": "CFFAFE",    # cyan  — happens as a side effect, no separate action
+    "manual": "FEF3C7",              # amber — a human must do it on target
     "review_required": "FEF3C7",     # amber — human must confirm
+    "none": "E5E7EB",                # grey  — nothing to import
     "": "F1F5F9",
 }
 
+# Actions whose cell should also show the unit's note: the note is where the actual caveat lives
+# ("UC tables must pre-exist", "copy the DBFS jar by hand", "client secret not exportable").
+_ACTION_SHOW_NOTE = {"manual", "dab_redeploy", "review_required", "assign_on_target",
+                     "create", "install"}
+
+# Fail loudly if a new action is added to the producer without a label here — otherwise it would
+# render as "—", which is the blank-cell failure mode the customer explicitly rejected.
+_missing_labels = IMPORT_ACTIONS - set(_IMPORT_ACTION_LABEL)
+assert not _missing_labels, f"import_action(s) with no Excel label: {sorted(_missing_labels)}"
+
 
 def _import_action_lookup(index: dict) -> dict:
-    """(asset_type, natural_key) → import_action, for the identity sheets."""
+    """(asset_type, natural_key) → import_action, for every per-asset sheet."""
     out = {}
     for r in index.get("units", []) or []:
         if r.get("import_action"):
@@ -127,7 +168,7 @@ def _import_action_lookup(index: dict) -> dict:
 # for every non-identity card).
 
 
-def _cluster_library_status(row: dict, index_units: list) -> tuple[str, str]:
+def _cluster_library_status(row: dict, index_units: list) -> tuple[str, str, str]:
     """cluster_library natural_key embeds a JSON blob — join by cluster_id + library_name substring."""
     cid = str(row.get("cluster_id") or "")
     lib_name = str(row.get("library_name") or "")
@@ -136,8 +177,8 @@ def _cluster_library_status(row: dict, index_units: list) -> tuple[str, str]:
             continue
         nk = str(u.get("natural_key") or "")
         if nk.startswith(f"{cid}:") and (not lib_name or lib_name in nk):
-            return u.get("export_status", ""), u.get("note", "")
-    return "", ""
+            return u.get("export_status", ""), u.get("note", ""), u.get("import_action", "")
+    return "", "", ""
 
 
 def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
@@ -189,7 +230,12 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
 
     status_cols = ["success", "failure", "skip", "manual", "dab", "covered",
                    "skipped_oversize", "incomplete"]
-    headers = ["Asset Type", "Total"] + [_STATUS_STYLE[s][0].split(" ")[0] for s in status_cols]
+    # Explicit short headers — deriving them from _STATUS_STYLE's first word made "Skipped (DAB)"
+    # and "Skipped (oversize)" both render as "Skipped", two indistinguishable columns.
+    _SHORT = {"success": "Success", "failure": "Failure", "skip": "Skip", "manual": "Manual",
+              "dab": "DAB", "covered": "Covered", "skipped_oversize": "Oversize",
+              "incomplete": "Incomplete"}
+    headers = ["Asset Type", "Total"] + [_SHORT[s] for s in status_cols]
     for col_idx, h in enumerate(headers, 1):
         cc = ws.cell(row=4, column=col_idx, value=h)
         cc.font = _font(bold=True, color="FFFFFF", size=10)
@@ -207,7 +253,7 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
             cc.border = box
             cc.alignment = _align("left" if col_idx == 1 else "center")
         row_idx += 1
-    for i, w in enumerate([24, 8, 9, 9, 7, 7, 7, 16, 12], 1):
+    for i, w in enumerate([30, 8, 9, 9, 7, 7, 7, 16, 12], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A5"
 
@@ -228,6 +274,36 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
             cc.fill = _fill("FEE2E2")
             cc.border = box
             cc.font = _font(size=10)
+
+    # Import Action roll-up: "how much does the tool do vs. the bundle vs. a human?" — the one
+    # question the per-type status table can't answer, since one type can span several actions.
+    action_counts = index.get("action_counts") or {}
+    if not action_counts:
+        # Older index (written before action_counts existed) → derive it from the units.
+        action_counts = {}
+        for r in index_units:
+            a = r.get("import_action") or ""
+            action_counts[a] = action_counts.get(a, 0) + 1
+    ar = fr + 2
+    ws.cell(row=ar, column=1, value="Import Actions (what the target side will do)").font = \
+        _font(bold=True, color="1E3A5F", size=12)
+    ar += 1
+    for col_idx, h in enumerate(["Import Action", "Count"], 1):
+        cc = ws.cell(row=ar, column=col_idx, value=h)
+        cc.font = _font(bold=True, color="FFFFFF")
+        cc.fill = _fill("334155")
+        cc.border = box
+    for act in sorted(action_counts, key=lambda a: (-action_counts[a], a)):
+        ar += 1
+        cc = ws.cell(row=ar, column=1, value=_IMPORT_ACTION_LABEL.get(act, act or "—"))
+        cc.fill = _fill(_IMPORT_ACTION_FILL.get(act, _IMPORT_ACTION_FILL[""]))
+        cc.border = box
+        cc.font = _font(size=10)
+        cc = ws.cell(row=ar, column=2, value=action_counts[act])
+        cc.border = box
+        cc.font = _font(size=10, bold=True)
+        cc.alignment = _align("center")
+    fr = ar
 
     # Oversize table.
     oversize = [r for r in index_units if r.get("export_status") == "skipped_oversize"]
@@ -255,8 +331,7 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
         cols = _COLUMNS.get(key, [("path", "Path", "plain")])
         label = _LABELS.get(key, key.replace("_", " ").title())
         sheet_name = re.sub(r'[\\/?*\[\]:]', '-', label)[:31]
-        show_action = key in _IDENTITY_CARDS
-        n_cols = len(cols) + 1 + (1 if show_action else 0)   # + Export Status [+ Import Action]
+        n_cols = len(cols) + 2   # + Export Status + Import Action (every sheet)
 
         ws2 = wb.create_sheet(title=sheet_name)
         ws2.sheet_view.showGridLines = False
@@ -268,9 +343,7 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
         c.alignment = _align("left")
         ws2.row_dimensions[1].height = 24
 
-        header_cells = [cl for (_, cl, _f) in cols] + ["Export Status"]
-        if show_action:
-            header_cells.append("Import Action")
+        header_cells = [cl for (_, cl, _f) in cols] + ["Export Status", "Import Action"]
         for col_idx, col_label in enumerate(header_cells, 1):
             cc = ws2.cell(row=3, column=col_idx, value=col_label)
             cc.font = _font(bold=True, color="FFFFFF", size=10)
@@ -290,40 +363,47 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
                 if row_num <= 103:
                     col_widths[col_idx - 1] = max(col_widths[col_idx - 1],
                                                   min(len(str(text)) if text else 0, 60))
-            # Export Status cell.
-            status, note = _resolve_status(key, item, status_by_key, index_units)
+            # Export Status cell ("did export capture this?").
+            status, note, action = _resolve_status(key, item, status_by_key, index_units,
+                                                   action_by_key)
             slabel, sfill = _STATUS_STYLE.get(status, _STATUS_STYLE[""])
-            status_col = n_cols - 1 if show_action else n_cols
-            scell = ws2.cell(row=row_num, column=status_col,
+            scell = ws2.cell(row=row_num, column=n_cols - 1,
                              value=slabel + (f" — {note}" if note and status in ("failure",) else ""))
             scell.fill = _fill(sfill)
             scell.border = box
             scell.font = _font(size=10, bold=(status == "failure"))
-            # Import Action cell (identity sheets only).
-            if show_action:
-                action = action_by_key.get(
-                    (_row_asset_type(key, item), _row_natural_key(key, item)), "")
-                acell = ws2.cell(row=row_num, column=n_cols,
-                                 value=_IMPORT_ACTION_LABEL.get(action, action or "—"))
-                acell.fill = _fill(_IMPORT_ACTION_FILL.get(action, _IMPORT_ACTION_FILL[""]))
-                acell.border = box
-                acell.font = _font(size=10, bold=(action == "review_required"))
+            # Import Action cell ("what will the TARGET side do with it?") — on every sheet, and
+            # the only place a DAB row says who recreates it. The note rides along for the
+            # actions where the caveat is the whole point (UC prereqs, DBFS artifacts, secrets).
+            acell = ws2.cell(
+                row=row_num, column=n_cols,
+                value=_IMPORT_ACTION_LABEL.get(action, action or "—")
+                + (f" — {note}" if note and action in _ACTION_SHOW_NOTE else ""))
+            acell.fill = _fill(_IMPORT_ACTION_FILL.get(action, _IMPORT_ACTION_FILL[""]))
+            acell.border = box
+            acell.alignment = _align("left", "top", wrap=True)
+            acell.font = _font(size=10, bold=(action in ("review_required", "manual")))
         for col_idx, w in enumerate(col_widths, 1):
             ws2.column_dimensions[get_column_letter(col_idx)].width = min(w + 4, 68)
-        ws2.column_dimensions[get_column_letter(n_cols)].width = 26
+        ws2.column_dimensions[get_column_letter(n_cols - 1)].width = 22
+        ws2.column_dimensions[get_column_letter(n_cols)].width = 46
 
     wb.save(local_path)
     return local_path
 
 
-def _resolve_status(card_key: str, row: dict, status_by_key: dict, index_units: list):
-    """(status, note) for one inventory row, joined to the export index."""
+def _resolve_status(card_key: str, row: dict, status_by_key: dict, index_units: list,
+                    action_by_key: dict):
+    """(status, note, import_action) for one inventory row, joined to the export index."""
     if card_key == "object_permissions":
-        return "success", ""   # every grant is captured wholesale in acls.json
+        # Every grant is captured wholesale in acls.json; import replays them once the objects
+        # they point at exist, so the ACL sheet's action is uniform.
+        return "success", "", "apply_acl"
     if card_key == "cluster_libraries":
         return _cluster_library_status(row, index_units)
     asset_type = _row_asset_type(card_key, row)
     nk = _row_natural_key(card_key, row)
     if not asset_type:
-        return "", ""
-    return status_by_key.get((asset_type, nk), ("", ""))
+        return "", "", ""
+    status, note = status_by_key.get((asset_type, nk), ("", ""))
+    return status, note, action_by_key.get((asset_type, nk), "")

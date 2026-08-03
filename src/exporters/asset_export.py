@@ -37,11 +37,15 @@ from src.utils.helpers import safe_str
 # what import will do — that's `migration_mode` + `import_action` (below).
 #   success           — payload/bytes captured, ready for import
 #   manual            — cannot be auto-recreated at all (secret values, oversize, UC-backed)
-#   dab               — bundle-owned; intentionally no payload (customer redeploys)
+#   dab               — bundle-owned; recorded in the ledger but payload DELIBERATELY skipped
 #   covered           — already exported via its native asset (no double-create)
 #   skip              — toggled off
 #   skipped_oversize  — exceeded an API size cap (set by the content fetcher)
 #   failure           — export itself errored
+# `dab` stays its own status rather than collapsing into `success`, because the create payload
+# genuinely is NOT captured for these — the bundle owns the definition. It renders as
+# "Skipped (DAB)" so it reads as a deliberate skip rather than a failure, and the paired
+# `import_action` ("dab_redeploy") says who does recreate it.
 _MODE_STATUS = {"auto": "success", "content": "success", "manual": "manual", "dab": "dab",
                 "covered": "covered"}
 
@@ -62,6 +66,91 @@ _IMPORT_ACTION_BY_CLASS = {
     "needs_review": "review_required",
     "unknown": "review_required",
 }
+
+# ── import_action for EVERY unit, not just identity ──────────────────────────────────────────
+# `export_status` says whether export captured a unit; `import_action` says what the TARGET side
+# will do with it. Without the second column a reader has to infer intent from the status, which
+# is exactly how "DAB" got misread as "not exported". So every unit carries one of these:
+#   create             — the utility creates the object on target via REST
+#   create_and_upload  — create the object, then push its BYTES (notebooks / workspace files)
+#   assign_on_target   — account-level identity: must ALREADY exist on target; assign + entitle
+#   add_members        — built-in group: PATCH members onto the group that already exists
+#   dab_redeploy       — bundle-owned; import SKIPS it, the customer's bundle redeploy owns it
+#   via_native_asset   — created as a side effect of its native asset (the on-disk twin)
+#   install            — attached to an existing object rather than created (cluster libraries)
+#   set_conf           — a workspace setting written via the conf API
+#   apply_acl          — permission grants replayed once the object exists
+#   manual             — no REST path; a human does it on target
+#   review_required    — low-confidence classification; confirm before import
+#   none               — nothing to import (toggled off, or export failed)
+_ACTION_CREATE = "create"
+_ACTION_DAB = "dab_redeploy"
+
+# The CLOSED vocabulary. `export_excel` renders a human label per action and any value missing
+# from its map silently degrades to "—", so the label map is checked against this set at import
+# time (see export_excel) — a new action can't be added here and forgotten there.
+IMPORT_ACTIONS = frozenset({
+    "create", "create_and_upload", "assign_on_target", "add_members", "dab_redeploy",
+    "via_native_asset", "install", "set_conf", "apply_acl", "manual", "review_required", "none",
+})
+
+# migration_mode → import_action, for units with no identity classification and no per-type
+# override below. Content units upload bytes; manual units stay manual; covered units are
+# created by their native asset.
+_ACTION_BY_MODE = {
+    "auto": _ACTION_CREATE,
+    "content": "create_and_upload",
+    "manual": "manual",
+    "dab": _ACTION_DAB,
+    "covered": "via_native_asset",
+}
+
+# asset_types whose import verb is NOT "create" even though their mode is `auto`. A cluster
+# library is INSTALLED onto an existing cluster and a workspace conf key is SET, neither of
+# which is a create; calling both "create" would misdescribe what import does.
+_ACTION_BY_ASSET_TYPE = {
+    "cluster_library": "install",
+    "workspace_conf": "set_conf",
+}
+
+# export_status values that mean there is nothing for import to do at all. Checked AFTER the
+# mode/type mapping so a toggled-off or failed unit never advertises an action.
+_ACTION_BY_STATUS = {
+    "skip": "none",
+    "failure": "none",
+    # An oversize notebook/file WAS recorded but its bytes never made it into the bundle, so
+    # import cannot recreate it — it's a manual copy, not a create_and_upload.
+    "skipped_oversize": "manual",
+}
+
+
+def derive_import_action(unit: dict) -> str:
+    """The TARGET-side action for one unit: classification first, then mode/type, then status.
+
+    Identity units keep the classification-driven answer (create vs assign is load-bearing —
+    creating an Azure UMI instead of assigning it mints a new applicationId and orphans every
+    ACL that referenced it). Everything else is derived from `migration_mode`, with a couple of
+    per-asset_type verb overrides, and finally overridden by a status that means "nothing to do".
+    """
+    status = safe_str(unit.get("export_status"))
+    if status in _ACTION_BY_STATUS:
+        return _ACTION_BY_STATUS[status]
+    asset_type = safe_str(unit.get("asset_type"))
+    mode = safe_str(unit.get("migration_mode"))
+    # Built-in group MEMBERSHIP is an action the utility DOES perform (PATCH members onto the
+    # pre-existing group), so it must not inherit the group's own "assign_on_target".
+    if asset_type == "group_membership":
+        return "add_members"
+    cls = safe_str(unit.get("classification"))
+    if cls:
+        # A bundle-owned identity would still be redeployed by the bundle, so mode wins over
+        # classification there; otherwise the classification is the authority.
+        if mode == "dab":
+            return _ACTION_DAB
+        return _IMPORT_ACTION_BY_CLASS.get(cls, "review_required")
+    if mode == "auto" and asset_type in _ACTION_BY_ASSET_TYPE:
+        return _ACTION_BY_ASSET_TYPE[asset_type]
+    return _ACTION_BY_MODE.get(mode, "review_required")
 
 # asset_type → bundle-relative artifact file that holds its units' payloads (Plan 2 §4).
 ARTIFACT_PATH: dict[str, str] = {
@@ -145,14 +234,11 @@ def _make_unit(asset_type: str, natural_key: str, source_id: str, payload_source
     }
     if extra:
         unit.update(extra)
-    # Identity units carry the create-vs-assign decision explicitly so a reader can't mistake
-    # `export_status=success` for "the utility will create this on target".
-    cls = safe_str(unit.get("classification"))
-    if cls:
-        # Built-in group MEMBERSHIP is an action the utility DOES perform (PATCH members onto the
-        # pre-existing group), so it must not inherit the group's own "assign_on_target".
-        unit["import_action"] = ("add_members" if asset_type == "group_membership"
-                                 else _IMPORT_ACTION_BY_CLASS.get(cls, "review_required"))
+    # EVERY unit carries the target-side action explicitly, so `export_status=success` can never
+    # be mistaken for "the utility will create this on target" (and `dab` can never be misread
+    # as "not exported"). The runner re-derives this after toggles/content so a unit whose status
+    # changed late — toggled off, oversize, failed — reports the right action.
+    unit["import_action"] = derive_import_action(unit)
     return unit
 
 

@@ -213,6 +213,22 @@ def verify(root):
     dab_units = [u for u in units if u["export_status"] == "dab"]
     print(f"DAB-detected units: {len(dab_units)} "
           f"({sorted({u['asset_type'] for u in dab_units})})")
+    # Every unit must carry a valid import_action — the workbook renders it as a column on every
+    # sheet, and an unknown/blank value shows as "—", which is the blank-cell failure the
+    # customer rejected. A DAB unit specifically must say dab_redeploy.
+    from src.exporters.asset_export import IMPORT_ACTIONS
+    bad_act = [(u["asset_type"], u["natural_key"], u.get("import_action"))
+               for u in units if u.get("import_action") not in IMPORT_ACTIONS]
+    print(f"Units with an invalid/missing import_action: {len(bad_act)}  {bad_act[:5]}")
+    bad_dab = [u["natural_key"] for u in dab_units if u.get("import_action") != "dab_redeploy"]
+    print(f"DAB units not marked dab_redeploy: {len(bad_dab)}  {bad_dab[:5]}")
+    act_counts: dict = {}
+    for u in units:
+        act_counts[u.get("import_action") or ""] = act_counts.get(u.get("import_action") or "", 0) + 1
+    print("Import actions: " + ", ".join(f"{a or '(none)'}={n}"
+                                         for a, n in sorted(act_counts.items(), key=lambda kv: -kv[1])))
+    if bad_act or bad_dab:
+        failed += 1
     cov = [u for u in units if u["export_status"] == "covered"]
     print(f"Covered (dashboard/alert twins deduped): {len(cov)}")
     over = [u for u in units if u["export_status"] == "skipped_oversize"]

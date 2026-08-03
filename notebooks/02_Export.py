@@ -123,6 +123,12 @@ print("\n=== Export complete ===")
 print(f"  total            {result['total']:>6}")
 for k in ("success", "failure", "skipped_oversize", "manual", "dab", "skip"):
     print(f"  {k:<16} {result.get(k, 0):>6}")
+# Export status says what we CAPTURED; import action says what the target side will DO with it.
+# They're different questions — a "Skipped (DAB)" unit still lands on target, via the customer's
+# bundle redeploy — so print both. Same two columns as every sheet in export_status.xlsx.
+print("\n=== Import actions (what the TARGET side will do) ===")
+for _act, _n in sorted((result.get("action_counts") or {}).items(), key=lambda kv: -kv[1]):
+    print(f"  {_act or '(none)':<20} {_n:>6}")
 print(f"\nBundle: {result['output_path']}")
 print("  export/ + export_index.json + export/acls.json + export_status.xlsx + manifest.json")
 

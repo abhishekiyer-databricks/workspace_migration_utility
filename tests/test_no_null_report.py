@@ -205,13 +205,18 @@ def test_export_status_column_resolves_for_every_card():
                   if k not in _CARD_NK_FIELDS and k != "cluster_libraries"]
     assert not missing_nk, f"cards absent from _CARD_NK_FIELDS: {missing_nk}"
 
-    # and the join must actually resolve a status end-to-end for a non-identity card
+    # and the join must actually resolve BOTH columns end-to-end for a non-identity card
     row = {"path": "/Users/a/big.bin"}
     index = {"units": [{"asset_type": "workspace_file", "natural_key": "/Users/a/big.bin",
-                        "export_status": "skipped_oversize", "note": "too big"}]}
-    from src.exporters.export_excel import _status_lookup
-    status, note = _resolve_status("workspace_files", row, _status_lookup(index), index["units"])
+                        "export_status": "skipped_oversize", "note": "too big",
+                        "import_action": "manual"}]}
+    from src.exporters.export_excel import _import_action_lookup, _status_lookup
+    status, note, action = _resolve_status("workspace_files", row, _status_lookup(index),
+                                           index["units"], _import_action_lookup(index))
     assert status == "skipped_oversize", f"expected oversize status, got {status!r}"
+    # Import Action is on every sheet now, not just the identity ones — an oversize file can't be
+    # recreated from the bundle, so it must read MANUAL rather than a create.
+    assert action == "manual", f"expected manual action, got {action!r}"
     assert _row_asset_type("workspace_files", row) == "workspace_file"
     assert _row_natural_key("workspace_files", row) == "/Users/a/big.bin"
 
