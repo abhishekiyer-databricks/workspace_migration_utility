@@ -20,10 +20,14 @@ from __future__ import annotations
 
 from src.exporters.acl_writer import acl_counts, collect_acls
 from src.exporters.asset_export import (
+    DAB_CONTENT_NOTE,
     TOGGLE_FOR,
+    _ACTION_DAB,
     build_all,
+    dab_bundle_root,
     derive_import_action,
     index_record,
+    is_dab_content_path,
 )
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
@@ -125,6 +129,13 @@ class ExportRunner:
         for units in units_by_type.values():
             for u in units:
                 u["import_action"] = derive_import_action(u)
+                # Stamp the reason HERE, not in _make_unit: the content pass overwrites `note`
+                # with the fetch result, so a note set at build time would be lost. Only for
+                # units that still carry the DAB action (a toggled-off or failed one reads
+                # `none`/`manual`, and its own note is the more useful message).
+                if u["import_action"] == _ACTION_DAB and is_dab_content_path(
+                        u.get("asset_type"), u.get("natural_key")):
+                    u["note"] = DAB_CONTENT_NOTE
 
     # ── content fetch (parallel, resumable) ────────────────────────────────
     def _fetch_content(self, units_by_type: dict) -> list[dict]:
@@ -314,6 +325,26 @@ class ExportRunner:
             for u in sorted(buckets[asset_type], key=lambda x: x["natural_key"]):
                 note = f" — {u['note']}" if u.get("note") else ""
                 lines.append(f"- `{u['natural_key']}`{note}")
+            lines.append("")
+        # Bundle roots: one line per BUNDLE, not per file (44 file rows would bury the actual
+        # instruction, which is a single redeploy per bundle).
+        roots: dict[str, int] = {}
+        for units in units_by_type.values():
+            for u in units:
+                if is_dab_content_path(u.get("asset_type"), u.get("natural_key")):
+                    root = dab_bundle_root(u["natural_key"])
+                    if root:
+                        roots[root] = roots.get(root, 0) + 1
+        if roots:
+            lines.append(f"## DAB bundles — redeploy against the target ({len(roots)})")
+            lines.append("")
+            lines.append("Content under these bundle roots is exported for reference but NOT "
+                         "imported. Re-point each bundle at the target workspace and run "
+                         "`databricks bundle deploy`; that recreates the files AND the "
+                         "jobs/pipelines/dashboards the bundle owns.")
+            lines.append("")
+            for root in sorted(roots):
+                lines.append(f"- `{root}` ({roots[root]} exported objects, not imported)")
             lines.append("")
         if oversize_rows:
             lines.append(f"## oversize — manual copy needed ({len(oversize_rows)})")

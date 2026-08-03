@@ -227,7 +227,12 @@ def verify(root):
         act_counts[u.get("import_action") or ""] = act_counts.get(u.get("import_action") or "", 0) + 1
     print("Import actions: " + ", ".join(f"{a or '(none)'}={n}"
                                          for a, n in sorted(act_counts.items(), key=lambda kv: -kv[1])))
-    if bad_act or bad_dab:
+    bad_bundle_act = [u["natural_key"] for u in units
+                      if is_dab_content_path(u["asset_type"], u["natural_key"])
+                      and u.get("import_action") != "dab_redeploy"]
+    print(f"Bundle-content units not marked dab_redeploy: {len(bad_bundle_act)}  "
+          f"{bad_bundle_act[:5]}")
+    if bad_act or bad_dab or bad_bundle_act:
         failed += 1
     cov = [u for u in units if u["export_status"] == "covered"]
     print(f"Covered (dashboard/alert twins deduped): {len(cov)}")
@@ -290,6 +295,24 @@ def _extra_checks(root, by_type):
             umi_detail = f"{u.get('classification')}/{u.get('import_action')}"
     print(f"{'azure UMI (ai27_umi)':<22}{'external → assign_on_target':<34}{umi_detail:<12}"
           f"{'✓ PASS' if umi_ok else '✗ FAIL'}")
+
+    # DAB bundle content: exported, but NEVER import-actioned as create/upload. Importing
+    # state/terraform.tfstate would point the customer's bundle at SOURCE workspace ids.
+    from src.exporters.asset_export import is_dab_content_path
+    bundle_units = [u for u in index["units"]
+                    if is_dab_content_path(u["asset_type"], u["natural_key"])]
+    bad_bundle = [(u["asset_type"], u["natural_key"], u.get("import_action"))
+                  for u in bundle_units if u.get("import_action") != "dab_redeploy"]
+    bok = bool(bundle_units) and not bad_bundle
+    print(f"{'DAB bundle content':<22}{'all dab_redeploy, none created':<34}"
+          f"{str(len(bundle_units)) + ' units':<12}{'✓ PASS' if bok else '✗ FAIL'}")
+    if bad_bundle:
+        print("   offenders:", bad_bundle[:5])
+    # The bytes ARE still exported (reference copy if a bundle drifted from git).
+    got_bytes = [u for u in bundle_units
+                 if u["asset_type"] in ("notebook", "workspace_file") and u.get("content_ref")]
+    print(f"{'DAB bundle bytes':<22}{'still exported for reference':<34}"
+          f"{str(len(got_bytes)) + ' files':<12}{'✓ PASS' if got_bytes else '✗ FAIL'}")
 
     # manifest verifies
     from src.config.config_manager import Config

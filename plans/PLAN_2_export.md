@@ -382,6 +382,43 @@ These must be recorded (no-silent-gaps → 1:1 reconciliation) but NOT re-export
 - **MLFLOW_EXPERIMENT** → `manual`, labelled "MLflow is out of scope (assets-only migration)"; also
   verified not file-readable (`No access to read file`). Never exported.
 
+### 5c. DAB bundle content — EXPORTED but NEVER IMPORTED (decided 2026-08-03)
+
+Workspace content living under a bundle root (`<home>/.bundle/<bundle>/<target>`, the CLI's default
+`workspace.root_path`) is captured in the bundle for reference but carries
+`import_action: "dab_redeploy"` — the same action as the bundle-owned jobs/pipelines — so the whole
+DAB story reads consistently. On fvm1 that is **44 of 148 units**: 21 files/notebooks + 23
+directories, 34 KB of bytes.
+
+**Why not import it.** Not merely redundant — actively harmful. `state/terraform.tfstate` maps
+bundle resources to **SOURCE-workspace object ids** (verified live: `databricks_job` →
+`627957782356291`). Landing it on the target makes the customer's next `databricks bundle deploy`
+believe those resources already exist under those ids, so it updates or deletes the wrong objects.
+`bundle deploy` recreates every one of these files anyway. Previously these read
+`CREATE + UPLOAD`, and the bundle's own directories read `CREATE`.
+
+**Why the bytes are still exported.** 34 KB, and if a customer's deployed bundle has drifted from
+its git source, the exported `databricks.yml` is the only record of what was actually deployed.
+Exporting is safe; *importing* is what is not.
+
+**Detection = the `/.bundle/` path segment only** — deliberately simple, matched on the DIRECTORY
+rather than on state filenames. The state format is already mid-migration (CLI ≥1.x
+`state/resources.json` vs older `state/terraform.tfstate` — both appear live on fvm1) and the newer
+direct-deployment engine drops Terraform altogether, so a filename-keyed rule would silently stop
+covering what it protects. A customer overriding `root_path` is not detected, but the consequence
+is a redundant upload, **never a skipped asset**: real DAB ownership of jobs/pipelines/warehouses
+comes from `dab_registry` parsing the state files (§ DAB detection), not from this path check.
+
+**`migration_mode` is deliberately left `auto`/`content`.** Changing it would drop these units out
+of the per-asset payload files (`_write_artifact_files` writes only `auto`/`content`) and strand
+their ACL grants — all 23 bundle directories carry grants. The units keep travelling with their
+permissions; `import_action` is the only skip signal. **Import contract:** branch on
+`import_action`, not `migration_mode`, and skip ACL replay for any object the importer did not
+create. Recorded in project memory for the importer work.
+
+Each bundle root gets ONE row in `manual_actions.md` ("redeploy this bundle against the target"),
+not one row per file.
+
 ### 5b. DBFS files — OUT OF SCOPE for v1 (review Q4 — D7 RESOLVED)
 
 **DBFS is out of scope for v1** — not inventoried, not exported. DBFS has a REST API (`dbfs/list`,

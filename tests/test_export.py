@@ -546,6 +546,109 @@ class _FakeCfg:
     output_path = ""
 
 
+def test_dab_bundle_content_is_never_imported():
+    """Workspace content under a `.bundle/` root is exported but NEVER imported.
+
+    Importing it is not merely redundant: `state/terraform.tfstate` maps bundle resources to
+    SOURCE-workspace object ids, so landing it on the target makes the customer's next
+    `bundle deploy` update/delete the wrong objects. Files, notebooks AND the bundle's directories
+    must all read `dab_redeploy`, same as the bundle-owned jobs/pipelines.
+    """
+    from src.exporters.asset_export import (
+        dab_bundle_root, derive_import_action, is_dab_content_path,
+    )
+
+    # Path detection: only real bundle roots, and only plain workspace content.
+    assert is_dab_content_path("workspace_file", "/Shared/.bundle/b/files/databricks.yml")
+    assert is_dab_content_path("notebook", "/Users/a@x.com/.bundle/b/files/nb")
+    assert is_dab_content_path("directory", "/Shared/.bundle/b/state")
+    assert not is_dab_content_path("workspace_file", "/Shared/wsmig/config.json")
+    # A job under a bundle path is DAB-owned via dab_registry (mode="dab"), not via this check.
+    assert not is_dab_content_path("job", "/Shared/.bundle/b/files/x")
+    # Must not match a folder that merely LOOKS similar.
+    assert not is_dab_content_path("notebook", "/Shared/my.bundle.stuff/nb")
+    assert not is_dab_content_path("workspace_file", "/Shared/.bundlex/b/f")
+
+    # Bundle root extraction → one manual-action row per bundle, not per file.
+    assert dab_bundle_root("/Shared/.bundle/b1/files/x") == "/Shared/.bundle/b1"
+    assert dab_bundle_root("/Users/a@x.com/.bundle/u1/state/y") == "/Users/a@x.com/.bundle/u1"
+    assert dab_bundle_root("/Shared/nope") == ""
+
+    # The action itself: content/auto must NOT win and advertise CREATE + UPLOAD.
+    def act(asset_type, key, mode, status="success"):
+        return derive_import_action({"asset_type": asset_type, "natural_key": key,
+                                     "migration_mode": mode, "export_status": status})
+    assert act("workspace_file", "/Shared/.bundle/b/files/databricks.yml", "content") == \
+        "dab_redeploy"
+    assert act("notebook", "/Shared/.bundle/b/files/nb", "content") == "dab_redeploy"
+    assert act("directory", "/Shared/.bundle/b/state", "auto") == "dab_redeploy"
+    # Non-bundle content is unaffected.
+    assert act("notebook", "/Shared/wsmig/nb", "content") == "create_and_upload"
+    assert act("directory", "/Shared/wsmig", "auto") == "create"
+    # A terminal status still wins over the bundle rule (toggled off / oversize).
+    assert act("workspace_file", "/Shared/.bundle/b/f", "content", "skip") == "none"
+    assert act("workspace_file", "/Shared/.bundle/b/f", "content", "skipped_oversize") == "manual"
+
+    # migration_mode must stay auto/content: changing it would drop these units out of the payload
+    # files and strand their ACL grants. The importer branches on import_action instead.
+    from src.exporters.asset_export import build_all
+    units = build_all({"workspace_object": [
+        {"object_type": "FILE", "path": "/Shared/.bundle/b/state/terraform.tfstate",
+         "object_id": "1"},
+        {"object_type": "DIRECTORY", "path": "/Shared/.bundle/b/state", "object_id": "2"},
+    ]})
+    wf = units["workspace_file"][0]
+    assert wf["import_action"] == "dab_redeploy" and wf["migration_mode"] == "content"
+    d = units["directory"][0]
+    assert d["import_action"] == "dab_redeploy" and d["migration_mode"] == "auto"
+
+
+def test_dab_content_keeps_action_and_note_through_the_content_pass():
+    """The content pass sets export_status/note late; the bundle action must survive it, and the
+    explanatory note must end up on the unit (it's what the workbook shows the operator)."""
+    import tempfile
+    from src.exporters import export_runner as er
+    from src.exporters.asset_export import DAB_CONTENT_NOTE, build_all
+    from src.exporters.artifact_writer import ArtifactWriter
+    from src.exporters.content_fetcher import FetchResult
+
+    tmp = tempfile.mkdtemp()
+
+    class Cfg(_FakeCfg):
+        output_path = tmp
+    aw = ArtifactWriter(Cfg())
+    aw.ensure_output_path()
+
+    units = build_all({"workspace_object": [
+        {"object_type": "FILE", "path": "/Shared/.bundle/b/files/databricks.yml", "object_id": "1"},
+        {"object_type": "NOTEBOOK", "path": "/Shared/wsmig/nb", "object_id": "2",
+         "language": "PYTHON"},
+    ]})
+
+    class Ok:
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch(self, unit):
+            return FetchResult(status="success", content_ref="c", content_route="direct_download",
+                              note="fetched")
+
+    orig = er.ContentFetcher
+    er.ContentFetcher = Ok
+    try:
+        r = er.ExportRunner(None, Cfg(), aw, content_fetch_workers=2)
+        r._fetch_content(units)
+        r._refresh_import_actions(units)
+    finally:
+        er.ContentFetcher = orig
+
+    bundle = units["workspace_file"][0]
+    assert bundle["import_action"] == "dab_redeploy", "content pass clobbered the bundle action"
+    assert bundle["note"] == DAB_CONTENT_NOTE, "operator-facing reason missing"
+    plain = units["notebook"][0]
+    assert plain["import_action"] == "create_and_upload" and plain["note"] == "fetched"
+
+
 def test_content_pass_resumes_after_a_crash():
     """THE regression test for mid-run failure.
 

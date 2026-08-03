@@ -124,6 +124,57 @@ _ACTION_BY_STATUS = {
 }
 
 
+# Workspace content that lives inside a Databricks Asset Bundle's root folder. The CLI's default
+# `root_path` is `<home>/.bundle/<bundle>/<target>`, so this one path segment identifies the whole
+# bundle-owned tree: the deployed source under `files/` AND the deployment state under `state/`.
+#
+# Deliberately matched on the DIRECTORY, not on state filenames: the state format is already
+# mid-migration (CLI ≥1.x writes `state/resources.json`, older CLIs `state/terraform.tfstate` — both
+# appear live on fvm1) and the newer direct-deployment engine drops Terraform altogether. A rule
+# keyed to filenames would silently stop covering what it was written to protect; a rule keyed to
+# the folder survives the engine change.
+#
+# Uploading this content is not merely redundant, it is HARMFUL: `state/terraform.tfstate` maps
+# bundle resources to SOURCE-workspace object ids (verified live: a tfstate on fvm1 pins
+# databricks_job → 627957782356291). Landing that on the target makes the customer's next
+# `bundle deploy` believe those resources already exist under those ids, so it updates or deletes
+# the wrong objects. The bundle recreates every one of these files on redeploy anyway.
+#
+# So they are EXPORTED (34 KB, and the only record of what was actually deployed if a customer's
+# bundle has drifted from git) but never imported — same `dab_redeploy` action as the bundle-owned
+# jobs/pipelines themselves, so the whole DAB story reads consistently. A customer who overrides
+# `root_path` is not detected here; the consequence is a redundant upload, never a skipped asset,
+# because DAB-OWNERSHIP of real assets is decided by `dab_registry` from the state files, not by
+# this path check.
+_DAB_ROOT_SEGMENT = "/.bundle/"
+
+# asset_types whose units can sit inside a bundle root (plain workspace content only — a job or
+# warehouse is bundle-owned via `dab_registry`, and its `migration_mode` is already "dab").
+_DAB_CONTENT_TYPES = {"notebook", "workspace_file", "directory"}
+
+
+def is_dab_content_path(asset_type: str, natural_key: str) -> bool:
+    """Whether this unit is workspace content inside a bundle's root folder (never imported)."""
+    return (safe_str(asset_type) in _DAB_CONTENT_TYPES
+            and _DAB_ROOT_SEGMENT in safe_str(natural_key))
+
+
+DAB_CONTENT_NOTE = ("inside a DAB bundle root — exported for reference but NOT imported; "
+                    "`databricks bundle deploy` against the target recreates it "
+                    "(importing bundle state would point the bundle at source-workspace ids)")
+
+
+def dab_bundle_root(natural_key: str) -> str:
+    """`/Shared/.bundle/my_bundle` for any path inside it, else "" — one row per bundle in the
+    manual-actions report, rather than one per file."""
+    key = safe_str(natural_key)
+    idx = key.find(_DAB_ROOT_SEGMENT)
+    if idx < 0:
+        return ""
+    after = key[idx + len(_DAB_ROOT_SEGMENT):].split("/")
+    return key[:idx] + _DAB_ROOT_SEGMENT + (after[0] if after else "")
+
+
 def derive_import_action(unit: dict) -> str:
     """The TARGET-side action for one unit: classification first, then mode/type, then status.
 
@@ -137,6 +188,13 @@ def derive_import_action(unit: dict) -> str:
         return _ACTION_BY_STATUS[status]
     asset_type = safe_str(unit.get("asset_type"))
     mode = safe_str(unit.get("migration_mode"))
+    # Bundle-root content: exported, never imported (see _DAB_ROOT_SEGMENT). Checked before the
+    # mode mapping so `content`/`auto` can't win and advertise CREATE + UPLOAD. `migration_mode`
+    # is intentionally NOT changed — that would drop these units out of the payload files and
+    # strand their ACL grants, so the unit still travels with its permissions and the importer
+    # skips creation on the strength of this action.
+    if is_dab_content_path(asset_type, unit.get("natural_key")):
+        return _ACTION_DAB
     # Built-in group MEMBERSHIP is an action the utility DOES perform (PATCH members onto the
     # pre-existing group), so it must not inherit the group's own "assign_on_target".
     if asset_type == "group_membership":
