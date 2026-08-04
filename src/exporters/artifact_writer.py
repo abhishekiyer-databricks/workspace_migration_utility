@@ -23,6 +23,18 @@ TOOL_VERSION = "0.1.0"
 _LOG = get_logger("artifact_writer")
 
 
+def _excluded_from_manifest(name: str) -> bool:
+    """Files the manifest must NOT checksum.
+
+    • `manifest.json` — it is the manifest.
+    • `execution_*.log` — the log keeps being written AFTER the manifest is built (the final
+      flush, plus anything logged during manifest writing itself), so its checksum would be stale
+      the moment it was recorded and `verify_manifest` would report a mismatch on every single
+      run. The log is a diagnostic, not a migratable artifact — it is not part of the handoff.
+    """
+    return name == "manifest.json" or (name.startswith("execution") and name.endswith(".log"))
+
+
 class ArtifactWriter:
     def __init__(self, config, dbutils=None, spark=None) -> None:
         self.config = config
@@ -107,7 +119,7 @@ class ArtifactWriter:
         files = []
         for dirpath, _dirs, names in os.walk(self._root):
             for name in sorted(names):
-                if name == "manifest.json":
+                if _excluded_from_manifest(name):
                     continue
                 full = os.path.join(dirpath, name)
                 rel = os.path.relpath(full, self._root)
@@ -163,3 +175,32 @@ class ArtifactWriter:
         if item_key not in cp[component]:
             cp[component].append(item_key)
         self.write_json("checkpoint.json", cp)
+
+    def mark_done_bulk(self, component: str, item_keys, results: Optional[dict] = None) -> None:
+        """Record many item_keys done in ONE checkpoint write (avoids O(n²) per-item rewrites on
+        the Volume when marking a large batch — e.g. thousands of fetched notebooks; Plan 2 §7c).
+
+        `results` optionally maps item_key → a small JSON-able dict describing the outcome, stored
+        under `"<component>:results"`. This is what makes a CRASH resumable: the done-list alone
+        says "this was fetched" but not what the result was, and the export_index.json that used
+        to supply that is only written after the whole pass — so a crash left the keys unusable
+        and every file was re-fetched. Both parts go out in a single write, so they can't diverge.
+        """
+        item_keys = [k for k in item_keys]
+        if not item_keys and not results:
+            return
+        cp = self._load_checkpoint()
+        existing = cp.setdefault(component, [])
+        seen = set(existing)
+        for k in item_keys:
+            if k not in seen:
+                existing.append(k)
+                seen.add(k)
+        if results:
+            cp.setdefault(f"{component}:results", {}).update(results)
+        self.write_json("checkpoint.json", cp)
+
+    def get_results(self, component: str) -> dict:
+        """item_key → recorded outcome dict for `component` (empty if none / older checkpoint)."""
+        got = self._load_checkpoint().get(f"{component}:results")
+        return got if isinstance(got, dict) else {}

@@ -1,0 +1,804 @@
+"""
+asset_export — turn inventory records into create-ready per-unit EXPORT RECORDS (Plan 2 §3, §5).
+
+Input  : `objects_by_type` (the collectors' output, as stored in inventory.json).
+Output : `units_by_type` = {asset_type: [unit, ...]}, where a *unit* is the per-unit export
+         record (§3) PLUS a `payload` (the normalized, runtime-stripped create body).
+
+Each bucket produced by a collector (coarse `object_type`) is EXPLODED into the fine-grained
+`asset_type` taxonomy the reconciliation report reconciles on (master §9 / Plan 2 §3). For most
+assets the payload is `strip_runtime(asset_type, <source object>)`; a few (identity, jobs, DLT,
+serving, dashboards, secrets, misc) need small custom source selection because the create body
+is a sub-object (`settings` / `spec` / `config`) or an assembled dict rather than the raw list item.
+
+Design boundaries (kept deliberately narrow):
+  • No I/O, no network, no threads here — pure transform of in-memory inventory records. Content
+    BYTES (notebooks/files) are fetched separately (`content_fetcher`, under the parallel pool);
+    this module only marks those units `mode="content"` and leaves `content_ref=None` for the
+    fetcher to fill.
+  • No ACL grants counted here — `acl_writer` is the single source of truth for ACLs; the runner
+    stamps the per-unit `acl_grants` count back onto these units so the two never disagree.
+  • Reference remap (source ids → target ids) is TARGET-side; payloads keep source ids verbatim.
+"""
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from src.transform.transforms import fingerprint, strip_runtime
+from src.utils.helpers import safe_str
+
+# migration_mode → default export_status (the fetcher/runner may override for content/skip).
+# `covered` = the object is the on-disk twin of an asset already exported via its NATIVE API
+# (a .lvdash.json / .dbalert.json whose dashboard/alert is captured as a lakeview_dashboard /
+# alert_v2 unit). It's recorded — so reconciliation stays complete and nothing is silently
+# dropped — but carries NO payload and NO bytes (import recreates it via the native asset, not
+# by uploading the file), avoiding a double-create.
+# `export_status` answers ONE question: did EXPORT capture this unit? It is NOT a prediction of
+# what import will do — that's `migration_mode` + `import_action` (below).
+#   success           — payload/bytes captured, ready for import
+#   manual            — cannot be auto-recreated at all (secret values, oversize, UC-backed)
+#   dab               — bundle-owned; recorded in the ledger but payload DELIBERATELY skipped
+#   covered           — already exported via its native asset (no double-create)
+#   skip              — toggled off
+#   skipped_oversize  — exceeded an API size cap (set by the content fetcher)
+#   failure           — export itself errored
+# `dab` stays its own status rather than collapsing into `success`, because the create payload
+# genuinely is NOT captured for these — the bundle owns the definition. It renders as
+# "Skipped (DAB)" so it reads as a deliberate skip rather than a failure, and the paired
+# `import_action` ("dab_redeploy") says who does recreate it.
+_MODE_STATUS = {"auto": "success", "content": "success", "manual": "manual", "dab": "dab",
+                "covered": "covered"}
+
+# What the TARGET side will do with a unit, derived from its identity classification. Export
+# status stays `success` for all of these (we DID export them) — this field carries the
+# create-vs-assign distinction so the report can't be misread as "the tool will create it".
+#   create           — the utility creates the object on target (new id minted)
+#   assign_on_target — account-level identity: it must ALREADY exist in the target account;
+#                      the utility assigns it to the workspace + sets entitlements, never creates
+#   review_required   — low-confidence classification; a human must confirm before import
+_IMPORT_ACTION_BY_CLASS = {
+    "entra_user": "assign_on_target",
+    "umi_or_entra_sp": "assign_on_target",
+    "account_group": "assign_on_target",
+    "db_managed_sp": "create",
+    "db_managed_group": "create",
+    "builtin_group": "assign_on_target",
+    "needs_review": "review_required",
+    "unknown": "review_required",
+}
+
+# ── import_action for EVERY unit, not just identity ──────────────────────────────────────────
+# `export_status` says whether export captured a unit; `import_action` says what the TARGET side
+# will do with it. Without the second column a reader has to infer intent from the status, which
+# is exactly how "DAB" got misread as "not exported". So every unit carries one of these:
+#   create             — the utility creates the object on target via REST
+#   create_and_upload  — create the object, then push its BYTES (notebooks / workspace files)
+#   assign_on_target   — account-level identity: must ALREADY exist on target; assign + entitle
+#   add_members        — built-in group: PATCH members onto the group that already exists
+#   dab_redeploy       — bundle-owned; import SKIPS it, the customer's bundle redeploy owns it
+#   via_native_asset   — created as a side effect of its native asset (the on-disk twin)
+#   install            — attached to an existing object rather than created (cluster libraries)
+#   set_conf           — a workspace setting written via the conf API
+#   apply_acl          — permission grants replayed once the object exists
+#   manual             — no REST path; a human does it on target
+#   review_required    — low-confidence classification; confirm before import
+#   none               — nothing to import (toggled off, or export failed)
+_ACTION_CREATE = "create"
+_ACTION_DAB = "dab_redeploy"
+
+# The CLOSED vocabulary. `export_excel` renders a human label per action and any value missing
+# from its map silently degrades to "—", so the label map is checked against this set at import
+# time (see export_excel) — a new action can't be added here and forgotten there.
+IMPORT_ACTIONS = frozenset({
+    "create", "create_and_upload", "assign_on_target", "add_members", "dab_redeploy",
+    "via_native_asset", "install", "set_conf", "apply_acl", "manual", "review_required", "none",
+})
+
+# migration_mode → import_action, for units with no identity classification and no per-type
+# override below. Content units upload bytes; manual units stay manual; covered units are
+# created by their native asset.
+_ACTION_BY_MODE = {
+    "auto": _ACTION_CREATE,
+    "content": "create_and_upload",
+    "manual": "manual",
+    "dab": _ACTION_DAB,
+    "covered": "via_native_asset",
+}
+
+# asset_types whose import verb is NOT "create" even though their mode is `auto`. A cluster
+# library is INSTALLED onto an existing cluster and a workspace conf key is SET, neither of
+# which is a create; calling both "create" would misdescribe what import does.
+_ACTION_BY_ASSET_TYPE = {
+    "cluster_library": "install",
+    "workspace_conf": "set_conf",
+}
+
+# export_status values that mean there is nothing for import to do at all. Checked AFTER the
+# mode/type mapping so a toggled-off or failed unit never advertises an action.
+_ACTION_BY_STATUS = {
+    "skip": "none",
+    "failure": "none",
+    # An oversize notebook/file WAS recorded but its bytes never made it into the bundle, so
+    # import cannot recreate it — it's a manual copy, not a create_and_upload.
+    "skipped_oversize": "manual",
+}
+
+
+# Workspace content that lives inside a Databricks Asset Bundle's root folder. The CLI's default
+# `root_path` is `<home>/.bundle/<bundle>/<target>`, so this one path segment identifies the whole
+# bundle-owned tree: the deployed source under `files/` AND the deployment state under `state/`.
+#
+# Deliberately matched on the DIRECTORY, not on state filenames: the state format is already
+# mid-migration (CLI ≥1.x writes `state/resources.json`, older CLIs `state/terraform.tfstate` — both
+# appear live on fvm1) and the newer direct-deployment engine drops Terraform altogether. A rule
+# keyed to filenames would silently stop covering what it was written to protect; a rule keyed to
+# the folder survives the engine change.
+#
+# Uploading this content is not merely redundant, it is HARMFUL: `state/terraform.tfstate` maps
+# bundle resources to SOURCE-workspace object ids (verified live: a tfstate on fvm1 pins
+# databricks_job → 627957782356291). Landing that on the target makes the customer's next
+# `bundle deploy` believe those resources already exist under those ids, so it updates or deletes
+# the wrong objects. The bundle recreates every one of these files on redeploy anyway.
+#
+# So they are EXPORTED (34 KB, and the only record of what was actually deployed if a customer's
+# bundle has drifted from git) but never imported — same `dab_redeploy` action as the bundle-owned
+# jobs/pipelines themselves, so the whole DAB story reads consistently. A customer who overrides
+# `root_path` is not detected here; the consequence is a redundant upload, never a skipped asset,
+# because DAB-OWNERSHIP of real assets is decided by `dab_registry` from the state files, not by
+# this path check.
+_DAB_ROOT_SEGMENT = "/.bundle/"
+
+# asset_types whose units can sit inside a bundle root (plain workspace content only — a job or
+# warehouse is bundle-owned via `dab_registry`, and its `migration_mode` is already "dab").
+_DAB_CONTENT_TYPES = {"notebook", "workspace_file", "directory"}
+
+
+def is_dab_content_path(asset_type: str, natural_key: str) -> bool:
+    """Whether this unit is workspace content inside a bundle's root folder (never imported).
+
+    Matches the `.bundle` container directory ITSELF as well as everything under it. Testing only
+    for the `/.bundle/` segment let `/Shared/.bundle` (and `/Users/<email>/.bundle`) fall through
+    to `create`, so the one directory that exists purely to hold bundle state read "CREATE on
+    target" while every file inside it correctly read "DAB REDEPLOY"."""
+    if safe_str(asset_type) not in _DAB_CONTENT_TYPES:
+        return False
+    key = safe_str(natural_key)
+    return _DAB_ROOT_SEGMENT in key or key.endswith(_DAB_ROOT_SEGMENT.rstrip("/"))
+
+
+DAB_CONTENT_NOTE = ("inside a DAB bundle root — exported for reference but NOT imported; "
+                    "`databricks bundle deploy` against the target recreates it "
+                    "(importing bundle state would point the bundle at source-workspace ids)")
+
+
+def dab_bundle_root(natural_key: str) -> str:
+    """`/Shared/.bundle/my_bundle` for any path inside it, else "" — one row per bundle in the
+    manual-actions report, rather than one per file."""
+    key = safe_str(natural_key)
+    idx = key.find(_DAB_ROOT_SEGMENT)
+    if idx < 0:
+        return ""
+    after = key[idx + len(_DAB_ROOT_SEGMENT):].split("/")
+    return key[:idx] + _DAB_ROOT_SEGMENT + (after[0] if after else "")
+
+
+def derive_import_action(unit: dict) -> str:
+    """The TARGET-side action for one unit: classification first, then mode/type, then status.
+
+    Identity units keep the classification-driven answer (create vs assign is load-bearing —
+    creating an Azure UMI instead of assigning it mints a new applicationId and orphans every
+    ACL that referenced it). Everything else is derived from `migration_mode`, with a couple of
+    per-asset_type verb overrides, and finally overridden by a status that means "nothing to do".
+    """
+    status = safe_str(unit.get("export_status"))
+    if status in _ACTION_BY_STATUS:
+        return _ACTION_BY_STATUS[status]
+    asset_type = safe_str(unit.get("asset_type"))
+    mode = safe_str(unit.get("migration_mode"))
+    # Bundle-root content: exported, never imported (see _DAB_ROOT_SEGMENT). Checked before the
+    # mode mapping so `content`/`auto` can't win and advertise CREATE + UPLOAD. `migration_mode`
+    # is intentionally NOT changed — that would drop these units out of the payload files and
+    # strand their ACL grants, so the unit still travels with its permissions and the importer
+    # skips creation on the strength of this action.
+    if is_dab_content_path(asset_type, unit.get("natural_key")):
+        return _ACTION_DAB
+    # Built-in group MEMBERSHIP is an action the utility DOES perform (PATCH members onto the
+    # pre-existing group), so it must not inherit the group's own "assign_on_target".
+    if asset_type == "group_membership":
+        return "add_members"
+    cls = safe_str(unit.get("classification"))
+    if cls:
+        # A bundle-owned identity would still be redeployed by the bundle, so mode wins over
+        # classification there; otherwise the classification is the authority.
+        if mode == "dab":
+            return _ACTION_DAB
+        return _IMPORT_ACTION_BY_CLASS.get(cls, "review_required")
+    if mode == "auto" and asset_type in _ACTION_BY_ASSET_TYPE:
+        return _ACTION_BY_ASSET_TYPE[asset_type]
+    return _ACTION_BY_MODE.get(mode, "review_required")
+
+# asset_type → bundle-relative artifact file that holds its units' payloads (Plan 2 §4).
+ARTIFACT_PATH: dict[str, str] = {
+    "user": "export/identity/users.json",
+    "service_principal": "export/identity/service_principals.json",
+    "group": "export/identity/groups.json",
+    # membership of the BUILT-IN groups (admins/users) — the groups themselves are never
+    # recreated, but their members must be re-added on target.
+    "group_membership": "export/identity/builtin_group_membership.json",
+    "instance_pool": "export/compute/instance_pools.json",
+    "cluster_policy": "export/compute/cluster_policies.json",
+    "cluster": "export/compute/clusters.json",
+    "directory": "export/workspace/objects.json",
+    "notebook": "export/workspace/objects.json",
+    "workspace_file": "export/workspace/objects.json",
+    "repo": "export/workspace/repos.json",
+    "secret_scope": "export/secrets/scopes.json",
+    "secret_value": "export/secrets/scopes.json",
+    "job": "export/jobs.json",
+    "sql_warehouse": "export/sql/warehouses.json",
+    "legacy_query": "export/sql/legacy_queries.json",
+    "legacy_alert": "export/sql/legacy_alerts.json",
+    "legacy_dashboard": "export/sql/legacy_dashboards.json",
+    "alert_v2": "export/sql/alerts_v2.json",
+    "dlt_pipeline": "export/dlt/pipelines.json",
+    "lakeview_dashboard": "export/dashboards/lakeview.json",
+    "genie_space": "export/genie/spaces.json",
+    "serving_endpoint": "export/serving/endpoints.json",
+    "global_init_script": "export/misc/global_init_scripts.json",
+    "cluster_library": "export/misc/cluster_libraries.json",
+    "workspace_conf": "export/misc/workspace_conf.json",
+    "app": "export/manual/apps.json",
+    "lakebase_project": "export/manual/lakebase.json",
+}
+
+# Coarse collector toggle that governs each asset_type (Config.AssetToggles fields). asset_types
+# with no toggle (apps/lakebase) are inventory-only and always emitted as manual regardless.
+TOGGLE_FOR: dict[str, str] = {
+    "user": "identity", "service_principal": "identity", "group": "identity",
+    "group_membership": "identity",
+    "instance_pool": "compute", "cluster_policy": "compute", "cluster": "compute",
+    "directory": "workspace", "notebook": "workspace", "workspace_file": "workspace",
+    "repo": "workspace",
+    # non-content workspace objects surfaced by the walk (recorded manual; §5 no-silent-gaps)
+    "lakeview_dashboard_file": "workspace", "alert_v2_file": "workspace",
+    "mlflow_experiment": "workspace", "workspace_library": "workspace",
+    "secret_scope": "secrets", "secret_value": "secrets",
+    "job": "jobs",
+    "sql_warehouse": "sql", "legacy_query": "sql", "legacy_alert": "sql",
+    "legacy_dashboard": "sql", "alert_v2": "sql",
+    "dlt_pipeline": "dlt",
+    "lakeview_dashboard": "dashboards",
+    "genie_space": "genie",
+    "serving_endpoint": "serving",
+    "global_init_script": "misc", "cluster_library": "misc", "workspace_conf": "misc",
+}
+
+
+def _make_unit(asset_type: str, natural_key: str, source_id: str, payload_source: Optional[dict],
+               *, mode: str, migratable: bool = True, note: str = "",
+               content_ref: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+    """Assemble one export record + its stripped/fingerprinted payload.
+
+    `payload_source` None → no create payload (manual/dab units): payload={} and the fingerprint
+    is computed over the empty dict (stable, meaningless — such units aren't upserted by content).
+    """
+    stripped = strip_runtime(asset_type, payload_source) if isinstance(payload_source, dict) else {}
+    unit = {
+        "asset_type": asset_type,
+        "natural_key": natural_key,
+        "source_id": safe_str(source_id),
+        "fingerprint": fingerprint(stripped),
+        "migratable": bool(migratable),
+        "migration_mode": mode,
+        "export_status": _MODE_STATUS.get(mode, "success"),
+        "artifact": ARTIFACT_PATH.get(asset_type, ""),
+        "content_ref": content_ref,
+        "note": note,
+        "acl_grants": 0,          # stamped by the runner from acl_writer (single source of truth)
+        "payload": stripped,
+    }
+    if extra:
+        unit.update(extra)
+    # EVERY unit carries the target-side action explicitly, so `export_status=success` can never
+    # be mistaken for "the utility will create this on target" (and `dab` can never be misread
+    # as "not exported"). The runner re-derives this after toggles/content so a unit whose status
+    # changed late — toggled off, oversize, failed — reports the right action.
+    unit["import_action"] = derive_import_action(unit)
+    return unit
+
+
+def index_record(unit: dict) -> dict:
+    """The unit MINUS its payload — what goes into export_index.json (the ledger, §3)."""
+    return {k: v for k, v in unit.items() if k != "payload"}
+
+
+# ---------------------------------------------------------------------------
+# Per-bucket builders. Each takes the collector's list for one coarse object_type and returns
+# a flat list of units (possibly across several fine-grained asset_types).
+# ---------------------------------------------------------------------------
+
+# Library keys whose value is a PATH to a binary artifact (as opposed to pypi/maven/cran, which
+# name a package a repo re-resolves on the target).
+_LIBRARY_PATH_KEYS = ("jar", "whl", "egg", "requirements")
+# Path prefixes whose CONTENT this tool does not export. `dbfs:/` (incl. the /dbfs FUSE spelling)
+# is out of scope per PLAN_2 §5b. UC Volumes + workspace files DO migrate, so they're fine.
+_UNEXPORTED_PREFIXES = ("dbfs:/", "/dbfs/")
+
+
+def _dbfs_library_ref(library: Any) -> str:
+    """Return the DBFS path a library points at, or "" if it needs no exported bytes.
+
+    Used to flag libraries that would migrate as a DANGLING reference: the definition carries
+    over but the artifact itself never reaches the target.
+    """
+    if not isinstance(library, dict):
+        return ""
+    for key in _LIBRARY_PATH_KEYS:
+        val = safe_str(library.get(key))
+        if val and val.lower().startswith(_UNEXPORTED_PREFIXES):
+            return val
+    return ""
+
+
+def _job_dbfs_library_refs(settings: dict) -> list[str]:
+    """Every DBFS-backed library referenced by a job's tasks (task-level + job-level env)."""
+    refs: list[str] = []
+    if not isinstance(settings, dict):
+        return refs
+    for task in settings.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        for lib in task.get("libraries") or []:
+            ref = _dbfs_library_ref(lib)
+            if ref:
+                refs.append(ref)
+    return refs
+
+
+def _identity_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        itype = r.get("identity_type")
+        raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
+        cls = safe_str(r.get("classification"))
+        if itype == "user":
+            out.append(_make_unit("user", safe_str(r.get("userName")), r.get("id"), raw,
+                                  mode="auto", extra={"classification": cls}))
+        elif itype == "service_principal":
+            note = ("OAuth client secret(s) present — NOT exportable; recreate on target manually."
+                    if r.get("has_secrets") else "")
+            out.append(_make_unit("service_principal", safe_str(r.get("applicationId")),
+                                  r.get("id"), raw, mode="auto", note=note,
+                                  extra={"classification": cls}))
+        elif itype == "group":
+            name = safe_str(r.get("displayName"))
+            if cls == "builtin_group":
+                # The built-in group OBJECT already exists on target and must never be recreated
+                # — but its MEMBERSHIP does not carry over by itself. Without this, a source
+                # workspace admin would silently not be an admin on target. So we emit the group
+                # as `covered` (exists, nothing to create) and a SEPARATE membership unit whose
+                # payload is the member list, which the importer replays as a PATCH (add members
+                # to the existing group) rather than a create.
+                out.append(_make_unit("group", name, r.get("id"), None,
+                                      mode="covered",
+                                      note="built-in group — exists on target; membership "
+                                           "migrated via the group_membership unit",
+                                      extra={"classification": cls}))
+                out.append(_make_unit(
+                    "group_membership", name, r.get("id"),
+                    {"displayName": name, "members": raw.get("members") or []},
+                    mode="auto",
+                    note="add these members to the EXISTING built-in group on target "
+                         "(PATCH members; never create the group)",
+                    extra={"classification": cls}))
+            else:
+                out.append(_make_unit("group", name, r.get("id"), raw,
+                                      mode="auto", extra={"classification": cls}))
+    return out
+
+
+def _dab_unit(asset_type: str, natural_key: str, source_id: Any, resource_word: str) -> dict:
+    """A bundle-owned asset: recorded in the ledger, but no create payload.
+
+    Recreating it via REST would produce a duplicate the bundle no longer manages, so the
+    customer's bundle redeploy owns it. Kept in the index so reconciliation has no silent gap.
+    """
+    return _make_unit(asset_type, natural_key, source_id, None, mode="dab", migratable=False,
+                      note=f"handled by DAB redeploy (bundle `{resource_word}` resource)")
+
+
+def _compute_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        ct = r.get("compute_type")
+        raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
+        nk = safe_str(r.get("_natural_key"))
+        if ct == "instance_pool":
+            if r.get("deployed_by_dab"):
+                out.append(_dab_unit("instance_pool", nk, r.get("instance_pool_id"),
+                                     "instance_pools"))
+            else:
+                out.append(_make_unit("instance_pool", nk, r.get("instance_pool_id"), raw,
+                                      mode="auto"))
+        elif ct == "cluster_policy":
+            # DAB has no cluster_policies resource type, so these are always hand-managed.
+            out.append(_make_unit("cluster_policy", nk, r.get("policy_id"), raw, mode="auto"))
+        elif ct == "cluster":
+            if r.get("deployed_by_dab"):
+                out.append(_dab_unit("cluster", nk, r.get("cluster_id"), "clusters"))
+            else:
+                out.append(_make_unit("cluster", nk, r.get("cluster_id"), raw, mode="auto"))
+    return out
+
+
+def _workspace_units(records: list[dict], native_paths: Optional[dict] = None) -> list[dict]:
+    """Build units for the workspace walk.
+
+    `native_paths` maps a workspace PATH → the native asset_type that already exports it (e.g. a
+    `.lvdash.json` path → "lakeview_dashboard"). Used to DEDUPE the walk's DASHBOARD/ALERT file
+    twins against their native units so each dashboard/alert is counted once (Plan 2 review).
+    """
+    native_paths = native_paths or {}
+    out: list[dict] = []
+    for r in records:
+        otype = safe_str(r.get("object_type"))
+        path = safe_str(r.get("path"))
+        oid = r.get("object_id") or r.get("repo_id")
+        if otype == "DIRECTORY":
+            out.append(_make_unit("directory", path, oid, {"path": path}, mode="auto"))
+        elif otype == "NOTEBOOK":
+            out.append(_make_unit(
+                "notebook", path, oid,
+                {"path": path, "object_type": "NOTEBOOK", "language": safe_str(r.get("language"))},
+                mode="content", extra={"owner": _owner_of(path)}))
+        elif otype == "FILE":
+            out.append(_make_unit(
+                "workspace_file", path, oid, {"path": path, "object_type": "FILE"},
+                mode="content", extra={"owner": _owner_of(path)}))
+        elif otype == "REPO":
+            raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
+            src = raw or {"path": path, "url": safe_str(r.get("url")),
+                          "provider": safe_str(r.get("provider")), "branch": safe_str(r.get("branch"))}
+            note = "git credentials are a target-side manual prerequisite" if src.get("url") else \
+                   "no repo URL — cannot auto-recreate; manual"
+            mode = "auto" if src.get("url") else "manual"
+            out.append(_make_unit("repo", path, r.get("repo_id"), src, mode=mode, note=note))
+        else:
+            # Object types that are NOT plain workspace content: DASHBOARD/ALERT are the on-disk
+            # twins of assets exported via their NATIVE API; MLFLOW_EXPERIMENT is out of scope.
+            # Never dropped silently, never re-exported as file bytes.
+            out.append(_workspace_other_unit(otype, path, oid, native_paths, r))
+    return out
+
+
+# Non-content workspace object_types the walk can return → (asset_type, note).
+_WS_OTHER = {
+    "DASHBOARD": ("lakeview_dashboard_file",
+                  "AI/BI dashboard artifact (.lvdash.json)"),
+    "ALERT": ("alert_v2_file",
+              "Alerts V2 artifact (.dbalert.json)"),
+    "MLFLOW_EXPERIMENT": ("mlflow_experiment",
+                          "MLflow is out of scope for this utility (assets-only migration)"),
+    "LIBRARY": ("workspace_library",
+                "workspace library object — handled via cluster libraries, not as content"),
+}
+
+
+def _workspace_other_unit(otype: str, path: str, oid, native_paths: dict,
+                          record: Optional[dict] = None) -> dict:
+    asset_type, note = _WS_OTHER.get(
+        otype, (f"workspace_{otype.lower()}",
+                f"unhandled workspace object_type {otype!r} — recorded, not exported"))
+    # If this file is the on-disk twin of a natively-exported dashboard/alert → `covered`
+    # (recorded, no gap, no double-create), else `manual` (MLflow/out-of-scope/unhandled).
+    native = _native_twin_of(otype, record or {}, native_paths)
+    if native and otype in ("DASHBOARD", "ALERT"):
+        return _make_unit(asset_type, path, oid, None, mode="covered", migratable=False,
+                          note=f"{note} — exported via native `{native}` unit (not re-uploaded)")
+    if otype in ("DASHBOARD", "ALERT"):
+        # Under a `.bundle/` path with no native match: this is the bundle's own SOURCE copy
+        # (`<root>/files/…`), which the customer's bundle redeploy recreates. That's known, not
+        # something for a human to review, so don't send it to the manual worklist.
+        if (record or {}).get("deployed_by_dab"):
+            return _dab_unit(asset_type, path, oid, "bundle source file")
+        # No native match and not bundle-owned → recorded manual so it's never a silent gap.
+        return _make_unit(asset_type, path, oid, None, mode="manual", migratable=False,
+                          note=f"{note} — no native asset match; review")
+    return _make_unit(asset_type, path, oid, None, mode="manual", migratable=False, note=note)
+
+
+def _owner_of(path: str) -> str:
+    """Owning user email for a `/Users/<email>/…` path, else "" (Plan 2 §6b)."""
+    parts = [p for p in safe_str(path).split("/") if p]
+    return parts[1] if len(parts) >= 2 and parts[0] == "Users" else ""
+
+
+def _secret_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("name"))
+        if r.get("deployed_by_dab"):
+            # DAB owns `secret_scopes` too. The scope is redeployed by the bundle; its VALUES
+            # are still a manual step (below), since no API ever returns them.
+            out.append(_dab_unit("secret_scope", name, name, "secret_scopes"))
+            for key in r.get("key_names") or []:
+                out.append(_make_unit(
+                    "secret_value", f"{name}/{safe_str(key)}", "", None, mode="manual",
+                    migratable=False,
+                    note="scope redeployed by DAB, but the secret VALUE is never readable via "
+                         "the API — re-populate manually (≤128 KB)"))
+            continue
+        payload = {
+            "name": name,
+            "backend_type": safe_str(r.get("backend_type")) or "DATABRICKS",
+            "keyvault_metadata": r.get("keyvault_metadata"),
+            "key_names": r.get("key_names") or [],
+        }
+        out.append(_make_unit("secret_scope", name, name, payload, mode="auto"))
+        # Values are never exportable → one manual unit per key so the target report lists each
+        # value to re-populate (cap 128 KB; never readable via the API).
+        for key in r.get("key_names") or []:
+            out.append(_make_unit(
+                "secret_value", f"{name}/{safe_str(key)}", "", None, mode="manual",
+                migratable=False,
+                note="secret value re-populated manually (never readable via API; ≤128 KB)"))
+    return out
+
+
+def _job_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("name"))
+        jid = safe_str(r.get("job_id"))
+        if r.get("deployed_by_dab"):
+            out.append(_make_unit("job", name, jid, None, mode="dab", migratable=False,
+                                  note="handled by DAB redeploy (Azure DevOps bundle pipeline)"))
+        else:
+            settings = r.get("settings") if isinstance(r.get("settings"), dict) else {}
+            # A job task can pull a library from dbfs:/ too. The job itself still migrates
+            # (mode auto — its definition is complete), but we surface the dangling artifact so
+            # it lands in manual_actions.md instead of failing at first run.
+            dbfs_refs = _job_dbfs_library_refs(settings)
+            note = ("" if not dbfs_refs else
+                    f"task library artifact(s) on DBFS not exported (DBFS out of scope): "
+                    f"{', '.join(dbfs_refs[:3])} — copy to target before running")
+            out.append(_make_unit("job", name, jid, settings, mode="auto", note=note))
+    return out
+
+
+def _sql_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        st = r.get("sql_type")
+        raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
+        nk = safe_str(r.get("_natural_key") or r.get("name"))
+        sid = safe_str(r.get("id"))
+        if st == "warehouse":
+            if r.get("deployed_by_dab"):
+                out.append(_dab_unit("sql_warehouse", nk, sid, "sql_warehouses"))
+            else:
+                out.append(_make_unit("sql_warehouse", nk, sid, raw, mode="auto"))
+        elif st == "legacy_query":
+            out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto"))
+        elif st == "legacy_alert":
+            out.append(_make_unit("legacy_alert", nk, sid, raw, mode="auto"))
+        elif st == "legacy_dashboard":
+            mode = "dab" if r.get("deployed_by_dab") else "auto"
+            out.append(_make_unit("legacy_dashboard", nk, sid, None if mode == "dab" else raw,
+                                  mode=mode, migratable=(mode != "dab"),
+                                  note=("handled by DAB redeploy" if mode == "dab" else "")))
+        elif st == "alert":
+            mode = "dab" if r.get("deployed_by_dab") else "auto"
+            out.append(_make_unit("alert_v2", nk, sid, None if mode == "dab" else raw,
+                                  mode=mode, migratable=(mode != "dab"),
+                                  note=("handled by DAB redeploy" if mode == "dab" else "")))
+    return out
+
+
+def _dlt_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("name"))
+        pid = safe_str(r.get("pipeline_id"))
+        if r.get("deployed_by_dab"):
+            out.append(_make_unit("dlt_pipeline", name, pid, None, mode="dab", migratable=False,
+                                  note="handled by DAB redeploy (spec.deployment.kind=BUNDLE)"))
+        else:
+            spec = r.get("spec") if isinstance(r.get("spec"), dict) else {}
+            out.append(_make_unit("dlt_pipeline", name, pid, spec, mode="auto"))
+    return out
+
+
+def _lakeview_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("display_name"))
+        did = safe_str(r.get("dashboard_id"))
+        if r.get("deployed_by_dab"):
+            out.append(_make_unit("lakeview_dashboard", name, did, None, mode="dab",
+                                  migratable=False, note="handled by DAB redeploy"))
+        else:
+            payload = {"display_name": name, "warehouse_id": safe_str(r.get("warehouse_id")),
+                       "serialized_dashboard": r.get("serialized_dashboard")}
+            out.append(_make_unit("lakeview_dashboard", name, did, payload, mode="auto"))
+    return out
+
+
+def _genie_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("title"))
+        sid = safe_str(r.get("space_id"))
+        serialized = r.get("serialized_space")
+        if serialized:
+            # AUTO-migratable (verified): create-ready body = serialized_space + title +
+            # description + warehouse_id. Target calls create_space/update_space, remapping the
+            # warehouse_id. serialized_space kept verbatim (string) — the API round-trips it.
+            # DAB supports `genie_spaces` as a bundle resource type (CLI v1.10.0+), so a Genie
+            # space CAN be bundle-managed — recreating it via REST would duplicate an asset the
+            # bundle owns. The collector already flags it from parent_path (`.bundle/`); honour it.
+            if r.get("deployed_by_dab"):
+                out.append(_make_unit(
+                    "genie_space", name, sid, None, mode="dab", migratable=False,
+                    note="handled by DAB redeploy (bundle `genie_spaces` resource)"))
+                continue
+            payload = {"title": name, "description": safe_str(r.get("description")),
+                       "warehouse_id": safe_str(r.get("warehouse_id")),
+                       "serialized_space": serialized}
+            out.append(_make_unit(
+                "genie_space", name, sid, payload, mode="auto",
+                note="recreate via Genie create_space/update_space; remap warehouse_id; "
+                     "serialized_space may reference UC tables that must pre-exist on target"))
+        else:
+            # No serialized_space returned (API/permission gap) → can't recreate → manual.
+            payload = {"title": name, "description": safe_str(r.get("description")),
+                       "warehouse_id": safe_str(r.get("warehouse_id"))}
+            out.append(_make_unit(
+                "genie_space", name, sid, payload, mode="manual", migratable=False,
+                note="serialized_space unavailable (not returned by the API) — recreate manually"))
+    return out
+
+
+def _serving_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        name = safe_str(r.get("name"))
+        if r.get("deployed_by_dab"):
+            out.append(_dab_unit("serving_endpoint", name, name, "model_serving_endpoints"))
+            continue
+        migratable = bool(r.get("migratable"))
+        config = r.get("config") if isinstance(r.get("config"), dict) else {}
+        out.append(_make_unit(
+            "serving_endpoint", name, name, config if migratable else None,
+            mode="auto" if migratable else "manual", migratable=migratable,
+            note=safe_str(r.get("migration_note"))))
+    return out
+
+
+def _misc_units(records: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in records:
+        mt = r.get("misc_type")
+        if mt == "global_init_script":
+            payload = {"name": safe_str(r.get("name")), "position": r.get("position"),
+                       "enabled": r.get("enabled"), "script_b64": r.get("script_b64")}
+            out.append(_make_unit("global_init_script", safe_str(r.get("_natural_key")),
+                                  r.get("script_id"), payload, mode="auto"))
+        elif mt == "cluster_library":
+            lib = r.get("library")
+            payload = {"cluster_id": safe_str(r.get("cluster_id")), "library": lib}
+            # A library whose artifact lives on DBFS (jar/whl/egg at dbfs:/...) only exports as a
+            # REFERENCE — DBFS content is out of scope (PLAN_2 §5b), so the bytes never reach the
+            # bundle and the path won't exist on target. pypi/maven/cran re-resolve from their
+            # repos, so only the dbfs-backed ones are affected. Flag them as manual instead of
+            # reporting a `success` that would silently break the cluster on target.
+            dbfs_ref = _dbfs_library_ref(lib)
+            if dbfs_ref:
+                out.append(_make_unit(
+                    "cluster_library", safe_str(r.get("_natural_key")), r.get("cluster_id"),
+                    payload, mode="manual", migratable=False,
+                    note=f"library artifact `{dbfs_ref}` lives on DBFS — the FILE is not exported "
+                         f"(DBFS out of scope); copy it to the target and re-point the library, "
+                         f"or the cluster will fail to start"))
+            else:
+                out.append(_make_unit("cluster_library", safe_str(r.get("_natural_key")),
+                                      r.get("cluster_id"), payload, mode="auto"))
+        elif mt == "workspace_conf":
+            payload = {"key": safe_str(r.get("key")), "value": r.get("value")}
+            out.append(_make_unit("workspace_conf", safe_str(r.get("key")),
+                                  safe_str(r.get("key")), payload, mode="auto"))
+    return out
+
+
+def _app_units(records: list[dict]) -> list[dict]:
+    return [_make_unit("app", safe_str(r.get("name")), safe_str(r.get("name")), None,
+                       mode="manual", migratable=False,
+                       note="Databricks App — source + resource bindings migrated manually (v1)")
+            for r in records]
+
+
+def _lakebase_units(records: list[dict]) -> list[dict]:
+    return [_make_unit("lakebase_project", safe_str(r.get("name")), safe_str(r.get("name")), None,
+                       mode="manual", migratable=False,
+                       note="Lakebase — data + connection topology migrated manually (v1)")
+            for r in records]
+
+
+# coarse object_type → builder
+_BUILDERS = {
+    "identity": _identity_units,
+    "compute": _compute_units,
+    "workspace_object": _workspace_units,
+    "secret_scope": _secret_units,
+    "job": _job_units,
+    "sql": _sql_units,
+    "dlt_pipeline": _dlt_units,
+    "lakeview_dashboard": _lakeview_units,
+    "genie_space": _genie_units,
+    "serving_endpoint": _serving_units,
+    "misc": _misc_units,
+    "app": _app_units,
+    "lakebase_project": _lakebase_units,
+}
+
+
+def _native_content_paths(objects_by_type: dict) -> dict[str, str]:
+    """Identity key → native asset_type, for deduping the walk's dashboard/alert file twins.
+
+    A dashboard/alert appears TWICE in the inventory: once via its native API (the real asset,
+    with a create payload) and once as the `.lvdash.json` / `.dbalert.json` object the workspace
+    walk returns. The twin must be marked `covered` so it is neither re-uploaded as bytes nor
+    counted as a second asset.
+
+    Matching is by **ASSET ID, not path**. Paths don't work: an Alerts V2 record returns
+    `parent_path: null` even on a detail GET (verified live on fvm1), so its twin was falling
+    through to `manual`. Worse, keying on a dashboard's `parent_path` maps a whole DIRECTORY —
+    so an unrelated dashboard sitting in the same folder got silently marked `covered` and its
+    own export was never checked. Ids are exact.
+
+    Keys are `"id:<value>"` so they can't collide with the path keys still used for lookup.
+    """
+    out: dict[str, str] = {}
+    for d in objects_by_type.get("lakeview_dashboard", []) or []:
+        did = safe_str(d.get("dashboard_id"))
+        if did:
+            out[f"id:{did}"] = "lakeview_dashboard"
+    for s in objects_by_type.get("sql", []) or []:
+        if s.get("sql_type") == "alert":
+            aid = safe_str(s.get("id"))
+            if aid:
+                out[f"id:{aid}"] = "alert_v2"
+    return out
+
+
+def _native_twin_of(otype: str, record: dict, native_keys: dict) -> str:
+    """The native asset_type that already exports this DASHBOARD/ALERT walk entry, else "".
+
+    A DASHBOARD's `resource_id` is the Lakeview `dashboard_id`; an ALERT's `object_id` is the
+    Alerts V2 id (its `resource_id` is an unrelated uuid). Both are checked so a collector that
+    populates only one of them still dedupes.
+    """
+    for candidate in (record.get("resource_id"), record.get("object_id")):
+        key = f"id:{safe_str(candidate)}"
+        if safe_str(candidate) and key in native_keys:
+            return native_keys[key]
+    return ""
+
+
+def build_all(objects_by_type: dict[str, list]) -> dict[str, list[dict]]:
+    """Build every unit from the inventory, grouped by fine-grained `asset_type`.
+
+    Toggle handling is the RUNNER's job (it rewrites toggled-off families to `skip`); this
+    function always builds full payloads so the transform stays pure + independently testable.
+    """
+    native_paths = _native_content_paths(objects_by_type)
+    units_by_type: dict[str, list[dict]] = {}
+    for object_type, builder in _BUILDERS.items():
+        records = objects_by_type.get(object_type) or []
+        if object_type == "workspace_object":
+            units = builder(records, native_paths)
+        else:
+            units = builder(records)
+        for unit in units:
+            units_by_type.setdefault(unit["asset_type"], []).append(unit)
+    return units_by_type

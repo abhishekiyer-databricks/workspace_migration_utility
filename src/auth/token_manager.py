@@ -26,6 +26,22 @@ from src.utils.retry import RetryableHTTPError, is_retryable_status, with_retry
 _LOG = get_logger("auth")
 
 
+class DownloadHTTPError(Exception):
+    """A non-retryable 4xx/5xx during a raw byte download; carries status + server body."""
+
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"HTTP {status}")
+        self.status = status
+
+
+class OversizeError(Exception):
+    """A raw download was refused/aborted because it exceeded the caller's byte cap (§5a)."""
+
+    def __init__(self, size: int, message: str = "") -> None:
+        super().__init__(message or f"oversize: {size} bytes")
+        self.size = size
+
+
 # ---------------------------------------------------------------------------
 # Context resolution (this workspace's run-as SP token + host)
 # ---------------------------------------------------------------------------
@@ -137,6 +153,52 @@ class ApiClient:
 
     def get(self, path: str, params: Optional[dict] = None) -> Any:
         return self._request("GET", path, params=params)
+
+    def download_bytes(self, path: str, params: Optional[dict] = None, *,
+                       max_bytes: int = 0) -> bytes:
+        """GET a raw (non-JSON) body as bytes — for notebook/workspace-file CONTENT export.
+
+        Streams the response so a large file isn't buffered twice. Retries on 429/5xx like every
+        other call. `max_bytes>0` enforces a hard size cap: if the server advertises a larger
+        Content-Length, OR the streamed body exceeds it, an `OversizeError` is raised (the caller
+        turns that into a `skipped_oversize` record — Plan 2 §5a) instead of downloading a giant.
+        Non-2xx responses raise (the body text is attached so callers can detect size errors).
+        """
+        url = f"{self._base}/{path.lstrip('/')}"
+
+        def _do() -> bytes:
+            with self._s.get(url, headers=self._headers(), params=params, verify=self._verify,
+                             timeout=self._timeout, stream=True) as r:
+                if is_retryable_status(r.status_code):
+                    retry_after = r.headers.get("Retry-After")
+                    raise RetryableHTTPError(
+                        r.status_code, f"GET {url} -> {r.status_code}",
+                        retry_after=float(retry_after) if retry_after else None)
+                if r.status_code >= 400:
+                    # Surface the server message (e.g. MAX_NOTEBOOK_SIZE_EXCEEDED) to the caller.
+                    body = ""
+                    try:
+                        body = r.text[:2000]
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise DownloadHTTPError(r.status_code, f"GET {url} -> {r.status_code}: {body}")
+                if max_bytes:
+                    clen = r.headers.get("Content-Length")
+                    if clen and clen.isdigit() and int(clen) > max_bytes:
+                        raise OversizeError(int(clen),
+                                            f"Content-Length {clen} exceeds cap {max_bytes}")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise OversizeError(total, f"streamed body exceeds cap {max_bytes}")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+        return with_retry(_do)
 
     def post(self, path: str, body: dict) -> Any:
         return self._request("POST", path, json_body=body)

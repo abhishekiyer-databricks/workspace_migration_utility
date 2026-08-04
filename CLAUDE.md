@@ -55,8 +55,13 @@ customer.
   only points at a model — if it serves a UC-registered model (out of scope) it can't be
   auto-recreated on target; only external-model endpoints are auto-migratable. Collector flags
   `migratable` + `migration_note` per endpoint. Apps / Lakebase / Vector Search = inventory-only,
-  migration flagged manual for v1. **Genie spaces**: customer has a SEPARATE repo for Genie
-  recreation (to be pointed to at import time) — inventory still captures them + a DAB flag.
+  migration flagged manual for v1. **Genie spaces**: AUTO-MIGRATABLE (verified live fvm1
+  2026-08-01). The current Genie API `GET /api/2.0/genie/spaces/{id}?include_serialized_space=true`
+  returns the full `serialized_space` JSON, recreatable via `create_space`/`update_space`
+  (approach adopted from the `client_shared_utils/workspace_asset_migration` reference). Export
+  captures `serialized_space`+title+description+warehouse_id; import remaps `warehouse_id`.
+  Caveat: `serialized_space` references UC tables by FQN → those must pre-exist on target (UC out
+  of scope). (Supersedes the old "separate Genie repo / un-exportable protobuf" plan.)
 
 ## Account-level preflight (decided) — VERIFY only, run once before workspace #1
 - Migration is done **one workspace at a time**, but there may be **one-time account-level
@@ -144,9 +149,12 @@ Cloned locally at `/tmp/WorkspaceMigration_ref` during design (re-clone from the
   `user_id_mapping`, `user_domain_mapping`, PAUSE-schedules-on-import, skip/force-recreate jobs.
 - **Drop**: all GCP cluster rewriting, node_type_mapping.csv, Azure→GCP availability
   mapping, bash orchestrators, the `databrickslabs/migrate` dependency and its stubs.
-- **Genie spaces caveat (still applies)**: `serialized_space` is an internal protobuf not
-  exposed by GET; auto-create via public API is blocked → resolve warehouse IDs and emit
-  manual-recreation instructions.
+- **Genie spaces (UPDATED — now auto-migratable, verified live 2026-08-01)**: the OLD caveat
+  ("`serialized_space` is an un-exportable protobuf") is **obsolete** — the current Genie API
+  `GET /api/2.0/genie/spaces/{id}?include_serialized_space=true` returns the full serialized_space
+  JSON, recreatable via `create_space`/`update_space`. Export captures it; import remaps
+  warehouse_id. Only caveat left: the serialized_space references UC tables by FQN (must pre-exist
+  on target; UC out of scope).
 - **Secret values caveat (still applies)**: secret scope *values* are never exported by
   the API — only scope names + ACLs migrate; values must be re-populated on target.
 

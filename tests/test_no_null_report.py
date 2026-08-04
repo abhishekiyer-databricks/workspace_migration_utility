@@ -183,10 +183,49 @@ def test_no_null_report():
           f"{counts['object_permissions']} ACL grant rows, no blank cells")
 
 
+def test_export_status_column_resolves_for_every_card():
+    """Every card's rows must JOIN to the export index, for all of them, not just identity.
+
+    Regression: an identity-only redefinition of `_CARD_ASSET_TYPE` shadowed the full card map,
+    so `_resolve_status` returned "" for every non-identity card and the Export Status column
+    silently rendered "—" — including for genuinely oversize files. A blank status is worse than
+    a wrong one: the operator sees nothing to act on.
+    """
+    from src.exporters.export_excel import (_CARD_ASSET_TYPE, _CARD_NK_FIELDS, _resolve_status,
+                                            _row_asset_type, _row_natural_key)
+    from src.reports.inventory_view import _SUMMARY_CARD_KEYS
+    # the full card map must still cover every summary card (minus the two computed ones)
+    computed = {"object_permissions", "sql_alerts"}
+    missing = [k for k in _SUMMARY_CARD_KEYS
+               if k not in computed and k not in _CARD_ASSET_TYPE]
+    assert not missing, f"cards absent from _CARD_ASSET_TYPE (status would blank): {missing}"
+    # cluster_libraries is exempt: its natural_key embeds a JSON library blob, so it joins via
+    # the dedicated _cluster_library_status() matcher rather than a natural-key field list.
+    missing_nk = [k for k in _CARD_ASSET_TYPE
+                  if k not in _CARD_NK_FIELDS and k != "cluster_libraries"]
+    assert not missing_nk, f"cards absent from _CARD_NK_FIELDS: {missing_nk}"
+
+    # and the join must actually resolve BOTH columns end-to-end for a non-identity card
+    row = {"path": "/Users/a/big.bin"}
+    index = {"units": [{"asset_type": "workspace_file", "natural_key": "/Users/a/big.bin",
+                        "export_status": "skipped_oversize", "note": "too big",
+                        "import_action": "manual"}]}
+    from src.exporters.export_excel import _import_action_lookup, _status_lookup
+    status, note, action = _resolve_status("workspace_files", row, _status_lookup(index),
+                                           index["units"], _import_action_lookup(index))
+    assert status == "skipped_oversize", f"expected oversize status, got {status!r}"
+    # Import Action is on every sheet now, not just the identity ones — an oversize file can't be
+    # recreated from the bundle, so it must read MANUAL rather than a create.
+    assert action == "manual", f"expected manual action, got {action!r}"
+    assert _row_asset_type("workspace_files", row) == "workspace_file"
+    assert _row_natural_key("workspace_files", row) == "/Users/a/big.bin"
+
+
 if __name__ == "__main__":
     import sys
     try:
         test_no_null_report()
+        test_export_status_column_resolves_for_every_card()
         print("\nPASS  test_no_null_report")
     except Exception:
         import traceback

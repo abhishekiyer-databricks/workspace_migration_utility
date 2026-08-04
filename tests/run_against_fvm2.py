@@ -50,7 +50,7 @@ def main():
     print(f"Staging   : {cfg.output_path}\n")
 
     aw = ArtifactWriter(cfg)
-    _logger.set_log_file(aw.ensure_output_path() + "/execution_export.log")
+    _logger.set_log_file(aw.ensure_output_path() + "/execution_inventory.log")
     result = InventoryRunner(client, cfg, aw).run()
 
     print("\n=== counts ===")
@@ -64,6 +64,7 @@ def main():
         for wmsg in result["warnings"]:
             print("  -", wmsg)
     print(f"\nArtifacts written to: {result['output_path']}")
+    _logger.flush_log_file()   # mirror the log to the staging dir (append there silently fails)
 
 
 if __name__ == "__main__":
