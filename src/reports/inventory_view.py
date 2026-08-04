@@ -159,6 +159,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_pinned",         "Pinned",          "badge_bool"),
         ("spark_version",   "Spark Version",   "plain"),
         ("node_type_id",    "Node Type",       "plain"),
+        ("_dab",            "Deployed by DAB", "badge_type"),
         ("_acls",           "ACL Grants",      "plain"),
         ("creator_user_name","Creator",         "plain"),
     ],
@@ -169,6 +170,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("state",              "State",          "badge_state"),
         ("min_idle_instances", "Min Idle",       "plain"),
         ("max_capacity",       "Max Capacity",   "plain"),
+        ("_dab",               "Deployed by DAB","badge_type"),
         ("_acls",              "ACL Grants",     "plain"),
     ],
     "cluster_policies": [
@@ -201,6 +203,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("cluster_size",      "Size",           "plain"),
         ("num_clusters",      "Clusters",       "plain"),
         ("auto_stop_mins",    "Auto-Stop (min)","plain"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
         ("creator_name",      "Creator",        "plain"),
     ],
@@ -219,6 +222,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("id",                "ID",             "mono"),
         ("user.name",         "Owner",          "plain"),
         ("parent",            "Parent",         "path"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
         ("updated_at",        "Updated",        "iso_ts"),
     ],
@@ -254,6 +258,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("name",              "Endpoint Name",  "plain"),
         ("state.ready",       "Ready",          "plain"),
         ("creator",           "Creator",        "plain"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_migratable",       "Auto-Migratable","badge_bool"),
         ("_migration_note",   "Migration Note", "trunc"),
         ("_acls",             "ACL Grants",     "plain"),
@@ -266,6 +271,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("keyvault_metadata", "Key Vault",      "kv_dns"),
         ("_key_count",        "Secret Keys",    "plain"),
         ("_values_migratable","Values Migrate", "badge_bool"),
+        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
     ],
     "repos": [
@@ -456,11 +462,17 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
     # ── Compute → clusters / instance_pools / cluster_policies ───────────
     # (Ephemeral job/DLT/model clusters are dropped by the collector — Plan 1a §8.)
+    # Clusters/pools/warehouses/scopes/serving have NO workspace path, so their DAB flag can't be
+    # inferred from one — it is stamped by `inventory_runner._stamp_dab_ownership` from the bundle
+    # state files (`dab_registry`). Surfacing it here means every tab whose asset CAN be
+    # bundle-owned says so up front, instead of leaving the reader to infer it from an export
+    # status of "Skipped (DAB)" further along the row.
     data["clusters"] = [
-        _merge(c, _pinned=bool(c.get("pinned")), _acls=_acl_count(c))
+        _merge(c, _pinned=bool(c.get("pinned")), _acls=_acl_count(c), _dab=_dab_label(c))
         for c in _by(compute, "compute_type", "cluster")]
     data["instance_pools"] = [
-        _merge(c, _acls=_acl_count(c)) for c in _by(compute, "compute_type", "instance_pool")]
+        _merge(c, _acls=_acl_count(c), _dab=_dab_label(c))
+        for c in _by(compute, "compute_type", "instance_pool")]
     data["cluster_policies"] = [
         _merge(c, _acls=_acl_count(c)) for c in _by(compute, "compute_type", "cluster_policy")]
 
@@ -483,7 +495,8 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
     # ── SQL → warehouses / legacy queries / alerts / dashboards ──────────
     data["sql_warehouses"] = [
-        _merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "warehouse")]
+        _merge(s, _acls=_acl_count(s), _dab=_dab_label(s))
+        for s in _by(sql, "sql_type", "warehouse")]
     data["sql_queries"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_query")]
     # Alerts tab shows BOTH legacy (/api/2.0/sql/alerts) and Alerts V2 (/api/2.0/alerts),
     # each tagged with a "Kind" so migration can tell them apart (only legacy migrate via
@@ -492,13 +505,15 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         _merge(s, _acls=_acl_count(s), _alert_kind=_alert_kind(s.get("sql_type")),
                _dab=_dab_label(s))
         for s in sql if s.get("sql_type") in ("legacy_alert", "alert")]
-    data["sql_dashboards"] = [_merge(s, _acls=_acl_count(s)) for s in _by(sql, "sql_type", "legacy_dashboard")]
+    data["sql_dashboards"] = [
+        _merge(s, _acls=_acl_count(s), _dab=_dab_label(s))
+        for s in _by(sql, "sql_type", "legacy_dashboard")]
 
     # ── Model serving endpoints (Agent Bricks agents are excluded at the collector —
     #    not recreatable via workspace REST) ─
     data["serving_endpoints"] = [
         _merge(e, _acls=_acl_count(e), _migratable=e.get("migratable"),
-               _migration_note=e.get("migration_note"))
+               _migration_note=e.get("migration_note"), _dab=_dab_label(e))
         for e in objects_by_type.get("serving_endpoint", []) or []]
 
     # ── Secrets ──────────────────────────────────────────────────────────
@@ -506,7 +521,7 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         _merge(s, backend_type=s.get("backend_type"),
                _key_count=len(s.get("key_names") or []),
                _values_migratable=s.get("values_migratable"),
-               _acls=_acl_count(s))
+               _acls=_acl_count(s), _dab=_dab_label(s))
         for s in objects_by_type.get("secret_scope", []) or []]
 
     # ── Apps / Lakebase (inventory-only, migration manual) ───────────────

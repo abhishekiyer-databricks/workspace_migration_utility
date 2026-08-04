@@ -154,9 +154,16 @@ _DAB_CONTENT_TYPES = {"notebook", "workspace_file", "directory"}
 
 
 def is_dab_content_path(asset_type: str, natural_key: str) -> bool:
-    """Whether this unit is workspace content inside a bundle's root folder (never imported)."""
-    return (safe_str(asset_type) in _DAB_CONTENT_TYPES
-            and _DAB_ROOT_SEGMENT in safe_str(natural_key))
+    """Whether this unit is workspace content inside a bundle's root folder (never imported).
+
+    Matches the `.bundle` container directory ITSELF as well as everything under it. Testing only
+    for the `/.bundle/` segment let `/Shared/.bundle` (and `/Users/<email>/.bundle`) fall through
+    to `create`, so the one directory that exists purely to hold bundle state read "CREATE on
+    target" while every file inside it correctly read "DAB REDEPLOY"."""
+    if safe_str(asset_type) not in _DAB_CONTENT_TYPES:
+        return False
+    key = safe_str(natural_key)
+    return _DAB_ROOT_SEGMENT in key or key.endswith(_DAB_ROOT_SEGMENT.rstrip("/"))
 
 
 DAB_CONTENT_NOTE = ("inside a DAB bundle root — exported for reference but NOT imported; "

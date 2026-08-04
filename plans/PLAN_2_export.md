@@ -533,6 +533,41 @@ intent to be inferred from its status (the customer read `DAB` as "not exported"
 closed vocabulary (`asset_export.IMPORT_ACTIONS`) and the Excel label map is asserted against it
 at import time, so a new action can't be added without a label and silently render `—`.
 
+**(3) `Deployed by DAB` on every tab whose asset CAN be bundle-owned (added 2026-08-04).** The
+status/action pair told the reader what happens to a bundle-owned asset but never that it *was*
+bundle-owned — only jobs, pipelines, alerts, dashboards, Genie spaces and workspace content had the
+flag column, so on the warehouse/cluster/pool/scope/serving tabs "Skipped (DAB) + DAB REDEPLOY" was
+the *first* hint, and it had to be inferred. Those five are exactly the **pathless** assets whose
+DAB-ness cannot come from a `.bundle/` path and is instead stamped from the bundle state files by
+`inventory_runner._stamp_dab_ownership` (+ legacy SQL dashboards, from their `parent` path). The
+data was already collected; only the column was missing. Declared once in
+`inventory_view._COLUMNS` and populated in `adapt()`, so it propagates to **all three** renderers
+(inventory HTML, inventory Excel, `export_status.xlsx`) — this is an inventory-layer change that
+Export inherits. Same `Manual / DAB (Shared) / DAB (User)` vocabulary as the jobs tab
+(`helpers.dab_deploy_label`).
+
+> **`apps` deliberately excluded.** `apps` IS a DAB resource type in
+> `dab_registry._RESOURCE_KIND_TO_ASSET` but is NOT in `_DAB_STAMP_TARGETS`, so app records are
+> never stamped. Giving that tab the column would print "Manual" for a bundle-owned app — a new
+> way to mislead. Adding `app` to the stamp targets needs a live check that the state `__id__`
+> matches the app `name`; until then the column stays off apps.
+
+**ACL-sheet rows on bundle content say `DAB REDEPLOY`, not `APPLY ACL` (fixed 2026-08-04).** The
+"Object Permissions (ACLs)" sheet joins nothing from the index — `_resolve_status` hardcoded
+`("success", "apply_acl")` for **every** grant. But `_flatten_acls` emits a row per grant for every
+workspace object including `DIRECTORY`, so grants on bundle-root content (all 23 bundle directories
+on fvm1 carry them) read `APPLY ACL on target` — an action the importer will never take, since it
+replays ACLs only for objects it created and it creates nothing under a bundle root (§5c). The
+**status stays `success`** (`acls.json` genuinely captured the grant; export is not at fault); only
+the action changes, matching how bundle-owned jobs read. Keyed off the row's `object_key` path via
+the same `is_dab_content_path` predicate the units use, so the two can't drift.
+
+**`is_dab_content_path` matches the `.bundle` container dir itself (fixed 2026-08-04).** The
+predicate tested for the `"/.bundle/"` segment *with* a trailing slash, so `/Shared/.bundle` and
+`/Users/<email>/.bundle` — the directories that exist purely to hold bundle state — fell through to
+`import_action: "create"` while every file inside them correctly read `dab_redeploy`. Affected
+`export_index.json` directly.
+
 Where a caveat exists the unit's `note` is appended to the action cell — e.g.
 `CREATE on target — UC tables in serialized_space must pre-exist on target`.
 

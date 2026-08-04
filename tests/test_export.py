@@ -562,6 +562,11 @@ def test_dab_bundle_content_is_never_imported():
     assert is_dab_content_path("workspace_file", "/Shared/.bundle/b/files/databricks.yml")
     assert is_dab_content_path("notebook", "/Users/a@x.com/.bundle/b/files/nb")
     assert is_dab_content_path("directory", "/Shared/.bundle/b/state")
+    # The `.bundle` CONTAINER dir itself, not just paths under it. Matching only the "/.bundle/"
+    # segment let this one directory fall through to `create` while every file inside it read
+    # `dab_redeploy` — the one row in the tree that claimed the importer would recreate it.
+    assert is_dab_content_path("directory", "/Shared/.bundle")
+    assert is_dab_content_path("directory", "/Users/a@x.com/.bundle")
     assert not is_dab_content_path("workspace_file", "/Shared/wsmig/config.json")
     # A job under a bundle path is DAB-owned via dab_registry (mode="dab"), not via this check.
     assert not is_dab_content_path("job", "/Shared/.bundle/b/files/x")
@@ -582,6 +587,7 @@ def test_dab_bundle_content_is_never_imported():
         "dab_redeploy"
     assert act("notebook", "/Shared/.bundle/b/files/nb", "content") == "dab_redeploy"
     assert act("directory", "/Shared/.bundle/b/state", "auto") == "dab_redeploy"
+    assert act("directory", "/Shared/.bundle", "auto") == "dab_redeploy"
     # Non-bundle content is unaffected.
     assert act("notebook", "/Shared/wsmig/nb", "content") == "create_and_upload"
     assert act("directory", "/Shared/wsmig", "auto") == "create"
@@ -601,6 +607,75 @@ def test_dab_bundle_content_is_never_imported():
     assert wf["import_action"] == "dab_redeploy" and wf["migration_mode"] == "content"
     d = units["directory"][0]
     assert d["import_action"] == "dab_redeploy" and d["migration_mode"] == "auto"
+
+
+def test_acl_sheet_rows_on_bundle_content_read_dab_redeploy():
+    """The Object-Permissions sheet joins nothing from the index — it hardcoded
+    ("success", "apply_acl") for EVERY grant, including grants on workspace content inside a
+    bundle root. The importer replays ACLs only for objects it created and it creates nothing
+    under a bundle root, so those rows promised an action import will never take.
+
+    Status stays `success` (acls.json really did capture the grant); only the ACTION changes.
+    """
+    from src.exporters.export_excel import _resolve_status
+
+    def act(object_type, object_key):
+        return _resolve_status("object_permissions",
+                               {"object_type": object_type, "object_key": object_key},
+                               {}, [], {})
+
+    # Bundle content — every workspace object type the ACL sheet emits, incl. the `.bundle` root.
+    for otype, key in (("directory", "/Shared/.bundle"),
+                       ("directory", "/Shared/.bundle/b/dev"),
+                       ("notebook", "/Shared/.bundle/b/dev/files/nb"),
+                       ("file", "/Shared/.bundle/b/dev/state/resources.json")):
+        status, note, action = act(otype, key)
+        assert (status, action) == ("success", "dab_redeploy"), f"{otype} {key} → {action}"
+        assert note, "the DAB row must carry the explanatory note the workbook renders"
+
+    # Non-bundle workspace content is untouched.
+    assert act("directory", "/Shared/analytics")[2] == "apply_acl"
+    assert act("notebook", "/Users/a@x.com/nb")[2] == "apply_acl"
+    # Pathless assets keep the uniform action: a bundle-owned job/warehouse/scope is flagged on
+    # its OWN sheet (via dab_registry), and its object_key is a name, never a path.
+    for otype in ("job", "cluster", "sql_warehouse", "secret_scope", "dlt_pipeline"):
+        assert act(otype, "nightly")[2] == "apply_acl", otype
+    # A name that merely looks bundle-ish must not be misread as a path.
+    assert act("secret_scope", "/Shared/.bundle/b")[2] == "apply_acl"
+
+
+def test_dab_flag_column_on_every_pathless_dab_capable_asset_tab():
+    """`_COLUMNS` is the single registry all three renderers read (inventory HTML, inventory
+    Excel, export workbook), so the DAB column must be declared there AND populated by `adapt()`.
+
+    Regression: warehouses/clusters/pools/scopes/serving endpoints CAN be bundle-owned (stamped
+    from the bundle state files by `_stamp_dab_ownership`) but had no column saying so — the
+    customer had to infer DAB-ness from an export status of "Skipped (DAB)" further along the row.
+    """
+    from src.reports.inventory_view import _COLUMNS, _resolve_items, adapt
+
+    dab = {"deployed_by_dab": True, "dab_scope": "shared"}
+    data = adapt({
+        "sql": [dict(dab, sql_type="warehouse", id="w1", _raw={"name": "wh"}, name="wh"),
+                dict(sql_type="legacy_dashboard", id="d1", name="dash")],
+        "compute": [dict(dab, compute_type="cluster", cluster_id="c1", cluster_name="cl"),
+                    dict(compute_type="instance_pool", instance_pool_id="p1",
+                         instance_pool_name="pool")],
+        "secret_scope": [dict(dab, name="kv", backend_type="DATABRICKS", key_names=["k"])],
+        "serving_endpoint": [dict(dab, name="ep", migratable=True)],
+    })
+    for card in ("sql_warehouses", "clusters", "instance_pools", "secret_scopes",
+                 "serving_endpoints", "sql_dashboards"):
+        labels = [lbl for (_k, lbl, _f) in _COLUMNS[card]]
+        assert "Deployed by DAB" in labels, f"{card} has no DAB column"
+        # and the key the column reads is actually populated (a declared-but-unpopulated column
+        # renders blank, which is the failure mode this is guarding against)
+        for row in _resolve_items(data, card):
+            assert row.get("_dab"), f"{card} row has an empty _dab cell: {row!r}"
+
+    # The label vocabulary matches the jobs tab (Manual / DAB (Shared) / DAB (User)).
+    assert _resolve_items(data, "sql_warehouses")[0]["_dab"] == "DAB (Shared)"
+    assert _resolve_items(data, "instance_pools")[0]["_dab"] == "Manual"
 
 
 def test_dab_content_keeps_action_and_note_through_the_content_pass():

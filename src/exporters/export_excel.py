@@ -26,7 +26,12 @@ import json
 import re
 from datetime import datetime
 
-from src.exporters.asset_export import IMPORT_ACTIONS
+from src.exporters.asset_export import (
+    DAB_CONTENT_NOTE,
+    IMPORT_ACTIONS,
+    _ACTION_DAB,
+    is_dab_content_path,
+)
 from src.reports.inventory_view import (
     _COLUMNS,
     _LABELS,
@@ -392,12 +397,31 @@ def generate_export_excel(objects_by_type: dict, index: dict, local_path: str,
     return local_path
 
 
+# ACL-sheet `object_type` (lower-cased from the workspace API's DIRECTORY/NOTEBOOK/FILE) → the
+# export asset_type `is_dab_content_path` expects. Only workspace content can sit inside a bundle
+# root; a job or warehouse is bundle-owned via `dab_registry` and its own row already says so.
+_ACL_WS_OBJECT_TYPES = {"directory": "directory", "notebook": "notebook", "file": "workspace_file"}
+
+
+def _is_dab_acl_row(row: dict) -> bool:
+    """Whether an Object-Permissions row grants on workspace content inside a bundle root."""
+    asset_type = _ACL_WS_OBJECT_TYPES.get(str(row.get("object_type") or "").lower())
+    if not asset_type:
+        return False
+    return is_dab_content_path(asset_type, row.get("object_key"))
+
+
 def _resolve_status(card_key: str, row: dict, status_by_key: dict, index_units: list,
                     action_by_key: dict):
     """(status, note, import_action) for one inventory row, joined to the export index."""
     if card_key == "object_permissions":
-        # Every grant is captured wholesale in acls.json; import replays them once the objects
-        # they point at exist, so the ACL sheet's action is uniform.
+        # Every grant is captured wholesale in acls.json, so the STATUS is uniformly success —
+        # export really did capture it. The ACTION is not uniform: the importer replays ACLs only
+        # for objects it created, and it deliberately creates nothing under a bundle root, so a
+        # grant on bundle content reads DAB REDEPLOY like the bundle-owned jobs do. Claiming
+        # "APPLY ACL on target" there promised an action import will never take.
+        if _is_dab_acl_row(row):
+            return "success", DAB_CONTENT_NOTE, _ACTION_DAB
         return "success", "", "apply_acl"
     if card_key == "cluster_libraries":
         return _cluster_library_status(row, index_units)
