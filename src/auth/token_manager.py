@@ -279,6 +279,17 @@ class ApiClient:
         return {"Authorization": f"Bearer {self._token_provider()}",
                 "Content-Type": "application/json"}
 
+    def auth_headers(self, content_type: str = "application/json") -> dict:
+        """Fresh auth headers for a caller that must bypass this client's JSON request path.
+
+        Public because two calls legitimately cannot go through `_request`: the streaming
+        workspace-files upload (octet-stream body, path in the URL) and the AKV scope create (a
+        one-off Azure AD bearer). Both still need THIS run's token — and a freshly-provided one, so a
+        refreshed M2M token is picked up rather than a stale copy.
+        """
+        return {"Authorization": f"Bearer {self._token_provider()}",
+                "Content-Type": content_type}
+
     def _request(self, method: str, path: str, *, params=None, json_body=None) -> Any:
         url = f"{self._base}/{path.lstrip('/')}"
 

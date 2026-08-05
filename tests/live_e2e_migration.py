@@ -161,7 +161,8 @@ def _pick_warehouse(client) -> str:
     return whs[0]["id"]
 
 
-def _import(cfg, target_client, aw, *, count_mutations=False, run_preflight=False):
+def _import(cfg, target_client, aw, *, count_mutations=False, run_preflight=False,
+            source_client=None):
     """Run the real ImportRunner (optionally the real Preflight first).
 
     Returns (summary, mutating_calls, state).
@@ -179,9 +180,19 @@ def _import(cfg, target_client, aw, *, count_mutations=False, run_preflight=Fals
         # The real gate, as 04_Import runs it — so the harness exercises preflight rather than
         # assuming a GO, and `preflight_report.*` really gets written.
         from src.importers.preflight import Preflight
-        verdict = Preflight(target_client, cfg, aw, state=state).run()
+        # The source client MUST be handed over in `direct` mode: preflight's source-connectivity
+        # check is BLOCKING, and rightly so (in direct mode there'd be nothing to read without it).
+        verdict = Preflight(target_client, cfg, aw, state=state,
+                            source_client=source_client if cfg.is_direct else None).run()
         print(f"    preflight verdict: {verdict['verdict']} "
               f"({len(verdict['blocking'])} blocking, {len(verdict['degrading'])} degrading)")
+        for item in verdict["blocking"]:
+            print(f"      BLOCKING: {item[:200]}")
+        # A NO-GO here would mean a real prerequisite is unmet on the target, not a tool problem —
+        # but it must be visible rather than silently overridden by preflight_enforce=false.
+        CHECKS.add("H", "preflight did not report a BLOCKING problem",
+                   verdict["verdict"] != "NO-GO",
+                   f"verdict={verdict['verdict']} blocking={verdict['blocking'][:2]}")
 
     runner = ImportRunner(client, cfg, aw, state=state, preflight_verdict=verdict)
     summary = runner.run()
@@ -506,7 +517,8 @@ def main(keep: bool = False) -> int:
         aw_e2 = ArtifactWriter(cfg_e)
         # Runs the REAL preflight gate too, so `preflight_report.*` is produced exactly as
         # `04_Import` produces it.
-        summary_e, _m, state_e = _import(cfg_e, target_client, aw_e2, run_preflight=True)
+        summary_e, _m, state_e = _import(cfg_e, target_client, aw_e2, run_preflight=True,
+                                         source_client=source_client)
         totals_e = summary_e["totals"]
         print(f"    totals: {json.dumps(totals_e)}")
         CHECKS.add("E", "the changed units were UPDATED", totals_e.get("updated", 0) > 0,

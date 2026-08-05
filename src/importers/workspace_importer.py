@@ -220,8 +220,7 @@ class WorkspaceImporter(BaseImporter):
         import requests
         url = (f"{self.client.base_url}/api/2.0/workspace-files/import-file/"
                f"{path.lstrip('/')}?overwrite={'true' if overwrite else 'false'}")
-        headers = dict(self.client._headers())          # reuse the run's auth
-        headers["Content-Type"] = "application/octet-stream"
+        headers = self.client.auth_headers("application/octet-stream")   # this run's live token
         resp = requests.post(url, data=data, headers=headers, timeout=600)
         if resp.status_code >= 400:
             raise RuntimeError(f"streaming upload of {path} failed: HTTP {resp.status_code}: "

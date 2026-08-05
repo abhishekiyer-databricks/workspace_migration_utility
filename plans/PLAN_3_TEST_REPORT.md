@@ -29,7 +29,7 @@ Plan 4 joins on, so Plan 4 is a reader, not a retrofit.
 
 ---
 
-## 2. Offline test suite — 239 tests, all passing
+## 2. Offline test suite — 242 tests, all passing
 
 `python3 -m pytest` (safe anywhere; `pytest.ini` excludes the live harnesses).
 
@@ -37,10 +37,10 @@ Plan 4 joins on, so Plan 4 is a reader, not a retrofit.
 |---|---:|---|
 | `test_state_store.py` | 25 | decision table, batching, flush-on-failure, recovery replay, pair isolation, retry buckets, identity map |
 | `test_import_framework.py` | 33 | fail-soft invariant, idempotency, dry-run purity, resume, run resolution, the 4 whole-run gates |
-| `test_importers_phase6_12.py` | 37 | sql/dlt/dashboards/genie/serving/misc + all ACL body/skip/parity rules |
+| `test_importers_phase6_12.py` | 40 | sql/dlt/dashboards/genie/serving/misc + all ACL body/skip/parity rules |
 | `test_importers_phase2_5.py` | 30 | compute/workspace/secrets/jobs traps (ephemeral, stop-after-create, AKV, remapping) |
 | `test_export.py` | 28 | (pre-existing) export engine |
-| `test_config_auth.py` | 22 | per-mode validation, secret precedence, redaction, M2M caching, error bodies |
+| `test_config_auth.py` | 24 | per-mode validation, secret precedence, redaction, M2M caching, error bodies |
 | `test_preflight_and_reports.py` | 22 | preflight GRADING, report shape, manual runbook |
 | `test_identity_importer.py` | 17 | create-vs-assign per classification, two-pass groups, entitlements |
 | `test_fingerprint_gaps.py` | 10 | GAP 1/2 regressions + a 23-case fingerprint-sensitivity sweep |
@@ -54,30 +54,44 @@ Plan 4 joins on, so Plan 4 is a reader, not a retrofit.
 |---|---|---|
 | `tests/live_direct_mode.py` | **13/13 PASS** | M2M token mints against fvm1, reaches admin-only endpoints, two clients bound to different hosts with different identities, secret in no log line |
 | `tests/live_state_store.py` | **24/24 PASS** | Real Delta DDL + MERGE-on-PK (upsert in place, no duplicate row), pair isolation in a shared table, quote/newline escaping, identity-map durability, retry work lists, dry-run isolation |
-| `tests/live_e2e_migration.py` | **see §4** | The full migration, twice, with a source mutation in between |
+| `tests/live_e2e_migration.py` | **43/43 PASS** | The full migration, twice, with a source mutation in between (see §4) |
 
 ---
 
-## 4. End-to-end live migration — final result
+## 4. End-to-end live migration — **43/43 PASS, 0 failed**
 
-See §6 for the exact final numbers.
+```
+  phase 0: 1 passed, 0 failed     source fixture
+  phase A: 6 passed, 0 failed     inventory + export over M2M
+  phase B: 4 passed, 0 failed     dry run — zero writes
+  phase C: 8 passed, 0 failed     live import
+  phase D: 3 passed, 0 failed     re-run SKIPs, no duplicates
+  phase E: 6 passed, 0 failed     source mutation -> UPDATE
+  phase F: 2 passed, 0 failed     adopt, not duplicate
+  phase G: 3 passed, 0 failed     retry modes
+  phase H: 10 passed, 0 failed    ACL parity + report set
+```
 
 Bundle exported from fvm1: **155 units** (130 captured, 0 export failures, 13 DAB-owned, 6 manual)
 across 17 identities, 11 compute, 92 workspace objects, 3 secret scopes, 4 jobs, 6 SQL, 3 DLT,
 3 dashboards, 2 genie spaces, 1 serving endpoint, 8 misc. Import decided **268 units** including
 119 ACL objects.
 
-| Phase | What it asserts |
-|---|---|
-| A | inventory + export over M2M; manifest verifies; `LATEST_EXPORT.json` ties to the manifest; content hashed |
-| B | **dry run makes ZERO mutating calls** (counted at the client), still decides all 268 units, writes only to the `_dryrun` state table |
-| C | live import completes fail-soft; objects really created; notebook lands as a NOTEBOOK with v1 content; state rows carry BOTH ids; identity map populated |
-| D | **re-run SKIPs** unchanged units; no duplicate created |
-| E | **source mutation → fingerprint moves → UPDATE against the STORED target id**; edited notebook content reaches the target |
-| F | an object created by hand is **ADOPTED**, not duplicated |
-| G | `retry_mode=failed_only` attempts only outstanding units; `import_assets=acls` runs ACLs alone |
-| H | ACL parity diff; the full report set exists and is joinable on `(asset_type, natural_key)` |
-| I | cleanup — the target and source are left as found |
+| Phase | What it asserts | Result |
+|---|---|---|
+| A | inventory + export over M2M; manifest verifies; `LATEST_EXPORT.json` ties to the manifest; content hashed | 155 units, 0 export failures |
+| B | **dry run makes ZERO mutating calls** (counted at the client), still decides every unit, writes only to the `_dryrun` state table | 0 mutations / 268 units decided |
+| C | live import completes fail-soft; objects really created; notebook lands as a NOTEBOOK with v1 content; state rows carry BOTH ids; identity map populated | 56 created, 51 adopted, run `completed` |
+| D | **re-run SKIPs** unchanged units; no duplicate created | 162 skipped, 3 created, 1 copy of the policy |
+| E | **source mutation → fingerprint moves → UPDATE against the STORED target id**; edited notebook content reaches the target | 2 updated, same target id, v2 content live |
+| F | an object created by hand is **ADOPTED**, not duplicated | 1 adopted, 1 copy |
+| G | `retry_mode=failed_only` attempts only outstanding units; `import_assets=acls` runs ACLs alone | 26 of 268 attempted |
+| H | ACL parity diff; the full report set exists and is joinable on `(asset_type, natural_key)` | **43 objects match, 0 divergence** |
+| I | cleanup — the target and source are left as found | schema dropped, prefixed objects deleted |
+
+The second live import (phase E's, after preflight ran for real) finished with **zero failures**:
+`{skipped_no_object: 75, skipped: 44}` — i.e. everything importable was already correct on target and
+the only outstanding rows were the by-design DAB ones.
 
 ### The headline result
 
@@ -164,19 +178,37 @@ The live target is a **shared sandbox that is not a migration target**, so a num
 failures are the tool behaving correctly. Each is categorised and carries a remediation — which is
 itself the thing being tested (§7d/D14: *never hard-fail the run on a per-unit problem*).
 
+Final live run: **20 failed, 75 skipped_no_object, 7 manual** out of 268 units, broken down as
+`prerequisite_missing: 16, permission_denied: 2, api_error: 2`.
+
 | Category | Count | Why this is correct |
 |---|---:|---|
 | `prerequisite_missing` — account identities | 5 | 4 Entra users + 1 UMI SP are not assigned to the target. The tool **must not** create them: creating an account SP mints a new `applicationId` and orphans every ACL. Reported for customer IT / an account admin. |
-| `prerequisite_missing` — user home dirs | 7 | `/Users/<email>` cannot be `mkdir`'d; it appears when the user is provisioned. Directly caused by the above. |
+| `prerequisite_missing` — user home dirs | 8 | `/Users/<email>` cannot be `mkdir`'d; it appears when the user is provisioned. A direct consequence of the row above. |
 | `prerequisite_missing` — cluster libraries | 2 | Clusters are stopped right after create (so the migration doesn't burn DBUs), and `libraries/install` needs a RUNNING cluster (D6). Opt in with `library_force_start_clusters=true`. |
 | `prerequisite_missing` — AKV scope | 1 | Needs an Azure AD token for app `2ff814a6-…`; the run-as identity here is a user, not an Entra SP (§6c). |
-| `api_error` — genie / DLT (403) | 2 | The run-as identity lacks create permission for those on this sandbox. |
-| `api_error` — alert_v2 (409) | 1 | An alert of that name already exists on the target from earlier testing. |
+| `permission_denied` — genie / DLT | 2 | The run-as identity lacks create permission for those on this shared sandbox. Correctly categorised (it was an indistinguishable `api_error` before fix 5.2). |
+| `api_error` — legacy alert + serving endpoint | 2 | Both diagnosed after fix 5.2 exposed the real messages, and both now handled properly (§5.9/§5.10) — they are `not_supported` with a remediation rather than a bare 400. |
 | `manual` | 7 | Repos (out of scope, D9), secret values (never readable by any API), legacy SQL dashboards (create endpoint gone, D10). |
 | `skipped_no_object` | 75 | ACL grants whose object is legitimately absent — mostly `dab_redeploy` (bundle-owned content the customer's `bundle deploy` recreates). Deliberately **not** `failed`, or every bundle-using workspace would show permanent red (§6b-i). |
 
 **None of these aborted the run** — that is the D21 fail-soft invariant working as designed, and the
-run status was `completed` throughout.
+run status was `completed` throughout. On the SECOND live import (after the fixes) the same bundle
+produced **zero failures**.
+
+### 5.9 An external-model serving endpoint cannot be created without its provider key
+Exposed by fix 5.2. The export payload carries `external_model{provider, name, task}` but **not** the
+credential — the API never returns it, exactly like a secret value — so the create failed with
+"Empty or wrong type of config provided for openai". That is a manual credential step, not a
+malformed payload. Now `not_supported` with the remediation (supply the key, ideally as a
+secret-scope reference).
+
+### 5.10 Legacy SQL alerts: the v1 create wants a shape the read API no longer returns
+Also exposed by fix 5.2. `POST sql/alerts` requires the old flat `options{column, op, value}` and
+rejects the modern payload with "Missing alert definition", but the current read surface only returns
+`condition{op, operand, threshold}`. The condition is now translated where it maps cleanly;
+anything that doesn't is reported as a manual rebuild rather than guessed at — an alert's **trigger**
+must not be approximated.
 
 ---
 
