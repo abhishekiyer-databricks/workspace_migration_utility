@@ -8,7 +8,20 @@ workspace assets** from a **source workspace** to a **target workspace**, both o
 be **generic + config-driven** so the same code migrates 100+ workspace pairs for the
 customer.
 
-## Runtime model (decided) — AIR-GAPPED, two-sided (NO source↔target connectivity)
+## Runtime model (REVISED 2026-08-04) — TWO modes, both must work (`connectivity_mode` widget)
+The deployment model is not fixed, so the utility supports both. See PLAN_0_master §1a.
+- **Mode A `airgap` (default)** — the two-sided model described below.
+- **Mode B `direct`** — **all** stages run **inside the TARGET workspace**; `01_Inventory` +
+  `02_Export` read the source over REST using a **source workspace-admin SP's client id +
+  secret** (OAuth M2M; the secret comes from a target-workspace secret scope OR a widget — both
+  supported, always redacted from artifacts/logs — see PLAN_3_import.md §2a). The
+  bundle is written straight to `target_staging_location`, so there is **no manual hop** and the
+  whole migration can run as **one end-to-end Job** (`00_Main_EndToEnd`, master §4a).
+- Both modes produce/consume the **same bundle**, so import/transform/validate are mode-agnostic;
+  the mode is recorded in `manifest.json` + `config_resolved.json`. Only `01`/`02` and
+  `auth/token_manager.build_clients()` are mode-aware.
+
+### Mode A detail — AIR-GAPPED, two-sided (NO source↔target connectivity)
 - **There is NO network connectivity between source and target workspaces.** The pull model
   is dead. The utility runs on **two sides that never talk to each other**:
   - **SOURCE side** (`01_Inventory`, `02_Export`): runs **inside the source workspace**;
@@ -28,8 +41,16 @@ customer.
 - **Hive metastore + UC are OUT of scope.** Assets only. (UC Volumes may be used purely as
   staging storage — not UC migration.)
 
-## Auth model (decided) — each side uses its own run-as SP; NO cross-workspace auth
-- **PATs are not allowed / disabled in the customer WS. No OAuth M2M either.**
+## Auth model (REVISED 2026-08-04) — per-mode
+- **PATs are not allowed / disabled in the customer WS** (still true in both modes).
+- **`direct` mode DOES use OAuth M2M** (client-credentials) for the **source** workspace only —
+  a source workspace-admin SP's `client_id` + secret, the secret read at runtime from a
+  **target-workspace secret scope** via `dbutils.secrets.get`. Never a widget value, never in
+  `config_resolved.json`. The earlier blanket "no OAuth M2M" applied to the air-gap-only design.
+- The workspace a notebook **runs in** is always reached with the run-as SP's notebook-context
+  token (SDK ambient auth), in both modes.
+
+### Mode A detail — each side uses its own run-as SP; NO cross-workspace auth
 - Each side runs as a **Databricks Job whose run-as identity is a workspace-admin SP** on
   **that** workspace. All API calls use that SP's **notebook-context token** against its own
   workspace only (SDK `WorkspaceClient` ambient auth, context-token fallback).
@@ -37,13 +58,25 @@ customer.
   thing that crosses. So the "same Databricks account?" question is irrelevant to the build.
 
 ## Config / driver (decided) — widget-based, no credentials in widgets
-- Common widgets: `role` (source|target), `run_id`, `source_workspace_id`.
+- Common widgets: `connectivity_mode` (airgap|direct), `role` (source|target), `run_id`,
+  `source_workspace_id`.
 - Source side: `source_staging_location`, `max_scim/max_workspace_items/max_ws_api_calls`,
-  `verbose`. Target side: `target_staging_location`, `dry_run`, `account_id`, transform options.
+  `verbose`. Target side: `target_staging_location`, `dry_run`, `account_id`, transform options,
+  `import_assets` (which families to import this session), `state_catalog`/`state_schema`/
+  (one shared catalog+schema across all pairs, assumed to exist; table names tool-owned),
+  `preflight_enforce`, `retry_mode` (off|failed_only|skipped_only|failed_and_skipped).
+- `direct` mode only: `source_workspace_url`, `source_sp_client_id`, and the secret **either** as
+  `source_sp_secret_scope`+`source_sp_secret_key` (pointer, preferred when both set) **or**
+  `spn_secret_value` (widget fallback). Always redacted from artifacts + logs.
 - Per-asset toggles (all default TRUE; flip to FALSE to skip), set on both sides. Same values
   usable as Job params. **No credentials in any widget** (run-as SP context token).
-- Asset scope decisions: INCLUDE legacy SQL (queries/alerts/dashboards),
-  workspace conf, Excel output, global init scripts, cluster libraries. EXCLUDE PATs/tokens
+- Asset scope decisions: INCLUDE legacy SQL queries/alerts,
+  workspace conf, Excel output, global init scripts, cluster libraries.
+  **Legacy SQL dashboards: inventoried + exported, NOT imported** (create endpoint deprecated/absent
+  on modern workspaces, verified live) → `manual` + rebuild note; underlying queries still migrate.
+  **Git repos: OUT OF SCOPE for import** (customer 2026-08-05) — inventoried + exported as metadata
+  only (url/provider/branch/path; zero file bytes, the collector never descends into a git folder),
+  which is the manual recreate runbook. Never created on target. EXCLUDE PATs/tokens
   (disabled) and **IP access lists** (account-level in this customer — configured in the
   account console / account API; a workspace-scoped tool can't see or migrate them → customer/
   account-admin manual task). REMOVE UC assets (registered models, connections, delta sharing, clean rooms) +
@@ -159,14 +192,17 @@ Cloned locally at `/tmp/WorkspaceMigration_ref` during design (re-clone from the
   the API — only scope names + ACLs migrate; values must be re-populated on target.
 
 ## Notebooks (scaffolded as stubs; see plans/PLAN_0_master.md §4)
-Air-gapped: `01_Inventory`/`02_Export` run in the SOURCE; the rest run in the TARGET.
+`airgap` mode: `01_Inventory`/`02_Export` run in the SOURCE; the rest run in the TARGET.
+`direct` mode: ALL of them run in the TARGET (01/02 read the source over REST).
 - `00_Account_Preflight` — VERIFY-only account prereqs (run once before workspace #1)
 - `01_Inventory` — read-only enumeration + identity classification → report (Plan 1)
 - `02_Export` (source) — dump enabled assets → source staging **bundle** (JSON + notebook SOURCE/DBC) + manifest/checksums. Checkpointed.
 - `03_Transform_Review` (target) — verify manifest; apply mappings/excludes → pre/post diff for sign-off
 - `04_Import` (target) — create on target in dependency order; idempotent + checkpointed + dry-run
 - `05_Validate` (target) — target vs export-manifest reconciliation report
-- `00_Main_Source` / `00_Main_Target` — optional per-side orchestrators
+- `00_Main_Source` / `00_Main_Target` — optional per-side orchestrators (`airgap`)
+- `00_Main_EndToEnd` — single Job running inventory→export→preflight→transform→import→validate
+  (**`direct` mode only**; the manual hop makes this impossible in `airgap`)
 Reusable logic lives in the importable `src/` package (Git folder); notebooks stay thin.
 
 ### Asset dependency order (non-UC; Hive metastore + UC OUT of scope)
@@ -229,13 +265,20 @@ account-admin / customer IT.
 - Everything **idempotent** (skip-if-exists) and **checkpointed** so a re-run resumes; plus
   **cross-run UPSERT** via the Delta state store (see above).
 - **Dry-run** supported on every mutating step.
-- Auth = the run-as workspace-admin SP's **notebook-context token** for THIS workspace only;
-  never call the other workspace, never hard-code credentials, no OAuth M2M / PAT / secrets.
+- Auth = the run-as workspace-admin SP's **notebook-context token** for the workspace the notebook
+  runs in. Never hard-code credentials; no PATs. **`airgap` mode additionally never calls the other
+  workspace; `direct` mode DOES call the source, via OAuth M2M** (see the Auth model section).
 - Generic first: no customer- or workspace-specific values in code; all in widgets/config.
 
-## Status
-Design complete + **scaffolded** for the AIR-GAPPED model. `notebooks/` + `src/` exist as
-**stubs only** (docstrings + signatures + `NotImplementedError`). `plans/PLAN_0_master.md`
-(master) + `plans/PLAN_1_setup_and_inventory.md` written. Placeholder `main.py` removed.
-Next: implement Plan 1 (foundation + `01_Inventory`, source side) after review. No functional
-implementation code yet.
+## Status (2026-08-04)
+- **Plan 1 (inventory) + Plan 2 (export) are IMPLEMENTED and live-tested** on fvm1 (source) and
+  the target workspace. See `plans/PLAN_1_setup_and_inventory.md`, `plans/PLAN_2_export.md`,
+  `plans/PLAN_1a_inventory_feedback.md`, `plans/INVENTORY_COVERAGE.md`, and the live harnesses in
+  `tests/` (`fixtures_fvm1.py`, `live_fvm1_report.py`, `live_fvm1_export.py`,
+  `live_replay_target.py`, `live_fvm1_resume.py`).
+- **`src/importers/`, `src/state/state_store.py`, and the target-side notebooks are still STUBS.**
+- **`plans/PLAN_3_import.md` written (awaiting review)** — the whole write half: dual-mode
+  connectivity/auth (§2), `LATEST_EXPORT.json` + resume (§3–4), `import_assets` selector (§5),
+  phase-ordered importers (§6), the Delta migration state table incl. the *when to write it* decision
+  (§7), end-to-end Job (§8), `00_Account_Preflight` gate (§9).
+- Next: implement Plan 3 in the phased build order (`PLAN_3_import.md` §10) after review.
