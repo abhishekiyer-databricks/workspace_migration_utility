@@ -42,6 +42,10 @@ def _pointer_path(config) -> str:
     return f"{wsmig_root(config)}/LATEST_INVENTORY.json"
 
 
+def _export_pointer_path(config) -> str:
+    return f"{wsmig_root(config)}/LATEST_EXPORT.json"
+
+
 # ── the inventory pointer (§2b path D) ──────────────────────────────────────
 
 def write_latest_pointer(config, run_id: str, counts: dict) -> str:
@@ -70,6 +74,62 @@ def read_latest_pointer(config) -> Optional[dict]:
             return json.load(f)
     except Exception:  # noqa: BLE001 — a garbled pointer is treated as absent
         return None
+
+
+# ── the EXPORT pointer (Plan 3 §3) ──────────────────────────────────────────
+# The inventory pointer is NOT usable for import: it names the run whose INVENTORY is newest,
+# which is not necessarily one whose EXPORT completed. Import needs "the newest run whose bundle
+# is finished", so Export writes this pointer as its very last action — AFTER manifest.json — and
+# its mere existence proves the bundle it names is complete.
+
+def write_latest_export_pointer(config, run_id: str, manifest: dict, counts: dict) -> str:
+    """Write `LATEST_EXPORT.json` naming the just-completed bundle. Returns its path.
+
+    `manifest_checksum` ties the pointer to THIS bundle's manifest, which is how import detects a
+    pointer left over from a DIFFERENT upload in `airgap` mode (ops copies both files; if the
+    pointer says run X but the run X dir on the target has a different manifest, import refuses and
+    names both rather than importing a mismatched bundle).
+    """
+    import hashlib
+    import json
+    root = wsmig_root(config)
+    os.makedirs(root, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    payload = {
+        "run_id": run_id,
+        "generated_utc": now_iso(),
+        "source_workspace_id": config.source_workspace_id,
+        "connectivity_mode": getattr(config, "connectivity_mode", ""),
+        "tool_version": manifest.get("tool_version", ""),
+        "manifest_checksum": f"sha256:{digest}",
+        "counts": counts,
+    }
+    with open(_export_pointer_path(config), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return _export_pointer_path(config)
+
+
+def read_latest_export_pointer(config) -> Optional[dict]:
+    """Read `LATEST_EXPORT.json` → dict, or None if absent/unreadable (garbled = absent)."""
+    import json
+    p = _export_pointer_path(config)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def manifest_checksum(manifest: dict) -> str:
+    """The same checksum `write_latest_export_pointer` records — so import can compare."""
+    import hashlib
+    import json
+    digest = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 # ── completion / resume state (§7a) ─────────────────────────────────────────

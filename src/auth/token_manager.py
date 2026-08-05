@@ -1,19 +1,32 @@
 """
-token_manager — authentication + REST client for THIS workspace only.
+token_manager — authentication + REST clients, per connectivity mode (master §1a, Plan 3 §2).
 
-AIR-GAPPED model: a workspace NEVER authenticates to the other workspace. Each side (source
-export / target import) runs as its own **workspace-admin run-as SP** and calls only its own
-workspace REST APIs using that SP's **notebook-context token**.
+The workspace a notebook RUNS IN is always reached with the run-as workspace-admin SP's
+**notebook-context token** (SDK ambient auth, context-token fallback). What changes by mode is
+only *how the SOURCE workspace is reached*:
 
-  • No OAuth M2M.  • No PATs.  • No cross-workspace client.  • No secrets.
+  • `airgap` — it isn't. Each side calls only its own workspace; the file bundle is the only thing
+    that crosses. `build_clients()` returns the same local client twice.
+  • `direct` — every stage runs in the TARGET, and inventory/export reach the SOURCE over REST with
+    an **OAuth M2M (client-credentials)** token for a source workspace-admin SP
+    (`oauth_m2m_token_provider`). `build_clients()` returns (source_client, target_client).
 
-Auth strategy (adapted from the customer inventory notebook driver):
+  • **No PATs, ever** (disabled in the customer's workspace).
+  • The M2M secret is read at runtime from a target secret scope (preferred) or a widget, and is
+    never logged, never persisted (`Config.redacted()` strips it).
+
+Also here: `mint_aad_token()` — an **Azure AD** token for the AzureDatabricks first-party app,
+which is the ONE call that cannot use a Databricks token: creating a secret scope BACKED BY an
+Azure Key Vault requires Databricks to prove to Azure who is asking (§6c).
+
+Auth strategy for the local client (adapted from the customer inventory notebook driver):
   1. SDK `WorkspaceClient()` ambient auth (works on serverless / shared / single-user) →
      read the bearer token + host from its config;
   2. fallback to the notebook-context token (classic single-user clusters).
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Optional
 
@@ -24,6 +37,21 @@ from src.utils.logger import get_logger
 from src.utils.retry import RetryableHTTPError, is_retryable_status, with_retry
 
 _LOG = get_logger("auth")
+
+
+class HTTPStatusError(Exception):
+    """A non-retryable 4xx/5xx whose message CARRIES THE SERVER'S EXPLANATION.
+
+    `requests.raise_for_status()` produces "400 Client Error: Bad Request for url: …", which tells
+    an operator nothing about what to fix. Databricks always explains itself in the response body
+    (`error_code` + `message`), so that text is folded into the message here — it is what makes an
+    import failure actionable, and what `classify_error` matches on to recognise
+    RESOURCE_ALREADY_EXISTS, PERMISSION_DENIED and friends.
+    """
+
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"HTTP {status}")
+        self.status = status
 
 
 class DownloadHTTPError(Exception):
@@ -101,6 +129,129 @@ class StaticTokenProvider:
         return self._token
 
 
+# Azure AD first-party application id for **AzureDatabricks**. Creating a Databricks secret scope
+# that is BACKED BY an Azure Key Vault is the only call in this tool that a Databricks token cannot
+# make: Databricks must prove to Azure that the CALLER may read that vault, and a Databricks
+# OAuth/context token carries no Azure AD identity — the call fails with the famously unhelpful
+# `"must have userAADToken defined!"`. An AAD access token for this app id works (verified live on
+# fvm1). See Plan 3 §6c / memory `fvm1-test-fixtures-and-akv-state`.
+AZURE_DATABRICKS_APP_ID = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
+
+# Refresh a client-credentials token this many seconds BEFORE it expires, so a long phase can't
+# have a call fail on a token that aged out mid-flight.
+_TOKEN_REFRESH_SKEW = 60
+
+
+class OAuthM2MTokenProvider:
+    """Client-credentials token provider — caches the token and refreshes before expiry.
+
+    Used for the SOURCE workspace in `direct` mode: `POST {host}/oidc/v1/token` with
+    `grant_type=client_credentials` and `scope=all-apis`. Thread-safe, because the content pass
+    fetches notebooks from the source concurrently and they share one provider.
+
+    Wrapped in the same `with_retry` as every other call, so a 429/5xx on the token endpoint is
+    handled rather than failing the run.
+    """
+
+    def __init__(self, host: str, client_id: str, client_secret: str,
+                 scope: str = "all-apis", verify_ssl: bool = True, timeout: int = 60) -> None:
+        self._host = host.rstrip("/")
+        self._client_id = client_id
+        self._secret = client_secret
+        self._scope = scope
+        self._verify = verify_ssl
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._token = ""
+        self._expires_at = 0.0
+
+    @property
+    def token_url(self) -> str:
+        return f"{self._host}/oidc/v1/token"
+
+    def _mint(self) -> tuple[str, float]:
+        def _do():
+            r = requests.post(
+                self.token_url,
+                auth=(self._client_id, self._secret),
+                data={"grant_type": "client_credentials", "scope": self._scope},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                verify=self._verify, timeout=self._timeout)
+            if is_retryable_status(r.status_code):
+                retry_after = r.headers.get("Retry-After")
+                raise RetryableHTTPError(
+                    r.status_code, f"POST {self.token_url} -> {r.status_code}",
+                    retry_after=float(retry_after) if retry_after else None)
+            if r.status_code >= 400:
+                # Deliberately does NOT echo the response body: an OAuth error body can quote the
+                # request, and the secret must never reach a log.
+                raise RuntimeError(
+                    f"OAuth M2M token request failed: HTTP {r.status_code} from "
+                    f"{self.token_url}. Check `source_sp_client_id`, the secret, and that the SP "
+                    f"is a workspace admin on the source workspace.")
+            doc = r.json()
+            tok = doc.get("access_token") or ""
+            if not tok:
+                raise RuntimeError(f"OAuth M2M response from {self.token_url} carried no "
+                                   f"access_token (keys: {sorted(doc)})")
+            return tok, float(doc.get("expires_in") or 3600)
+
+        token, expires_in = with_retry(_do)
+        return token, time.time() + max(expires_in - _TOKEN_REFRESH_SKEW, 30)
+
+    def __call__(self) -> str:
+        with self._lock:
+            if not self._token or time.time() >= self._expires_at:
+                self._token, self._expires_at = self._mint()
+                _LOG.info("minted OAuth M2M token for source workspace",
+                          host=self._host, client_id=self._client_id,
+                          valid_for_s=int(self._expires_at - time.time()))
+            return self._token
+
+
+def oauth_m2m_token_provider(host: str, client_id: str, client_secret: str,
+                            scope: str = "all-apis") -> OAuthM2MTokenProvider:
+    """Build a cached, self-refreshing client-credentials token provider for `host`."""
+    return OAuthM2MTokenProvider(host, client_id, client_secret, scope=scope)
+
+
+def mint_aad_token(client_id: str, client_secret: str, tenant_id: str,
+                   resource_app_id: str = AZURE_DATABRICKS_APP_ID) -> str:
+    """Mint an **Azure AD** access token for the AzureDatabricks app, headlessly (§6c, D4).
+
+    This is required ONLY for `POST secrets/scopes/create` with
+    `scope_backend_type=AZURE_KEYVAULT` — the linking call. Everything else uses the Databricks
+    token. If the run-as identity is an Azure managed identity / Entra SP it can mint this itself
+    via client-credentials — no `az login`, no laptop.
+
+    Note this is separate from vault PERMISSIONS: the AAD token is *who is asking*; the vault's
+    access policy / RBAC grant is *whether they're allowed*. Both are needed, and the importer
+    distinguishes the two failures in its remediation note.
+    """
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+    def _do():
+        r = requests.post(url, data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": f"{resource_app_id}/.default",
+        }, timeout=60)
+        if is_retryable_status(r.status_code):
+            raise RetryableHTTPError(r.status_code, f"POST {url} -> {r.status_code}")
+        if r.status_code >= 400:
+            # Azure AD error bodies are safe to surface (they don't echo the secret) and the
+            # error code is what tells the customer what to fix.
+            raise RuntimeError(f"Azure AD token request failed: HTTP {r.status_code}: "
+                               f"{r.text[:300]}")
+        tok = (r.json() or {}).get("access_token") or ""
+        if not tok:
+            raise RuntimeError("Azure AD response carried no access_token")
+        return tok
+
+    return with_retry(_do)
+
+
 # ---------------------------------------------------------------------------
 # REST client (bound to THIS workspace)
 # ---------------------------------------------------------------------------
@@ -141,7 +292,24 @@ class ApiClient:
                     f"{method} {url} -> {r.status_code}",
                     retry_after=float(retry_after) if retry_after else None,
                 )
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # `raise_for_status()` alone gives "400 Client Error: Bad Request for url: …", which
+                # says nothing about WHAT was wrong. Databricks always explains itself in the body
+                # (`error_code` + `message`), and that text is what makes an import failure
+                # actionable — both for the operator reading the report and for classify_error(),
+                # which matches on markers like RESOURCE_ALREADY_EXISTS. Without it every API
+                # rejection looked identical.
+                detail = ""
+                try:
+                    doc = r.json()
+                    if isinstance(doc, dict):
+                        detail = " ".join(str(doc.get(k)) for k in ("error_code", "message", "error")
+                                          if doc.get(k))
+                    detail = detail or r.text[:600]
+                except ValueError:
+                    detail = r.text[:600]
+                raise HTTPStatusError(r.status_code,
+                                      f"{method} {url} -> {r.status_code}: {detail[:600]}")
             if r.text:
                 try:
                     return r.json()
@@ -274,3 +442,59 @@ def build_client(config, dbutils=None, spark=None) -> ApiClient:
     if not config.ctx.token or not config.ctx.workspace_url:
         config.ctx = resolve_context(dbutils, spark, account_id=config.ctx.account_id)
     return ApiClient(config.ctx.workspace_url, StaticTokenProvider(config.ctx.token))
+
+
+def build_clients(config, dbutils=None, spark=None) -> tuple[ApiClient, ApiClient]:
+    """Return `(source_client, target_client)` for this run's connectivity mode (Plan 3 §2).
+
+    This is the ONE place the mode is handled. Collectors and importers already take a `client`
+    argument, so they never learn which mode they're in — the runner decides which client to hand
+    over. That containment is the whole point of putting the mode in one place.
+
+      • `airgap`: both are the LOCAL context-token client. On the source side "this workspace" IS
+        the source; on the target side the source client is never used (import reads the bundle).
+      • `direct`: `source_client` is bound to `source_workspace_url` with an OAuth M2M token for
+        the source SP; `target_client` is the local context-token client.
+    """
+    local = build_client(config, dbutils=dbutils, spark=spark)
+    if not config.is_direct:
+        return local, local
+
+    secret = config.resolve_source_secret(dbutils)   # never logged, never stored
+    provider = oauth_m2m_token_provider(config.source.workspace_url, config.source.client_id,
+                                        secret)
+    source_client = ApiClient(config.source.workspace_url, provider)
+    _LOG.info("direct mode: source client bound",
+              source_host=config.source.workspace_url,
+              client_id=config.source.client_id,
+              secret_from=("secret_scope" if config.source.uses_secret_scope else "widget"))
+    return source_client, local
+
+
+class MutationGuard:
+    """Wraps an ApiClient and RAISES on any mutating verb — the dry-run purity assertion.
+
+    `dry_run=true` is meant to be a full rehearsal: real reads, real bundle, real decisions, zero
+    target writes. "The importers check a flag" is a claim; wrapping the client so a POST/PUT/
+    PATCH/DELETE cannot physically happen is proof. Used by the dry-run tests and available to the
+    notebook as a belt-and-braces option.
+
+    GETs pass through untouched, so existence checks and the state decisions still run for real —
+    which is what makes a dry run's report meaningful rather than a guess.
+    """
+
+    _MUTATING = ("post", "put", "patch", "delete")
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.attempted: list[str] = []
+
+    def __getattr__(self, name: str):
+        if name in self._MUTATING:
+            def _blocked(path, *a, **kw):
+                self.attempted.append(f"{name.upper()} {path}")
+                raise AssertionError(
+                    f"dry-run violation: {name.upper()} {path} — a dry run must make no "
+                    f"mutating call")
+            return _blocked
+        return getattr(self._inner, name)

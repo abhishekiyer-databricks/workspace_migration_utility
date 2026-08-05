@@ -28,6 +28,7 @@ per-file (no cross-thread contention).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -59,6 +60,13 @@ class FetchResult:
     size_bytes: int = 0
     note: str = ""
     oversize: dict = field(default_factory=dict)   # {path,size,type,reason,recommended} for §5a
+    # sha256 of the fetched BYTES. The metadata payload of a notebook/file is only
+    # {path, object_type, language}, so without this the fingerprint cannot move when a
+    # notebook's CODE changes — editing a notebook on source would re-export to the same
+    # fingerprint and the target-side upsert would SKIP it, leaving the OLD code on target
+    # (Plan 3 §7c-audit GAP 1). The runner folds this into the unit's fingerprint after the
+    # content pass. Free to compute: the bytes are already in memory.
+    content_sha256: str = ""
 
 
 def _is_notebook_oversize(exc: Exception) -> bool:
@@ -140,7 +148,8 @@ class ContentFetcher:
             _LOG.warning("content write failed", path=path, error=str(exc))
             return FetchResult(status="failure", content_kind=kind, note=f"content write: {exc}")
         return FetchResult(status="success", content_ref=rel, content_route="direct_download",
-                          content_kind=kind, size_bytes=len(data))
+                          content_kind=kind, size_bytes=len(data),
+                          content_sha256=hashlib.sha256(data).hexdigest())
 
     def _oversize(self, path: str, kind: str, size: int) -> FetchResult:
         if kind == "notebook":

@@ -1,18 +1,30 @@
 """
 ConfigManager — centralises all runtime configuration for the workspace migration utility.
 
-AIR-GAPPED model: the tool runs on TWO sides that never talk to each other. A `role` widget
-declares which side this run is:
-  • role="source"  → inventory/export; reads THIS (source) workspace; WRITES the bundle to
-    `source_staging_location`.
-  • role="target"  → preflight/transform/import/validate; READS the bundle from
-    `target_staging_location` (uploaded there by ops); writes THIS (target) workspace.
+TWO connectivity modes, both supported (master §1a; the `connectivity_mode` widget picks one):
 
-Auth on BOTH sides = the run-as SP's notebook-context token for THIS workspace only
-(no OAuth M2M, no PATs, no cross-workspace creds — see auth/token_manager.py).
+  • MODE A `airgap` (default) — the two-sided model. The tool runs on two sides that never talk
+    to each other, and a `role` widget declares which side this run is:
+      - role="source"  → inventory/export; reads THIS (source) workspace; WRITES the bundle to
+        `source_staging_location`. Ops then physically moves the bundle.
+      - role="target"  → preflight/transform/import/validate; READS the bundle from
+        `target_staging_location`; writes THIS (target) workspace.
+  • MODE B `direct` — EVERY stage runs in the TARGET workspace (so `role="target"` throughout).
+    Inventory/export reach the SOURCE over REST using a source workspace-admin SP's client id +
+    secret (OAuth M2M), and the bundle is written straight to `target_staging_location`, so there
+    is no manual hop and the whole migration can run as one Job.
 
-Mirrors the `Config` dataclass pattern of uc-inventory-migration, EXTENDED to hold role +
-staging locations + per-asset TOGGLES (all default True) + transform options.
+Both modes emit the IDENTICAL bundle, so transform/import/validate are mode-agnostic — the mode
+only decides *who reads the source* and *whether the file hop is manual*.
+
+Auth: the workspace a notebook RUNS IN is always reached with the run-as SP's notebook-context
+token. In `direct` mode the SOURCE is additionally reached via OAuth M2M (auth/token_manager.py).
+No PATs in either mode. The M2M secret is NEVER persisted — `redacted()` strips it, and a test
+asserts the literal appears in no written artifact.
+
+Mirrors the `Config` dataclass pattern of uc-inventory-migration, EXTENDED to hold role + mode +
+staging locations + per-asset TOGGLES (all default True) + transform options + the target-side
+import controls (state table, selector, retry mode).
 Config is WIDGET-based: `from_dbutils()` reads notebook widgets / job params. No config files.
 """
 from __future__ import annotations
@@ -24,6 +36,26 @@ ROLE_SOURCE = "source"
 ROLE_TARGET = "target"
 _VALID_ROLES = (ROLE_SOURCE, ROLE_TARGET)
 
+MODE_AIRGAP = "airgap"
+MODE_DIRECT = "direct"
+_VALID_MODES = (MODE_AIRGAP, MODE_DIRECT)
+
+# The asset families `import_assets` can select, in phase order (Plan 3 §5, §6). `acls` is
+# deliberately selectable ON ITS OWN — replaying permissions is the pass most likely to need a
+# second attempt after identities are fixed up or a DAB redeploy lands.
+IMPORT_FAMILIES = ("identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
+                   "dashboards", "genie", "serving", "misc", "acls")
+
+# Retry modes (D22). ONE dropdown, not three booleans — booleans permit the meaningless
+# `failed_only + skipped_only` combination ("both, or neither?"), a dropdown cannot be invalid.
+RETRY_MODES = ("off", "failed_only", "skipped_only", "failed_and_skipped")
+
+# Table names are owned by the TOOL, not the operator (D19): nothing to typo, and every one of
+# the 100+ workspace pairs lands in the same place (every row keyed by source_workspace_id).
+STATE_TABLE = "wsmig_migration_state"
+IDENTITY_MAP_TABLE = "wsmig_identity_map"
+STATE_TABLE_DRYRUN = "wsmig_migration_state_dryrun"
+
 
 @dataclass
 class WorkspaceContext:
@@ -31,6 +63,30 @@ class WorkspaceContext:
     workspace_url: str = ""          # derived from context
     token: str = ""                  # notebook-context token of the run-as SP
     account_id: str = ""             # optional (target side); enables account-level preflight
+
+
+@dataclass
+class SourceConnection:
+    """`direct`-mode only: how to reach the SOURCE workspace over REST (master §1a, Plan 3 §2a).
+
+    `client_id` is an applicationId — not a secret. The SECRET arrives one of two supported ways
+    and is never persisted:
+      • preferred: `secret_scope` + `secret_key` pointers, read at runtime via
+        `dbutils.secrets.get(scope, key)` in the TARGET workspace (Databricks auto-redacts those
+        values from notebook output);
+      • fallback: `spn_secret_value` typed into a widget — convenient for a first smoke test, but
+        a widget value is visible on the Job/run page and retained in run history.
+    """
+    workspace_url: str = ""
+    client_id: str = ""
+    secret_scope: str = ""
+    secret_key: str = ""
+    spn_secret_value: str = ""       # NEVER persisted — stripped by Config.redacted()
+
+    @property
+    def uses_secret_scope(self) -> bool:
+        """Whether the (preferred) scope+key path is fully configured."""
+        return bool(self.secret_scope and self.secret_key)
 
 
 @dataclass
@@ -51,7 +107,7 @@ class AssetToggles:
 
 @dataclass
 class TransformConfig:
-    """Mapping + exclude + schedule options applied in 03_Transform_Review."""
+    """Mapping + exclude + schedule options applied in 03_Transform_Review / 04_Import."""
     pause_job_schedules: bool = True
     user_domain_mapping: dict = field(default_factory=dict)   # old.com -> new.com
     user_id_mapping: dict = field(default_factory=dict)       # old@a.com -> new@b.com
@@ -60,40 +116,122 @@ class TransformConfig:
 
 
 @dataclass
+class ImportOptions:
+    """Target-side import controls (Plan 3 §3, §5, §7b, §7d)."""
+    # Which families to import THIS session. Empty/["all"] = every family in the bundle. This is
+    # SEPARATE from the migrate_* toggles and narrower: toggles are bundle scope (set identically
+    # on both sides), the selector is this session's work list over what the bundle contains.
+    import_assets: list = field(default_factory=lambda: ["all"])
+    retry_mode: str = "off"
+    state_catalog: str = ""          # required when dry_run=false; assumed to already exist
+    state_schema: str = ""           # required when dry_run=false; assumed to already exist
+    preflight_enforce: bool = True
+    skip_manifest_verify: bool = False
+    force_full_import: bool = False
+    allow_deletes: bool = False              # D5 — deletes are never automatic
+    library_force_start_clusters: bool = False   # D6 — never burn DBUs by default
+    # Warehouse used by the state store when it runs OUTSIDE a notebook (no `spark`), e.g. the
+    # live test harness driving the Statement Execution API. Blank in a notebook, where spark.sql
+    # is used instead.
+    state_warehouse_id: str = ""
+
+    def selects(self, family: str) -> bool:
+        """Whether `family` is in this session's work list."""
+        sel = [s.strip().lower() for s in (self.import_assets or []) if str(s).strip()]
+        if not sel or "all" in sel:
+            return True
+        return family in sel
+
+    @property
+    def selected_families(self) -> tuple:
+        """The families this session will actually attempt, in phase order."""
+        return tuple(f for f in IMPORT_FAMILIES if self.selects(f))
+
+
+@dataclass
 class Config:
-    """Top-level runtime config for one workspace migration run (one side of the air-gap)."""
+    """Top-level runtime config for one workspace migration run."""
     role: str = ""                   # "source" | "target"; guards mis-runs
+    connectivity_mode: str = MODE_AIRGAP
     ctx: WorkspaceContext = field(default_factory=WorkspaceContext)
+    source: SourceConnection = field(default_factory=SourceConnection)
     toggles: AssetToggles = field(default_factory=AssetToggles)
     transform: TransformConfig = field(default_factory=TransformConfig)
+    imports: ImportOptions = field(default_factory=ImportOptions)
     run_id: str = ""
     source_workspace_id: str = ""    # identifies the bundle: .../wsmig/<source_ws_id>/<run_id>
     # Staging locations — each a UC Volume path ("/Volumes/…"; managed or ADLS-backed
     # external volume; never raw abfss://):
-    source_staging_location: str = ""   # role=source WRITES the bundle here
-    target_staging_location: str = ""   # role=target READS the bundle here
+    source_staging_location: str = ""   # airgap role=source WRITES the bundle here
+    target_staging_location: str = ""   # role=target READS the bundle here (direct: also writes)
     dry_run: bool = True
     # Source-side safety caps (0 = unlimited), carried from the inventory script.
     max_scim: int = 0
     max_workspace_items: int = 0
     max_ws_api_calls: int = 0
 
+    # ── mode helpers ──────────────────────────────────────────────────────
+    @property
+    def is_direct(self) -> bool:
+        return self.connectivity_mode == MODE_DIRECT
+
     @property
     def staging_location(self) -> str:
-        """The staging root for THIS side (source writes / target reads)."""
-        loc = self.source_staging_location if self.role == ROLE_SOURCE else self.target_staging_location
+        """The staging root for THIS run.
+
+        In `direct` mode EVERYTHING lives in `target_staging_location` — both halves of the run
+        are in the target workspace, so `source_staging_location` is unused (validate() enforces
+        the right widget per mode). In `airgap` mode the role picks the side's own location.
+        """
+        if self.is_direct:
+            loc = self.target_staging_location
+        else:
+            loc = (self.source_staging_location if self.role == ROLE_SOURCE
+                   else self.target_staging_location)
         return loc.rstrip("/")
 
     @property
     def output_path(self) -> str:
         """Run-isolated bundle dir: <staging_location>/wsmig/<source_ws_id>/<run_id>."""
         if not self.staging_location:
-            raise ValueError("staging_location is empty for role=%r" % self.role)
+            raise ValueError("staging_location is empty for role=%r mode=%r"
+                             % (self.role, self.connectivity_mode))
         if not self.source_workspace_id:
             raise ValueError("source_workspace_id is required to build the bundle path")
         if not self.run_id:
             raise ValueError("run_id is required to build the bundle path")
         return f"{self.staging_location}/wsmig/{self.source_workspace_id}/{self.run_id}"
+
+    # ── state table FQNs (target side) ────────────────────────────────────
+    def _state_fqn(self, table: str) -> str:
+        if not (self.imports.state_catalog and self.imports.state_schema):
+            return ""
+        return f"{self.imports.state_catalog}.{self.imports.state_schema}.{table}"
+
+    @property
+    def state_table_fqn(self) -> str:
+        """The main per-object state table — or the DRY-RUN twin when rehearsing.
+
+        A rehearsal writes to a SEPARATE table (`…_dryrun`) rather than a `dry_run` column, so it
+        can never pollute the real source→target id map, and dropping the rehearsal state is a
+        one-line DROP TABLE.
+        """
+        return self._state_fqn(STATE_TABLE_DRYRUN if self.dry_run else STATE_TABLE)
+
+    @property
+    def identity_map_table_fqn(self) -> str:
+        return self._state_fqn(IDENTITY_MAP_TABLE)
+
+    @property
+    def state_enabled(self) -> bool:
+        """Whether the Delta state store is in play.
+
+        Skipped entirely when `dry_run=true` AND no catalog/schema was given, so a first-look
+        rehearsal needs no UC setup at all. With `dry_run=false` the catalog/schema are REQUIRED
+        (validate() enforces it): without durable state every create risks becoming a duplicate on
+        the next run, which is worse than not starting.
+        """
+        return bool(self.imports.state_catalog and self.imports.state_schema)
 
     # ── widget helpers ────────────────────────────────────────────────────
     @staticmethod
@@ -122,6 +260,11 @@ class Config:
         if role not in _VALID_ROLES:
             raise ValueError(f"widget `role` must be one of {_VALID_ROLES}, got {role!r}")
 
+        mode = (w("connectivity_mode", MODE_AIRGAP) or MODE_AIRGAP).strip().lower()
+        if mode not in _VALID_MODES:
+            raise ValueError(f"widget `connectivity_mode` must be one of {_VALID_MODES}, "
+                             f"got {mode!r}")
+
         toggles = AssetToggles(
             identity=parse_bool(w("migrate_identity", "true"), True),
             compute=parse_bool(w("migrate_compute", "true"), True),
@@ -144,10 +287,35 @@ class Config:
             exclude_job_name_patterns=parse_csv(w("exclude_job_name_patterns")),
         )
 
+        imports = ImportOptions(
+            import_assets=parse_csv(w("import_assets", "all")) or ["all"],
+            retry_mode=(w("retry_mode", "off") or "off").strip().lower(),
+            state_catalog=w("state_catalog"),
+            state_schema=w("state_schema"),
+            preflight_enforce=parse_bool(w("preflight_enforce", "true"), True),
+            skip_manifest_verify=parse_bool(w("skip_manifest_verify", "false"), False),
+            force_full_import=parse_bool(w("force_full_import", "false"), False),
+            allow_deletes=parse_bool(w("allow_deletes", "false"), False),
+            library_force_start_clusters=parse_bool(
+                w("library_force_start_clusters", "false"), False),
+            state_warehouse_id=w("state_warehouse_id"),
+        )
+
+        source = SourceConnection(
+            workspace_url=(w("source_workspace_url") or "").rstrip("/"),
+            client_id=w("source_sp_client_id"),
+            secret_scope=w("source_sp_secret_scope"),
+            secret_key=w("source_sp_secret_key"),
+            spn_secret_value=w("spn_secret_value"),
+        )
+
         cfg = cls(
             role=role,
+            connectivity_mode=mode,
+            source=source,
             toggles=toggles,
             transform=transform,
+            imports=imports,
             run_id=w("run_id") or now_compact(),
             source_workspace_id=w("source_workspace_id"),
             source_staging_location=w("source_staging_location"),
@@ -166,21 +334,67 @@ class Config:
         return cfg
 
     def validate(self) -> None:
-        """Fail fast on mis-configuration (e.g. wrong staging widget for the role)."""
-        if self.role == ROLE_SOURCE and not self.source_staging_location:
-            raise ValueError("role=source requires `source_staging_location`")
-        if self.role == ROLE_TARGET and not self.target_staging_location:
-            raise ValueError("role=target requires `target_staging_location`")
+        """Fail fast on mis-configuration (wrong staging widget for the mode/role, etc.)."""
         if not self.source_workspace_id:
             raise ValueError("`source_workspace_id` is required")
 
+        if self.is_direct:
+            # Everything runs in the target, so that is the only staging location used.
+            if not self.target_staging_location:
+                raise ValueError(
+                    "connectivity_mode=direct requires `target_staging_location` (the bundle is "
+                    "written AND read there; `source_staging_location` is unused in this mode)")
+            if self.role != ROLE_TARGET:
+                raise ValueError(
+                    "connectivity_mode=direct runs every stage in the TARGET workspace, so "
+                    f"role must be 'target' (got {self.role!r})")
+            if not self.source.workspace_url:
+                raise ValueError("connectivity_mode=direct requires `source_workspace_url`")
+            if not self.source.client_id:
+                raise ValueError(
+                    "connectivity_mode=direct requires `source_sp_client_id` (the source "
+                    "workspace-admin SP's applicationId — not a secret)")
+            if not (self.source.uses_secret_scope or self.source.spn_secret_value):
+                raise ValueError(
+                    "connectivity_mode=direct needs the source SP secret via EITHER "
+                    "`source_sp_secret_scope`+`source_sp_secret_key` (preferred — a widget value "
+                    "is visible on the run page and kept in run history) OR `spn_secret_value`")
+        else:
+            if self.role == ROLE_SOURCE and not self.source_staging_location:
+                raise ValueError("role=source requires `source_staging_location`")
+            if self.role == ROLE_TARGET and not self.target_staging_location:
+                raise ValueError("role=target requires `target_staging_location`")
+
+        if self.imports.retry_mode not in RETRY_MODES:
+            raise ValueError(f"`retry_mode` must be one of {RETRY_MODES}, "
+                             f"got {self.imports.retry_mode!r}")
+
+        unknown = [f for f in self.imports.import_assets
+                   if f.strip().lower() not in IMPORT_FAMILIES + ("all",)]
+        if unknown:
+            raise ValueError(f"`import_assets` has unknown families {unknown}; "
+                             f"valid: {('all',) + IMPORT_FAMILIES}")
+
+        # A live import with no durable state is a correctness hazard, not an inconvenience: a
+        # crash leaves no source→target id map, so the next run cannot take the UPDATE path and
+        # may create duplicates. So the catalog/schema are mandatory once dry_run=false.
+        if self.role == ROLE_TARGET and not self.dry_run and not self.state_enabled:
+            raise ValueError(
+                "dry_run=false requires `state_catalog` + `state_schema` (the shared, "
+                "already-existing catalog+schema for the migration state table). Without durable "
+                "state a re-run cannot tell CREATE from UPDATE and may duplicate objects.")
+
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
-        """Build config from a plain dict (for tests / SDK callers)."""
+        """Build config from a plain dict (for tests / SDK callers). Does NOT validate, so a test
+        can construct a deliberately partial config."""
         cfg = cls(
             role=d.get("role", ""),
+            connectivity_mode=d.get("connectivity_mode", MODE_AIRGAP),
             toggles=AssetToggles(**d.get("toggles", {})),
             transform=TransformConfig(**d.get("transform", {})),
+            imports=ImportOptions(**d.get("imports", {})),
+            source=SourceConnection(**d.get("source", {})),
             run_id=d.get("run_id", ""),
             source_workspace_id=d.get("source_workspace_id", ""),
             source_staging_location=d.get("source_staging_location", ""),
@@ -194,8 +408,40 @@ class Config:
         return cfg
 
     def redacted(self) -> dict:
-        """Return config as a dict with the context token removed (for config_resolved.json)."""
+        """Config as a dict with EVERY credential removed (for config_resolved.json).
+
+        Two secrets exist and both must go: the workspace context token, and — on the widget
+        path — the source SP's OAuth secret. The scope/key NAMES are kept (they're pointers, not
+        secrets, and they document which credential a run used). A test asserts the literal
+        `spn_secret_value` appears in no written artifact or log line.
+        """
         d = asdict(self)
-        if "ctx" in d and isinstance(d["ctx"], dict):
+        if isinstance(d.get("ctx"), dict):
             d["ctx"] = {k: v for k, v in d["ctx"].items() if k != "token"}
+        if isinstance(d.get("source"), dict):
+            src = {k: v for k, v in d["source"].items() if k != "spn_secret_value"}
+            # Say WHICH path supplied the secret, so an auditor can tell without seeing it.
+            src["secret_source"] = ("secret_scope" if self.source.uses_secret_scope
+                                    else ("widget" if self.source.spn_secret_value else "none"))
+            d["source"] = src
         return d
+
+    def resolve_source_secret(self, dbutils=None) -> str:
+        """The source SP's OAuth secret for `direct` mode (Plan 3 §2a). Never logged, never stored.
+
+        Precedence is explicit so there is never doubt about which credential a run used:
+          scope+key (if BOTH set) → `spn_secret_value` → fail fast naming both options.
+        The scope path wins when present, so a customer who has set up a scope can leave
+        `spn_secret_value` blank (or stale) with no surprise.
+        """
+        if self.source.uses_secret_scope:
+            if dbutils is None:
+                raise RuntimeError(
+                    "`source_sp_secret_scope`/`source_sp_secret_key` are set but no dbutils was "
+                    "passed, so the secret cannot be read. Pass dbutils, or use spn_secret_value.")
+            return dbutils.secrets.get(scope=self.source.secret_scope, key=self.source.secret_key)
+        if self.source.spn_secret_value:
+            return self.source.spn_secret_value
+        raise RuntimeError(
+            "No source SP secret available. Set EITHER `source_sp_secret_scope` + "
+            "`source_sp_secret_key` (preferred) OR `spn_secret_value`.")

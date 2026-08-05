@@ -166,6 +166,11 @@ def is_dab_content_path(asset_type: str, natural_key: str) -> bool:
     return _DAB_ROOT_SEGMENT in key or key.endswith(_DAB_ROOT_SEGMENT.rstrip("/"))
 
 
+# Git repos: inventoried + exported as metadata, never imported (customer 2026-08-05, §6a).
+REPO_MANUAL_NOTE = ("git repos are OUT OF SCOPE for import — recreate manually on target "
+                    "(Repos ▸ Add Repo with this url/provider/branch at this path), then "
+                    "re-apply its permissions from the ACL report")
+
 DAB_CONTENT_NOTE = ("inside a DAB bundle root — exported for reference but NOT imported; "
                     "`databricks bundle deploy` against the target recreates it "
                     "(importing bundle state would point the bundle at source-workspace ids)")
@@ -276,18 +281,23 @@ TOGGLE_FOR: dict[str, str] = {
 
 def _make_unit(asset_type: str, natural_key: str, source_id: str, payload_source: Optional[dict],
                *, mode: str, migratable: bool = True, note: str = "",
-               content_ref: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+               content_ref: Optional[str] = None, extra: Optional[dict] = None,
+               fingerprint_extra: Optional[dict] = None) -> dict:
     """Assemble one export record + its stripped/fingerprinted payload.
 
     `payload_source` None → no create payload (manual/dab units): payload={} and the fingerprint
     is computed over the empty dict (stable, meaningless — such units aren't upserted by content).
+
+    `fingerprint_extra` adds fields to the FINGERPRINT INPUT ONLY, never to `payload` — for
+    source-side metadata that matters for change detection but is not a create field (§7c-audit).
     """
     stripped = strip_runtime(asset_type, payload_source) if isinstance(payload_source, dict) else {}
+    fp_input = {**stripped, **fingerprint_extra} if fingerprint_extra else stripped
     unit = {
         "asset_type": asset_type,
         "natural_key": natural_key,
         "source_id": safe_str(source_id),
-        "fingerprint": fingerprint(stripped),
+        "fingerprint": fingerprint(fp_input),
         "migratable": bool(migratable),
         "migration_mode": mode,
         "export_status": _MODE_STATUS.get(mode, "success"),
@@ -365,11 +375,20 @@ def _identity_units(records: list[dict]) -> list[dict]:
             out.append(_make_unit("user", safe_str(r.get("userName")), r.get("id"), raw,
                                   mode="auto", extra={"classification": cls}))
         elif itype == "service_principal":
+            has_secrets = bool(r.get("has_secrets"))
             note = ("OAuth client secret(s) present — NOT exportable; recreate on target manually."
-                    if r.get("has_secrets") else "")
+                    if has_secrets else "")
+            # `has_secrets` is collected but is NOT a SCIM create field, so it never reached the
+            # payload — meaning creating an OAuth secret on an existing source SPN left the
+            # stripped SCIM object byte-identical, the fingerprint unmoved, and the manual action
+            # silently skipped on every later run (§7c-audit GAP 2). Hashing it as a
+            # fingerprint-only input makes false→true move the hash, so the state store reports
+            # `updated` and re-emits the manual action on the run where it became true. It cannot
+            # migrate the secret — client secrets are never readable — only resurface the ask.
             out.append(_make_unit("service_principal", safe_str(r.get("applicationId")),
                                   r.get("id"), raw, mode="auto", note=note,
-                                  extra={"classification": cls}))
+                                  extra={"classification": cls},
+                                  fingerprint_extra={"_has_secrets": has_secrets}))
         elif itype == "group":
             name = safe_str(r.get("displayName"))
             if cls == "builtin_group":
@@ -459,10 +478,15 @@ def _workspace_units(records: list[dict], native_paths: Optional[dict] = None) -
             raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
             src = raw or {"path": path, "url": safe_str(r.get("url")),
                           "provider": safe_str(r.get("provider")), "branch": safe_str(r.get("branch"))}
-            note = "git credentials are a target-side manual prerequisite" if src.get("url") else \
-                   "no repo URL — cannot auto-recreate; manual"
-            mode = "auto" if src.get("url") else "manual"
-            out.append(_make_unit("repo", path, r.get("repo_id"), src, mode=mode, note=note))
+            # Repos are OUT OF SCOPE for import (customer 2026-08-05, D9/§6a): never created on
+            # target, always `manual`. The PAYLOAD is deliberately kept — it is metadata only
+            # (url/provider/branch/path; the collector never descends into a git folder, so zero
+            # file bytes and zero content-fetch calls), and that metadata IS the manual recreate
+            # runbook. Dropping it would make the manual step worse for no saving.
+            note = (REPO_MANUAL_NOTE if src.get("url") else
+                    "no repo URL — cannot auto-recreate; manual")
+            out.append(_make_unit("repo", path, r.get("repo_id"), src, mode="manual",
+                                  migratable=False, note=note))
         else:
             # Object types that are NOT plain workspace content: DASHBOARD/ALERT are the on-disk
             # twins of assets exported via their NATIVE API; MLFLOW_EXPERIMENT is out of scope.

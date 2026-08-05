@@ -1,22 +1,193 @@
 """
-SqlImporter — writes sql to the TARGET workspace.
+SqlImporter — phase 6: warehouses → legacy queries → legacy alerts → alerts v2 (Plan 3 §6, §6d).
 
-STUB ONLY (see PLAN.md §6 asset catalog, §2). Create SQL warehouses (+ optionally legacy queries/alerts/dashboards); warehouse-id + owner remap.
-Implements BaseImporter: load -> skip-if-exists -> create_one, with dry-run + checkpoint.
+Warehouses go FIRST because everything downstream — queries, alerts, DLT, Lakeview dashboards and
+Genie spaces — carries a `warehouse_id` that must be remapped to the target's.
+
+**Legacy SQL dashboards are NEVER attempted** (D10/§6d). `POST /api/2.0/preview/sql/dashboards` — the
+old Redash-style create — no longer works on modern workspaces (verified live while building the fvm1
+fixtures, which is why no live fixture for one exists). Read/list still work, so they inventory and
+export fine; only creation is gone. Attempting it would produce a permanent red failure on every run
+forever, which trains the operator to ignore red — so each is recorded `manual` with enough detail to
+rebuild it as an AI/BI dashboard. Their underlying `legacy_query` objects still migrate, so only the
+visual layout is hand-rebuilt. Export already marks them `manual`, so the base class handles it and
+this importer has no dashboard code path at all.
 """
 from __future__ import annotations
 
-from src.importers.base_importer import BaseImporter, ImportResult
+from src.importers.base_importer import BaseImporter
+from src.utils.helpers import safe_str
 
 
 class SqlImporter(BaseImporter):
-    component = "sql_importer"
+    component = "sql"
+    asset_types = ("sql_warehouse", "legacy_query", "legacy_alert", "alert_v2",
+                   "legacy_dashboard")
 
     def load(self) -> list[dict]:
-        raise NotImplementedError  # TODO: read staged export JSON for this asset
+        """Warehouses → queries → alerts. Legacy dashboards ride along as `manual` units."""
+        return self.units_for("sql_warehouse", "legacy_query", "legacy_alert", "alert_v2",
+                              "legacy_dashboard")
 
-    def existing_keys(self) -> set:
-        raise NotImplementedError  # TODO: list existing on target for skip-if-exists
+    def existing_keys(self) -> dict:
+        """`{name: id}` per SQL asset type, published for the phases that remap onto them."""
+        out: dict = {}
 
-    def create_one(self, item: dict) -> dict:
-        raise NotImplementedError  # TODO: strip runtime + remap refs + POST (see PLAN.md §6)
+        warehouses = (self.client.get("api/2.0/sql/warehouses") or {}).get("warehouses") or []
+        found = {safe_str(w.get("name")): safe_str(w.get("id"))
+                 for w in warehouses if w.get("name")}
+        self.context.setdefault("sql_warehouse_target_ids", {}).update(found)
+        out.update(found)
+
+        # Queries and alerts are cursor APIs, and a truncated list here means a DUPLICATE query on
+        # every re-run — so both go through the paginating helper rather than a bare get.
+        queries = self.client.get_paginated("api/2.0/sql/queries", "results",
+                                            params={"page_size": 100})
+        q_found = {safe_str(q.get("display_name") or q.get("name")): safe_str(q.get("id"))
+                   for q in queries if (q.get("display_name") or q.get("name"))}
+        self.context.setdefault("legacy_query_target_ids", {}).update(q_found)
+        out.update(q_found)
+
+        alerts = self.client.get_paginated("api/2.0/alerts", "results", params={"page_size": 100})
+        a_found = {safe_str(a.get("display_name") or a.get("name")): safe_str(a.get("id"))
+                   for a in alerts if (a.get("display_name") or a.get("name"))}
+        self.context.setdefault("alert_v2_target_ids", {}).update(a_found)
+        out.update(a_found)
+
+        return out
+
+    # ── create ────────────────────────────────────────────────────────────
+    def create_one(self, unit: dict) -> dict:
+        asset_type = safe_str(unit.get("asset_type"))
+        if asset_type == "sql_warehouse":
+            return self._create_warehouse(unit)
+        if asset_type == "legacy_query":
+            return self._create_query(unit)
+        if asset_type == "legacy_alert":
+            return self._create_legacy_alert(unit)
+        if asset_type == "alert_v2":
+            return self._create_alert_v2(unit)
+        raise RuntimeError(f"sql importer got an unexpected asset_type {asset_type!r}")
+
+    def update_one(self, unit: dict, target_id: str) -> dict:
+        """The edit APIs — note each SQL asset uses a DIFFERENT shape."""
+        asset_type = safe_str(unit.get("asset_type"))
+        payload = dict(unit.get("payload") or {})
+        if asset_type == "sql_warehouse":
+            # Warehouses edit via `/{id}/edit`, not a PUT on the collection.
+            self.client.post(f"api/2.0/sql/warehouses/{target_id}/edit",
+                             self._warehouse_body(payload, unit))
+            return {"target_id": target_id}
+        if asset_type == "legacy_query":
+            self.client.post(f"api/2.0/sql/queries/{target_id}",
+                             {"query": self._query_body(payload)})
+            return {"target_id": target_id}
+        if asset_type == "legacy_alert":
+            self.client.put(f"api/2.0/sql/alerts/{target_id}", self._legacy_alert_body(payload))
+            return {"target_id": target_id}
+        if asset_type == "alert_v2":
+            self.client.patch(f"api/2.0/alerts/{target_id}", self._alert_v2_body(payload))
+            return {"target_id": target_id}
+        return {"target_id": target_id}
+
+    # ── warehouses ────────────────────────────────────────────────────────
+    def _create_warehouse(self, unit: dict) -> dict:
+        body = self._warehouse_body(unit.get("payload") or {}, unit)
+        created = self.client.post("api/2.0/sql/warehouses", body)
+        wh_id = safe_str(created.get("id"))
+        self.context.setdefault("sql_warehouse_target_ids", {})[self.natural_key(unit)] = wh_id
+        return {"target_id": wh_id,
+                "note": "same cloud/region, so warehouse_type and size are kept verbatim"}
+
+    def _warehouse_body(self, payload: dict, unit: dict) -> dict:
+        body = dict(payload)
+        body["name"] = safe_str(body.get("name")) or self.natural_key(unit)
+        # `creator_name` names a SOURCE identity: the target attributes the warehouse to the caller,
+        # and an unknown name is rejected outright.
+        body.pop("creator_name", None)
+        return body
+
+    # ── legacy queries ────────────────────────────────────────────────────
+    def _create_query(self, unit: dict) -> dict:
+        created = self.client.post("api/2.0/sql/queries",
+                                   {"query": self._query_body(unit.get("payload") or {})})
+        qid = safe_str(created.get("id"))
+        self.context.setdefault("legacy_query_target_ids", {})[self.natural_key(unit)] = qid
+        return {"target_id": qid}
+
+    def _query_body(self, payload: dict) -> dict:
+        body = dict(payload)
+        # A source workspace path that need not exist on target, and is not required by create.
+        body.pop("parent_path", None)
+        self._remap_warehouse(body)
+        return body
+
+    # ── alerts ────────────────────────────────────────────────────────────
+    def _create_legacy_alert(self, unit: dict) -> dict:
+        created = self.client.post("api/2.0/sql/alerts",
+                                   self._legacy_alert_body(unit.get("payload") or {}))
+        return {"target_id": safe_str(created.get("id"))}
+
+    def _legacy_alert_body(self, payload: dict) -> dict:
+        """Remap the alert's QUERY id — an alert holding a source query id is inert on target."""
+        body = dict(payload)
+        src_query = safe_str(body.get("query_id"))
+        if src_query:
+            target_id, key = self.remap_id("legacy_query", src_query)
+            if target_id:
+                body["query_id"] = target_id
+            else:
+                self.result.warnings.append(
+                    f"legacy alert references source query {src_query!r}"
+                    + (f" ({key!r})" if key else "")
+                    + " which has no target equivalent — import the sql family first, then re-run "
+                      "with retry_mode=failed_only")
+        self._remap_warehouse(body)
+        return body
+
+    def _create_alert_v2(self, unit: dict) -> dict:
+        # Verified against the SDK's `create_alert`: /api/2.0/alerts takes the AlertV2 body FLAT,
+        # NOT wrapped in {"alert": ...} the way legacy queries are.
+        created = self.client.post("api/2.0/alerts",
+                                   self._alert_v2_body(unit.get("payload") or {}))
+        aid = safe_str(created.get("id"))
+        self.context.setdefault("alert_v2_target_ids", {})[self.natural_key(unit)] = aid
+        return {"target_id": aid}
+
+    def _alert_v2_body(self, payload: dict) -> dict:
+        body = dict(payload)
+        body.pop("parent_path", None)
+        self._remap_warehouse(body)
+        return body
+
+    # ── shared ────────────────────────────────────────────────────────────
+    def _remap_warehouse(self, body: dict) -> None:
+        """Remap `warehouse_id` (and the legacy `data_source_id` spelling) onto a target warehouse.
+
+        A stale source warehouse id leaves the object existing but unable to run, so an unresolvable
+        one is never left in place silently. Falling back to an existing target warehouse keeps the
+        object RUNNABLE, which is more useful than a query that errors on open — and the substitution
+        is reported so the operator can re-point it deliberately.
+        """
+        for field in ("warehouse_id", "data_source_id"):
+            src = safe_str(body.get(field))
+            if not src:
+                continue
+            target_id, key = self.remap_id("sql_warehouse", src)
+            if target_id:
+                body[field] = target_id
+                continue
+            fallback = next(iter((self.context.get("sql_warehouse_target_ids") or {}).values()), "")
+            if fallback:
+                body[field] = fallback
+                self.result.warnings.append(
+                    f"{field} pointed at source warehouse {src!r}"
+                    + (f" ({key!r})" if key else "")
+                    + f", which is not on target, so it was pointed at an existing warehouse "
+                      f"({fallback}) to keep the object runnable — re-point it if that is not the "
+                      f"warehouse you want.")
+            else:
+                body.pop(field, None)
+                self.result.warnings.append(
+                    f"{field}={src!r} could not be remapped and the target has NO warehouse at all "
+                    f"— the object was created without one and will not run until you attach one.")

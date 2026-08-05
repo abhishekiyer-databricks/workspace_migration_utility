@@ -31,6 +31,7 @@ from src.exporters.asset_export import (
 )
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
+from src.transform.transforms import fingerprint
 from src.utils.helpers import now_iso
 from src.utils.logger import get_logger
 
@@ -43,6 +44,28 @@ _PRODUCED = {"success", "skipped_oversize"}
 # middle ground, NOT a tunable — see the rationale in `_fetch_content`. 200 keeps the Volume
 # writes negligible (~25 rewrites for 5k notebooks) while capping what a crash re-fetches.
 CHECKPOINT_BATCH = 200
+
+
+def _apply_content_fingerprint(unit: dict, content_sha256: str) -> None:
+    """Re-fingerprint a content unit over `payload + the content hash` (§7c-audit GAP 1).
+
+    A notebook/workspace-file unit's payload is only `{path, object_type, language}`, so the
+    fingerprint built at unit-construction time is blind to the file's actual CONTENT. Editing a
+    notebook's code on source therefore produced an IDENTICAL fingerprint, the target's upsert
+    decided SKIP, and the target kept the old code — on a fully green report. Hashing the bytes
+    alongside the payload is what makes "the source changed" detectable for the assets this tool
+    exists to move.
+
+    `_content_sha256` is a FINGERPRINT INPUT ONLY — it is deliberately not added to `payload`,
+    which must stay a valid create body (the workspace import API would reject the extra field).
+    A blank hash leaves the fingerprint untouched, so a failed/oversize unit (no bytes fetched)
+    keeps its metadata-only hash rather than silently hashing the empty string.
+    """
+    if not content_sha256:
+        return
+    unit["content_sha256"] = content_sha256
+    unit["fingerprint"] = fingerprint({**(unit.get("payload") or {}),
+                                       "_content_sha256": content_sha256})
 
 
 class ExportRunner:
@@ -104,7 +127,17 @@ class ExportRunner:
 
         # manifest LAST — its presence marks the bundle complete (resume detection, §7a).
         asset_counts = {t: len(u) for t, u in units_by_type.items()}
-        self.aw.write_manifest(asset_counts)
+        manifest = self.aw.write_manifest(asset_counts)
+
+        # LATEST_EXPORT.json AFTER the manifest (Plan 3 §3): the pointer import resolves a bundle
+        # through. Writing it last is the point — its existence proves the bundle it names is
+        # complete, which the inventory pointer cannot promise. Best-effort: a pointer hiccup must
+        # not fail an otherwise-good export (import can still be given an explicit run_id).
+        try:
+            from src.exporters.bundle_state import write_latest_export_pointer
+            write_latest_export_pointer(self.config, self.config.run_id, manifest, asset_counts)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("latest-export pointer not written", error=str(exc))
 
         summary = self._summary(index)
         _LOG.info("export complete", **{k: summary[k] for k in ("total", "success", "failure",
@@ -172,6 +205,10 @@ class ExportRunner:
                 u["content_ref"] = row.get("content_ref")
                 u["content_route"] = row.get("content_route", "")
                 u["note"] = row.get("note", u.get("note", ""))
+                # The content hash MUST be restored too, or a resumed unit re-fingerprints on
+                # metadata alone and a notebook edit becomes invisible to the target's upsert
+                # (§7c-audit GAP 1 — the exact class of bug §4 warns about).
+                _apply_content_fingerprint(u, row.get("content_sha256", ""))
                 if row.get("export_status") == "skipped_oversize" and row.get("oversize"):
                     with shared as s:
                         s["oversize"].append(row["oversize"])
@@ -203,6 +240,9 @@ class ExportRunner:
             unit["export_status"] = res.status
             unit["content_ref"] = res.content_ref
             unit["content_route"] = res.content_route
+            # Fold the CONTENT hash into the fingerprint — the metadata payload alone cannot
+            # detect an edited notebook (§7c-audit GAP 1).
+            _apply_content_fingerprint(unit, res.content_sha256)
             if res.note:
                 unit["note"] = res.note
             if res.status == "skipped_oversize" and res.oversize:
@@ -223,6 +263,7 @@ class ExportRunner:
                                         "content_ref": res.content_ref,
                                         "content_route": res.content_route,
                                         "note": res.note or "",
+                                        "content_sha256": res.content_sha256,
                                         "oversize": unit.get("oversize")}
                 if len(pending) >= CHECKPOINT_BATCH:
                     self.aw.mark_done_bulk("export:content", pending, pending_results)

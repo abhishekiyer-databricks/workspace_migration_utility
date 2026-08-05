@@ -26,13 +26,27 @@ _LOG = get_logger("artifact_writer")
 def _excluded_from_manifest(name: str) -> bool:
     """Files the manifest must NOT checksum.
 
+    The rule: the manifest attests to the EXPORTED BUNDLE — the things that must survive the handoff
+    intact. Anything written *after* the manifest, or written by a later stage, cannot be
+    checksummed, because its hash would be stale the moment it was recorded and
+    `verify_manifest()` would then fail on every subsequent run.
+
     • `manifest.json` — it is the manifest.
-    • `execution_*.log` — the log keeps being written AFTER the manifest is built (the final
-      flush, plus anything logged during manifest writing itself), so its checksum would be stale
-      the moment it was recorded and `verify_manifest` would report a mismatch on every single
-      run. The log is a diagnostic, not a migratable artifact — it is not part of the handoff.
+    • `execution_*.log` — the log keeps being written AFTER the manifest is built (the final flush,
+      plus anything logged during manifest writing itself). A diagnostic, not a migratable artifact.
+    • `checkpoint.json` — **written by BOTH export and import.** Found live: the first import run
+      recorded its progress here, which changed the file, so the manifest check failed on the very
+      next run and refused a bundle that was actually perfect. It is per-attempt bookkeeping, not
+      part of the handoff.
+    • the import-side outputs (`import_*`, `preflight_report.*`, `acl_parity_report.*`,
+      `manual_actions_import.md`) — produced by the TARGET after the bundle arrived, so they are not
+      part of what the handoff must deliver, and they change on every run.
     """
-    return name == "manifest.json" or (name.startswith("execution") and name.endswith(".log"))
+    if name in ("manifest.json", "checkpoint.json", "manual_actions_import.md"):
+        return True
+    if name.startswith("execution") and name.endswith(".log"):
+        return True
+    return name.startswith(("import_", "preflight_report", "acl_parity_report"))
 
 
 class ArtifactWriter:

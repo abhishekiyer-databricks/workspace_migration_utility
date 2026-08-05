@@ -270,15 +270,35 @@ account-admin / customer IT.
   workspace; `direct` mode DOES call the source, via OAuth M2M** (see the Auth model section).
 - Generic first: no customer- or workspace-specific values in code; all in widgets/config.
 
-## Status (2026-08-04)
-- **Plan 1 (inventory) + Plan 2 (export) are IMPLEMENTED and live-tested** on fvm1 (source) and
-  the target workspace. See `plans/PLAN_1_setup_and_inventory.md`, `plans/PLAN_2_export.md`,
-  `plans/PLAN_1a_inventory_feedback.md`, `plans/INVENTORY_COVERAGE.md`, and the live harnesses in
-  `tests/` (`fixtures_fvm1.py`, `live_fvm1_report.py`, `live_fvm1_export.py`,
-  `live_replay_target.py`, `live_fvm1_resume.py`).
-- **`src/importers/`, `src/state/state_store.py`, and the target-side notebooks are still STUBS.**
-- **`plans/PLAN_3_import.md` written (awaiting review)** — the whole write half: dual-mode
-  connectivity/auth (§2), `LATEST_EXPORT.json` + resume (§3–4), `import_assets` selector (§5),
-  phase-ordered importers (§6), the Delta migration state table incl. the *when to write it* decision
-  (§7), end-to-end Job (§8), `00_Account_Preflight` gate (§9).
-- Next: implement Plan 3 in the phased build order (`PLAN_3_import.md` §10) after review.
+## Status (2026-08-05)
+- **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested** fvm1 → target_ws. The whole pipeline runs:
+  inventory → export → preflight → import (all 12 phases) → reports.
+- **Plan 3 (import) is complete**: `src/state/state_store.py` + `sql_backend.py`, all 12 importers
+  in `src/importers/` (identity, compute, workspace, secrets, jobs, sql, dlt, dashboards, genie,
+  serving, misc, acls) + `base_importer` / `phases` / `import_runner` / `preflight`,
+  `src/reports/import_report.py`, and the notebooks `00_Account_Preflight`, `04_Import`,
+  `00_Main_EndToEnd`. `01`/`02` now have mode-aware role guards.
+- **Test suite**: ~250 offline tests (`python3 -m pytest`), plus live harnesses:
+  `live_direct_mode.py` (OAuth M2M, 13/13), `live_state_store.py` (real Delta MERGE, 24/24),
+  `live_e2e_migration.py` (the full migration + idempotency + update + adopt + retry + ACL parity).
+  `pytest.ini` keeps the offline suite safe to run anywhere; live harnesses are invoked explicitly.
+- **pip needs the Databricks proxy**: `pip3 install --index-url https://pypi-proxy.cloud.databricks.com/simple <pkg>`.
+- **Bugs found and fixed by the live E2E run** (each has a regression test):
+  1. `checkpoint.json` was checksummed in `manifest.json`, but IMPORT writes it — so the first
+     import invalidated the bundle and every later run was refused. Now excluded, along with the
+     import-side outputs (`artifact_writer._excluded_from_manifest`).
+  2. API errors carried no server explanation ("400 Client Error: Bad Request for url: …"), making
+     every failure unactionable AND breaking `RESOURCE_ALREADY_EXISTS` detection. `ApiClient` now
+     folds `error_code` + `message` into the raised error (`HTTPStatusError`).
+  3. A >10 MB workspace FILE exports fine (500 MB ceiling) but `workspace/import` caps its base64
+     body at 10 MB. Large files now use the streaming `workspace-files/import-file` route
+     (verified with 120 MB).
+  4. Platform-internal dirs (`.db_internal`) were being mkdir'd and 400ing — now skipped.
+  5. Group membership was patched during each group's own create, which silently under-populated any
+     group whose members came later in the bundle. Now a true second pass after all groups exist.
+  6. Secret-scope ACLs were being sent to `PUT permissions/...` (which 404s) instead of
+     `secrets/acls/put`, and nothing populated the MANAGE principal — the secrets importer now reads
+     it from `export/acls.json` (it is needed at create time; the ACL phase runs last).
+- **Deferred to Plan 4** (unchanged): `03_Transform_Review` and `05_Validate` are still stubs — the
+  cross-stage inventoried→exported→imported reconciliation. `import_results.json` is already written
+  in the shape Plan 4 joins on.

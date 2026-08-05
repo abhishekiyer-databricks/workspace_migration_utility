@@ -15,9 +15,22 @@
 
 # COMMAND ----------
 
-dbutils.widgets.dropdown("role", "source", ["source", "target"], "Role (must be source)")
+# `airgap` (default): this notebook runs INSIDE the source workspace with role=source, and writes to
+# source_staging_location for ops to move. `direct`: it runs in the TARGET with role=target, reads the
+# source over REST via OAuth M2M, and writes straight to target_staging_location (no manual hop).
+dbutils.widgets.dropdown("connectivity_mode", "airgap", ["airgap", "direct"], "Connectivity mode")
+dbutils.widgets.dropdown("role", "source", ["source", "target"],
+                         "Role (source in airgap, target in direct)")
 dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("source_staging_location", "", "Source staging (UC Volume path /Volumes/...)")
+dbutils.widgets.text("source_staging_location", "", "[airgap] Source staging (/Volumes/...)")
+dbutils.widgets.text("target_staging_location", "", "[direct] Staging (/Volumes/...)")
+# direct-mode source connection. The secret is EITHER a scope pointer (preferred — a widget value is
+# visible on the run page and kept in run history) OR spn_secret_value; scope+key wins when both set.
+dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
+dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
+dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope for the SP secret")
+dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
+dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no scope/key; redacted)")
 dbutils.widgets.text("run_id", "", "Run id (blank = use LATEST_INVENTORY / resume incomplete)")
 dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
 dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
@@ -69,7 +82,7 @@ _REPO_ROOT = _add_repo_root_to_syspath()
 print(f"repo root on sys.path: {_REPO_ROOT}")
 
 from src.config.config_manager import Config, ROLE_SOURCE
-from src.auth.token_manager import build_client
+from src.auth.token_manager import build_clients
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.bundle_state import resolve_export_run_id
 from src.exporters.export_runner import ExportRunner
@@ -81,8 +94,14 @@ from src.utils import logger as _logger
 
 # COMMAND ----------
 
-cfg = Config.from_dbutils(dbutils, spark)  # reads role, staging, safety caps, toggles
-assert cfg.role == ROLE_SOURCE, f"This notebook must run with role=source (got {cfg.role!r})"
+cfg = Config.from_dbutils(dbutils, spark)  # reads role, mode, staging, safety caps, toggles
+
+# Mode-aware guard (master §1a): `airgap` runs this inside the SOURCE (role=source); `direct` runs
+# every stage in the TARGET and reads the source over REST (role=target). Config.validate() already
+# enforces that the source connection widgets are populated in `direct` mode.
+assert cfg.role == ROLE_SOURCE or cfg.is_direct, (
+    f"02_Export must run with role=source in `airgap` mode (got role={cfg.role!r}, "
+    f"connectivity_mode={cfg.connectivity_mode!r}). In `direct` mode use role=target.")
 
 # Resolve the run_id (Plan 2 §2b): explicit widget → task-value (2-task job) → incomplete-bundle
 # resume → LATEST_INVENTORY.json pointer → fail loudly. Never invent a run_id (empty bundle).
@@ -100,8 +119,12 @@ _force_full = (dbutils.widgets.get("force_full_export") or "false").strip().lowe
 _run_id, _how = resolve_export_run_id(cfg, _widget_run_id, _force_full)
 cfg.run_id = _run_id
 
-client = build_client(cfg, dbutils=dbutils, spark=spark)  # context token for THIS workspace
-print(f"Source workspace : {cfg.ctx.workspace_url}")
+# (source_client, target_client) — the SAME local client in `airgap`, an M2M-bound client on
+# source_workspace_url in `direct`. The exporter is unchanged either way; only which client it gets.
+source_client, local_client = build_clients(cfg, dbutils=dbutils, spark=spark)
+client = source_client
+print(f"Source workspace : {client.base_url}"
+      + (f"   (read over REST from {cfg.ctx.workspace_url})" if cfg.is_direct else ""))
 print(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
 print(f"Bundle           : {cfg.output_path}")
 
