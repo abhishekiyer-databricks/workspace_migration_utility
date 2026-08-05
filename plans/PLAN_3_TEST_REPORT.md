@@ -29,7 +29,7 @@ Plan 4 joins on, so Plan 4 is a reader, not a retrofit.
 
 ---
 
-## 2. Offline test suite — 259 tests, all passing
+## 2. Offline test suite — 239 tests, all passing
 
 `python3 -m pytest` (safe anywhere; `pytest.ini` excludes the live harnesses).
 

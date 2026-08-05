@@ -15,8 +15,32 @@ this importer has no dashboard code path at all.
 """
 from __future__ import annotations
 
-from src.importers.base_importer import BaseImporter
+from typing import Optional
+
+from src.importers.base_importer import BaseImporter, UnsupportedOperation
 from src.utils.helpers import safe_str
+
+# The v1 alert `op` vocabulary. The modern `condition.op` uses words; v1 wants symbols.
+_V1_OPS = {"GREATER_THAN": ">", "GREATER_THAN_OR_EQUAL": ">=", "LESS_THAN": "<",
+           "LESS_THAN_OR_EQUAL": "<=", "EQUAL": "==", "NOT_EQUAL": "!="}
+
+
+def _legacy_alert_options(condition) -> Optional[dict]:
+    """Translate a modern `condition` block into the v1 `options` a legacy create requires.
+
+    Returns None when it does not map cleanly — the caller then reports a manual rebuild rather than
+    guessing at an alert's trigger, which is the kind of thing that must not be approximated.
+    """
+    if not isinstance(condition, dict):
+        return None
+    op = _V1_OPS.get(safe_str(condition.get("op")))
+    column = ((condition.get("operand") or {}).get("column") or {}).get("name")
+    threshold = ((condition.get("threshold") or {}).get("value") or {})
+    value = next((threshold[k] for k in ("string_value", "double_value", "bool_value")
+                  if k in threshold), None)
+    if not op or not column or value is None:
+        return None
+    return {"column": safe_str(column), "op": op, "value": safe_str(value)}
 
 
 class SqlImporter(BaseImporter):
@@ -124,9 +148,29 @@ class SqlImporter(BaseImporter):
 
     # ── alerts ────────────────────────────────────────────────────────────
     def _create_legacy_alert(self, unit: dict) -> dict:
-        created = self.client.post("api/2.0/sql/alerts",
-                                   self._legacy_alert_body(unit.get("payload") or {}))
-        return {"target_id": safe_str(created.get("id"))}
+        """Create a LEGACY (v1) SQL alert — which needs the legacy `options` shape.
+
+        Verified live: `POST /api/2.0/sql/alerts` rejects the modern payload with "Missing alert
+        definition". The v1 create wants a flat `options{column, op, value}`, but the current LIST/GET
+        surface returns the NEW `condition{op, operand, threshold}` shape instead — so the exported
+        payload cannot be posted back as-is. The condition is translated where it maps cleanly, and
+        anything that doesn't is reported as a manual rebuild rather than an opaque 400.
+        """
+        payload = self._legacy_alert_body(unit.get("payload") or {})
+        if "options" not in payload:
+            options = _legacy_alert_options(payload.get("condition"))
+            if options is None:
+                raise UnsupportedOperation(
+                    f"legacy alert `{self.natural_key(unit)}` cannot be recreated: the v1 create API "
+                    f"requires the old flat `options{{column, op, value}}` shape, but the current "
+                    f"read API only returns the newer `condition` shape, and this alert's condition "
+                    f"does not translate cleanly. Rebuild it on target as an Alerts V2 alert (the "
+                    f"underlying query HAS migrated), or recreate it by hand.")
+            payload["options"] = options
+            payload.pop("condition", None)
+        created = self.client.post("api/2.0/sql/alerts", payload)
+        return {"target_id": safe_str(created.get("id")),
+                "note": "legacy (v1) alert — its `condition` was translated to the v1 `options` shape"}
 
     def _legacy_alert_body(self, payload: dict) -> dict:
         """Remap the alert's QUERY id — an alert holding a source query id is inert on target."""

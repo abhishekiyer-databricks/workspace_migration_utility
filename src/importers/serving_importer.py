@@ -43,6 +43,7 @@ class ServingImporter(BaseImporter):
         name = self.natural_key(unit)
         config = dict(unit.get("payload") or {})
         self._reject_uc_backed(name, config)
+        self._require_provider_credentials(name, config)
         body = {"name": name, "config": self._config_body(config)}
         created = self.client.post("api/2.0/serving-endpoints", body)
         return {"target_id": safe_str(created.get("name")) or name,
@@ -76,6 +77,40 @@ class ServingImporter(BaseImporter):
                     f"OF SCOPE for this utility, so that model does not exist on the target and the "
                     f"endpoint cannot be recreated here. Migrate the model with the UC tooling, then "
                     f"recreate this endpoint (only external-model endpoints are auto-migratable).")
+
+    def _require_provider_credentials(self, name: str, config: dict) -> None:
+        """An external-model endpoint cannot be created without its provider CREDENTIAL block.
+
+        Verified live: the export payload carries `external_model{provider, name, task}` but NOT the
+        credential (`openai_api_key` / `anthropic_api_key` / …), because that field is **write-only —
+        the API never returns it**, exactly like a secret value. Posting the config without it fails
+        with the unhelpful "Empty or wrong type of config provided for openai".
+
+        So this is a MANUAL step by nature, not a tool defect: the endpoint definition migrated, but a
+        human must supply the API key (usually as a secret-scope reference). Reported with that
+        remediation rather than as a raw API rejection, so the operator knows it is a credential, not
+        a malformed payload.
+        """
+        missing = []
+        for entity in (config.get("served_entities") or config.get("served_models") or []):
+            if not isinstance(entity, dict):
+                continue
+            external = entity.get("external_model")
+            if not isinstance(external, dict):
+                continue
+            provider = safe_str(external.get("provider"))
+            # Any `*_config` block is the credential holder (openai_config, anthropic_config, …).
+            has_credentials = any(k.endswith("_config") and external.get(k) for k in external)
+            if not has_credentials:
+                missing.append(f"{safe_str(entity.get('name')) or provider} ({provider})")
+        if missing:
+            raise UnsupportedOperation(
+                f"serving endpoint `{name}` serves external model(s) {', '.join(missing)}, but the "
+                f"provider API KEY is write-only — no Databricks API ever returns it, so it is not in "
+                f"the bundle (the same reason secret values are not). The endpoint definition "
+                f"migrated, but it cannot be created without the credential. Recreate it on target "
+                f"supplying the provider key (ideally as a secret-scope reference), then re-run with "
+                f"retry_mode=failed_only for anything that depends on it.")
 
     @staticmethod
     def _config_body(config: dict) -> dict:

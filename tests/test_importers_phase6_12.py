@@ -98,15 +98,53 @@ def test_an_unmappable_warehouse_falls_back_to_an_existing_one_and_says_so():
     assert any("runnable" in w for w in res.warnings)
 
 
+def _condition(op="GREATER_THAN", column="v", value="0"):
+    """The MODERN condition shape the read API returns (the v1 create wants `options` instead)."""
+    return {"op": op, "operand": {"column": {"name": column}},
+            "threshold": {"value": {"string_value": value}}}
+
+
 def test_alert_query_id_is_remapped():
     client = RecordingClient()
     imp, _st, _aw = _make(SqlImporter, [
         _unit("legacy_query", "q1", {"display_name": "q1"}, source_id="SRC-Q"),
-        _unit("legacy_alert", "a1", {"name": "a1", "query_id": "SRC-Q"}),
+        _unit("legacy_alert", "a1", {"name": "a1", "query_id": "SRC-Q",
+                                     "condition": _condition()}),
     ], client)
     imp.run()
     body = client.bodies_to("sql/alerts")[0]
     assert body["query_id"] == "id-1", "an alert holding a SOURCE query id is inert on target"
+
+
+def test_a_legacy_alert_condition_is_translated_to_the_v1_options_shape():
+    """REGRESSION (found live): `POST sql/alerts` rejects the modern payload with "Missing alert
+    definition" — the v1 create needs the old flat `options{column, op, value}`, but the current read
+    API only returns `condition`. Without translating, every legacy alert failed with an opaque 400.
+    """
+    client = RecordingClient()
+    imp, _st, _aw = _make(SqlImporter, [
+        _unit("legacy_alert", "a1", {"name": "a1", "query_id": "q",
+                                     "condition": _condition("GREATER_THAN", "total", "42")})],
+        client)
+    res = imp.run()
+    body = client.bodies_to("sql/alerts")[0]
+    assert body["options"] == {"column": "total", "op": ">", "value": "42"}
+    assert "condition" not in body, "the v1 API does not understand the modern condition block"
+    assert res.created == 1
+
+
+def test_an_untranslatable_legacy_alert_is_not_supported_rather_than_a_bare_400():
+    """An alert's TRIGGER must never be approximated — if it doesn't map, say so."""
+    client = RecordingClient()
+    imp, st, _aw = _make(SqlImporter, [
+        _unit("legacy_alert", "weird", {"name": "weird", "query_id": "q",
+                                        "condition": {"op": "SOMETHING_EXOTIC"}})], client)
+    res = imp.run()
+    assert client.posts_to("sql/alerts") == []
+    assert res.failed == 1
+    row = st.row("legacy_alert", "weird")
+    assert row["failure_category"] == "not_supported"
+    assert "Alerts V2" in row["last_error"] and "query HAS migrated" in row["last_error"]
 
 
 def test_alert_v2_is_posted_flat_not_wrapped():
@@ -231,23 +269,31 @@ def test_genie_space_is_auto_migratable_with_serialized_space():
 
 # ═══════════════════════════════ SERVING ════════════════════════════════════
 
+def _external_entity(name="gpt", provider="openai", with_credentials=True):
+    """An external-model served entity. The `*_config` block is where the API key lives."""
+    external = {"provider": provider, "name": "gpt-4o-mini", "task": "llm/v1/chat"}
+    if with_credentials:
+        external[f"{provider}_config"] = {"openai_api_key": "{{secrets/scope/key}}"}
+    return {"name": name, "external_model": external}
+
+
 def test_platform_managed_endpoints_are_never_touched():
     client = RecordingClient()
     imp, _st, _aw = _make(ServingImporter, [
         _unit("serving_endpoint", "databricks-meta-llama-3", {}),
         _unit("serving_endpoint", "my-openai-proxy",
-              {"served_entities": [{"name": "e", "external_model": {"provider": "openai"}}]}),
+              {"served_entities": [_external_entity()]}),
     ], client)
     res = imp.run()
     assert res.total == 1, "a databricks-* endpoint is platform-managed and not ours to migrate"
     assert client.bodies_to("serving-endpoints")[0]["name"] == "my-openai-proxy"
 
 
-def test_an_external_model_endpoint_is_created_with_the_api_key_caveat():
+def test_an_external_model_endpoint_with_credentials_is_created():
     client = RecordingClient()
     imp, _st, _aw = _make(ServingImporter, [
         _unit("serving_endpoint", "gpt-proxy",
-              {"served_entities": [{"name": "gpt", "external_model": {"provider": "openai"}}],
+              {"served_entities": [_external_entity()],
                "config_version": 7, "state": {"ready": "READY"}})], client)
     res = imp.run()
     body = client.bodies_to("serving-endpoints")[0]
@@ -255,6 +301,25 @@ def test_an_external_model_endpoint_is_created_with_the_api_key_caveat():
     for field in ("config_version", "state"):
         assert field not in body["config"], f"{field} is not a create field"
     assert "API key is NOT migratable" in res.units[0]["note"]
+
+
+def test_an_external_endpoint_WITHOUT_its_provider_key_is_not_supported():
+    """REGRESSION (found live): the provider API key is WRITE-ONLY — no API returns it — so it is not
+    in the bundle, and the create fails with the unhelpful "Empty or wrong type of config provided
+    for openai". That is a manual credential step, not a malformed payload, and the report must say
+    so rather than showing a bare 400.
+    """
+    client = RecordingClient()
+    imp, st, _aw = _make(ServingImporter, [
+        _unit("serving_endpoint", "gpt-proxy",
+              {"served_entities": [_external_entity(with_credentials=False)]})], client)
+    res = imp.run()
+    assert client.posts_to("serving-endpoints") == [], \
+        "an endpoint with no credential must not be attempted — the 400 is unavoidable"
+    assert res.failed == 1
+    row = st.row("serving_endpoint", "gpt-proxy")
+    assert row["failure_category"] == "not_supported"
+    assert "write-only" in row["last_error"] and "secret-scope" in row["last_error"]
 
 
 def test_a_uc_backed_endpoint_is_not_supported_rather_than_a_failure_loop():

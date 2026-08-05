@@ -278,7 +278,7 @@ account-admin / customer IT.
   serving, misc, acls) + `base_importer` / `phases` / `import_runner` / `preflight`,
   `src/reports/import_report.py`, and the notebooks `00_Account_Preflight`, `04_Import`,
   `00_Main_EndToEnd`. `01`/`02` now have mode-aware role guards.
-- **Test suite**: ~250 offline tests (`python3 -m pytest`), plus live harnesses:
+- **Test suite**: 239 offline tests (`python3 -m pytest`), plus live harnesses:
   `live_direct_mode.py` (OAuth M2M, 13/13), `live_state_store.py` (real Delta MERGE, 24/24),
   `live_e2e_migration.py` (the full migration + idempotency + update + adopt + retry + ACL parity).
   `pytest.ini` keeps the offline suite safe to run anywhere; live harnesses are invoked explicitly.
