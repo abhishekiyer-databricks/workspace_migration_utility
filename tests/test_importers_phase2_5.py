@@ -15,6 +15,7 @@ correct, passes a smoke test, and then fails in the customer's workspace:
 from __future__ import annotations
 
 import base64
+import json
 import os
 import tempfile
 
@@ -360,6 +361,40 @@ def test_a_databricks_scope_is_created_with_manage_at_create_time():
     body = client.bodies_to("secrets/scopes/create")[0]
     assert body["initial_manage_principal"] == "users"
     assert "2 secret VALUE(s) are NOT migratable" in res.units[0]["note"]
+
+
+def test_a_named_manage_principal_is_deferred_to_an_acl_put_not_sent_at_create():
+    """`initial_manage_principal` accepts ONLY `users` — a named principal must not be sent there.
+
+    Regression (live 2026-08-06): the source scopes were MANAGEd by specific users, so the importer
+    put those names in `initial_manage_principal` and the API rejected every one —
+    `400 BAD_REQUEST Cannot specify <user> as initial_manage_principal` — failing 3 of 4 scopes.
+    Verified against the real API that even the CALLER's own username is refused; `users` is the
+    only accepted literal. The named grant is therefore applied afterwards via `secrets/acls/put`,
+    which (unlike `users:MANAGE`) genuinely can be patched later.
+    """
+    # the MANAGE holder is read from the BUNDLE (export/acls.json), not from cross-phase context:
+    # the ACL phase runs last, so the scope phase has to read it from the bundle directly.
+    acls = json.dumps([{"asset_type": "secret_scope", "natural_key": "app-secrets",
+                        "grants": [{"principal": "alice@corp.com", "permission_level": "MANAGE"}]}])
+    client = RecordingClient()
+    imp, _st = _make(SecretsImporter, [
+        _unit("secret_scope", "app-secrets",
+              {"name": "app-secrets", "backend_type": "DATABRICKS", "key_names": ["k1"]})],
+        client, staging_files={"export/acls.json": acls.encode()})
+    res = imp.run()
+
+    body = client.bodies_to("secrets/scopes/create")[0]
+    assert body["initial_manage_principal"] == "users", \
+        f"only `users` may be sent at create, got {body['initial_manage_principal']!r}"
+    assert "alice@corp.com" not in str(body), "a named principal must never reach the create body"
+
+    # …and it must still END UP with MANAGE, via the ACL API
+    acl_bodies = client.bodies_to("secrets/acls/put")
+    assert any(b.get("principal") == "alice@corp.com" and b.get("permission") == "MANAGE"
+               and b.get("scope") == "app-secrets" for b in acl_bodies), \
+        f"expected a MANAGE acls/put for alice@corp.com, got {acl_bodies}"
+    assert res.units[0]["target_id"] == "app-secrets"
 
 
 def test_an_akv_scope_without_an_aad_token_fails_with_the_right_remediation():

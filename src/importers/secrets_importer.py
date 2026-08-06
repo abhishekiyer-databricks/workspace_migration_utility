@@ -72,22 +72,44 @@ class SecretsImporter(BaseImporter):
         backend = safe_str(payload.get("backend_type")).upper() or "DATABRICKS"
 
         body: dict = {"scope": name}
-        manage_principal = self._manage_principal(name)
-        if manage_principal:
-            # MUST be set at create — `users:MANAGE` cannot be patched later.
-            body["initial_manage_principal"] = manage_principal
+        manage_principal, deferred_manage = self._manage_principal(name)
+        # `users` is the only value the API accepts here (see _manage_principal); any NAMED
+        # principal is granted MANAGE straight after create instead.
+        body["initial_manage_principal"] = manage_principal
 
         if backend == _AKV:
-            return self._create_akv_scope(unit, body, payload)
+            return self._create_akv_scope(unit, body, payload, deferred_manage)
 
         self.client.post("api/2.0/secrets/scopes/create", body)
+        granted = self._grant_manage(name, deferred_manage)
         keys = payload.get("key_names") or []
         return {"target_id": name,
-                "note": (f"Databricks-backed scope created (MANAGE={manage_principal}). Its "
+                "note": (f"Databricks-backed scope created (MANAGE={manage_principal}"
+                         f"{', ' + ', '.join(granted) if granted else ''}). Its "
                          f"{len(keys)} secret VALUE(s) are NOT migratable — no API returns a value — "
                          f"so re-populate them on target; each key has its own manual row.")}
 
-    def _create_akv_scope(self, unit: dict, body: dict, payload: dict) -> dict:
+    def _grant_manage(self, scope: str, principals: list) -> list:
+        """Grant MANAGE to named principals after the scope exists.
+
+        `initial_manage_principal` only accepts `users`, so a source scope managed by a specific
+        user/SP/group has to be reproduced through `secrets/acls/put`. Best-effort per principal: a
+        scope that exists but is missing one MANAGE grant is far better than no scope at all, and the
+        ACL phase (12) re-applies scope ACLs anyway — this is belt-and-braces for the MANAGE case.
+        """
+        granted = []
+        for principal in principals:
+            try:
+                self.client.post("api/2.0/secrets/acls/put",
+                                 {"scope": scope, "principal": principal, "permission": "MANAGE"})
+                granted.append(principal)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("scope MANAGE grant failed", scope=scope, principal=principal,
+                                 error=str(exc)[:200])
+        return granted
+
+    def _create_akv_scope(self, unit: dict, body: dict, payload: dict,
+                          deferred_manage: list = ()) -> dict:
         """Link the scope to the SAME Azure Key Vault, using an AAD token (§6c/D4)."""
         name = self.natural_key(unit)
         meta = payload.get("keyvault_metadata") or {}
@@ -123,6 +145,8 @@ class SecretsImporter(BaseImporter):
                 f"REFUSED ({str(exc)[:200]}). Grant the run-as identity `get` + `list` on that vault "
                 f"(an access policy, or the *Key Vault Secrets User* role) — that is a grant on the "
                 f"AZURE VAULT, not on the Databricks scope.") from exc
+
+        self._grant_manage(name, list(deferred_manage))
 
         return {"target_id": name,
                 "note": (f"linked to the SOURCE vault {dns_name} verbatim. NOTE this is a "
@@ -165,23 +189,29 @@ class SecretsImporter(BaseImporter):
         self._manage_cache = cache
         return cache
 
-    def _manage_principal(self, scope: str) -> str:
-        """The `initial_manage_principal` for a new scope, remapped to a TARGET principal.
+    def _manage_principal(self, scope: str) -> tuple[str, list]:
+        """`(initial_manage_principal, deferred_manage_principals)` for a new scope.
 
-        MUST be right first time: `users:MANAGE` cannot be patched later, so getting it wrong means
-        deleting and recreating the scope. A specific principal is resolved through the identity map,
-        because a DB-managed SP's appId changed on target and a stale one would leave the scope
-        manageable by nobody but the run-as identity.
+        **`users` is the ONLY value this API accepts.** Verified live 2026-08-06: passing any
+        specific principal — including the CALLER's own username — fails with
+        `400 BAD_REQUEST Cannot specify <principal> as initial_manage_principal`. So a source scope
+        whose MANAGE holder is a named user/SP/group cannot express that at create time; sending it
+        fails the whole scope (which is what happened: 3 of 4 scopes failed on the first live run).
+
+        The named principals are therefore returned separately, to be granted via
+        `secrets/acls/put` straight after the scope exists. That ordering is safe: unlike
+        `users:MANAGE` — which genuinely cannot be patched later — an explicit MANAGE acl CAN be
+        put afterwards, so nothing is lost by deferring it.
         """
+        deferred = []
         for principal in self._source_manage_grants().get(scope, []):
             if principal == "users":
-                return "users"
+                continue          # already covered by the initial_manage_principal below
             mapped = self.resolve_principal(principal)
             if mapped:
-                return mapped
-        # Default to `users`, matching the API's own default — better than a scope only the run-as
-        # SP can manage.
-        return "users"
+                deferred.append(mapped)
+        # `users` matches the API's own default, and is the only accepted literal.
+        return "users", deferred
 
     def update_one(self, unit: dict, target_id: str) -> dict:
         """A secret scope has NO edit API, and recreating it would destroy its values."""
