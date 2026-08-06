@@ -375,9 +375,19 @@ def _identity_units(records: list[dict]) -> list[dict]:
             out.append(_make_unit("user", safe_str(r.get("userName")), r.get("id"), raw,
                                   mode="auto", extra={"classification": cls}))
         elif itype == "service_principal":
-            has_secrets = bool(r.get("has_secrets"))
-            note = ("OAuth client secret(s) present — NOT exportable; recreate on target manually."
-                    if has_secrets else "")
+            # Tri-state, NOT bool(): None means the check itself failed (a workspace-admin SP
+            # cannot read another SP's credentials — needs account_admin). Reporting that as
+            # "no secrets" would silently drop a manual action, so it gets its own note.
+            has_secrets = r.get("has_secrets")
+            if has_secrets is None:
+                note = ("could not check for OAuth client secret(s) — the running identity lacks "
+                        "account_admin; if this SPN has secrets they are NOT exportable and must "
+                        "be recreated on target manually. VERIFY MANUALLY.")
+            elif has_secrets:
+                note = ("OAuth client secret(s) present — NOT exportable; recreate on target "
+                        "manually.")
+            else:
+                note = ""
             # `has_secrets` is collected but is NOT a SCIM create field, so it never reached the
             # payload — meaning creating an OAuth secret on an existing source SPN left the
             # stripped SCIM object byte-identical, the fingerprint unmoved, and the manual action

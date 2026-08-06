@@ -113,7 +113,7 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_managed",      "Managed By",    "badge_managed"),
         ("active",        "Active",        "badge_bool"),
         ("_entitlements", "Entitlements",  "plain"),
-        ("_has_secrets",  "Has Secrets",   "badge_bool"),
+        ("_has_secrets",  "Has Secrets",   "badge_bool_unknown"),
         ("id",            "SCIM ID",       "mono"),
     ],
     "notebooks": [
@@ -442,7 +442,9 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
     data["service_principals"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),
                _managed=_sp_managed(i.get("classification")),
-               _has_secrets=bool(i.get("has_secrets")))
+               # NOT bool(): `None` means "could not check" (insufficient privilege) and must
+               # stay distinct from a real False, or the report understates manual work.
+               _has_secrets=i.get("has_secrets"))
         for i in _by(identity, "identity_type", "service_principal")]
     data["groups"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),

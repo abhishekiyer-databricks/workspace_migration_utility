@@ -347,6 +347,71 @@ def test_view_adapter_acls_and_managed_metadata():
     assert counts["object_permissions"] == 7
 
 
+def test_sp_secret_check_failure_is_unknown_not_false():
+    """A failed OAuth-secret check must be `None` ("could not check"), never `False`.
+
+    Regression (found live 2026-08-06, `direct` mode): despite its `/accounts/` path the endpoint
+    is account-level behind a workspace proxy. A USER with account_admin can read it, but a
+    workspace-admin SERVICE PRINCIPAL gets 403 PERMISSION_DENIED. The collector swallowed that and
+    returned False — indistinguishable from "this SP genuinely has no secrets" — so an operator
+    would skip recreating a client secret that really does exist. Unknown must stay distinct.
+    """
+    from src.collectors.identity_collector import IdentityCollector
+
+    scim = {"ServicePrincipals": [
+        {"id": "s1", "applicationId": "app-denied", "displayName": "sp denied"},
+        {"id": "s2", "applicationId": "app-has", "displayName": "sp has"},
+        {"id": "s3", "applicationId": "app-none", "displayName": "sp none"},
+    ]}
+
+    def _denied(_params):
+        raise RuntimeError("GET .../credentials/secrets -> 403: PERMISSION_DENIED "
+                           "User is not authorized to perform this operation.")
+
+    gt = {
+        "api/2.0/accounts/servicePrincipals/s1/credentials/secrets": _denied,
+        "api/2.0/accounts/servicePrincipals/s2/credentials/secrets":
+            {"secrets": [{"id": "sec1", "status": "ACTIVE"}]},
+        "api/2.0/accounts/servicePrincipals/s3/credentials/secrets": {},
+    }
+    coll = IdentityCollector(FakeClient(get_table=gt, scim_table=scim), _cfg())
+    objs = _run_ok(coll)   # a permission gap must NOT be a collector error
+    sps = {o["applicationId"]: o for o in objs if o.get("identity_type") == "service_principal"}
+    assert sps["app-denied"]["has_secrets"] is None, "403 must be unknown, not False"
+    assert sps["app-has"]["has_secrets"] is True
+    assert sps["app-none"]["has_secrets"] is False, "a real empty result stays False"
+
+    # ONE summary warning for the systemic gap, not one per affected SP.
+    assert len(coll._secret_check_failures) == 1
+
+    # and the three states must be distinguishable everywhere they surface
+    from src.exporters.excel_generator import _cell_text
+    from src.reports.html_generator import _cell_html
+    assert _cell_text(None, "badge_bool_unknown") == "Could not check"
+    assert _cell_text(False, "badge_bool_unknown") == "No"
+    assert _cell_text(True, "badge_bool_unknown") == "Yes"
+    assert "Could not check" in _cell_html(None, "badge_bool_unknown")
+    assert ">No<" in _cell_html(False, "badge_bool_unknown")
+    # plain badge_bool must keep its two-state behaviour for every other column
+    assert _cell_text(None, "badge_bool") == ""
+
+    # the export note must tell the operator to verify by hand, and each state must
+    # fingerprint differently so None -> True re-surfaces the manual action on a later run
+    from src.exporters.asset_export import build_all
+
+    def _unit(has_secrets):
+        return build_all({"identity": [{
+            "identity_type": "service_principal", "applicationId": "app1", "id": "1",
+            "classification": "db_managed_sp", "has_secrets": has_secrets,
+            "_raw": {"displayName": "sp", "applicationId": "app1"}}]})["service_principal"][0]
+
+    unknown, present, absent = _unit(None), _unit(True), _unit(False)
+    assert "could not check" in unknown["note"].lower()
+    assert "VERIFY MANUALLY" in unknown["note"]
+    assert "present" in present["note"] and absent["note"] == ""
+    assert len({unknown["fingerprint"], present["fingerprint"], absent["fingerprint"]}) == 3
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

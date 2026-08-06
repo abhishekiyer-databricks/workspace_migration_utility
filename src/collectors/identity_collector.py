@@ -45,11 +45,31 @@ class IdentityCollector(BaseCollector):
 
     def discover(self) -> list[dict]:
         max_scim = int(getattr(self.config, "max_scim", 0) or 0)
+        # (scim_id, error) for every SP whose OAuth-secret check failed — collapsed into ONE
+        # warning below, since the usual cause is a single missing privilege, not N problems.
+        self._secret_check_failures: list[tuple] = []
         out: list[dict] = []
         out.extend(self._users(max_scim))
         out.extend(self._service_principals(max_scim))
         out.extend(self._groups(max_scim))
+        self._warn_secret_check_failures()
         return out
+
+    def _warn_secret_check_failures(self) -> None:
+        if not self._secret_check_failures:
+            return
+        n = len(self._secret_check_failures)
+        _, first_error = self._secret_check_failures[0]
+        denied = "PERMISSION_DENIED" in first_error or "403" in first_error
+        self.log.warning(
+            "could not check OAuth client secrets for service principals — "
+            "reported as 'Could not check' (NOT as 'No')",
+            service_principals_affected=n,
+            likely_cause=("the running identity lacks account_admin; a workspace-admin SERVICE "
+                          "PRINCIPAL cannot read another SP's credentials (a USER with "
+                          "account_admin can). Grant account_admin to populate this flag."
+                          if denied else "see error"),
+            example_error=first_error[:200])
 
     # natural_key differs per identity type; override the base helper.
     def natural_key(self, obj: dict) -> str:
@@ -71,13 +91,21 @@ class IdentityCollector(BaseCollector):
         raw = self.client.get_scim("ServicePrincipals", max_items=max_scim)
         return [self._map_sp(s) for s in raw]
 
-    def _sp_has_secrets(self, scim_id: str) -> bool:
-        """Whether an SP has OAuth client secrets (workspace proxy; metadata only — never values).
+    def _sp_has_secrets(self, scim_id: str):
+        """Whether an SP has OAuth client secrets — `True` / `False` / `None` for "couldn't check".
 
-        Verified: GET /api/2.0/accounts/servicePrincipals/{SCIM_ID}/credentials/secrets works for
-        a workspace-admin and returns secret metadata (id/hash/status), never the value. Client
-        secrets CANNOT be migrated → flags the SP for manual secret recreation on target (Plan 1a §6).
-        Best-effort: any failure → False (never aborts the collector).
+        `GET /api/2.0/accounts/servicePrincipals/{SCIM_ID}/credentials/secrets` returns secret
+        metadata (id/hash/status), never the value. Client secrets CANNOT be migrated → this flags
+        the SP for manual secret recreation on target (Plan 1a §6).
+
+        **`None` is not the same as `False`.** Despite the `/accounts/` path this is an
+        account-level resource behind a workspace proxy: a USER with account_admin can read it,
+        but a plain workspace-admin **service principal** gets `403 PERMISSION_DENIED` (verified
+        live 2026-08-06 in `direct` mode). Returning `False` there would be silently wrong — it
+        reads as "this SP has no secrets", so an operator would skip recreating a secret that
+        really does exist. Unknown must stay distinguishable from no.
+
+        Never aborts the collector: any failure degrades to `None`.
         """
         if not scim_id:
             return False
@@ -86,8 +114,10 @@ class IdentityCollector(BaseCollector):
                 f"api/2.0/accounts/servicePrincipals/{scim_id}/credentials/secrets")
             return bool(data.get("secrets")) if isinstance(data, dict) else False
         except Exception as exc:  # noqa: BLE001
-            self.log.warning("sp secrets check failed", scim_id=scim_id, error=str(exc))
-            return False
+            # One systemic permission gap would otherwise log once per SP; record it and let the
+            # collector emit a single summary warning at the end of the SP pass.
+            self._secret_check_failures.append((scim_id, str(exc)))
+            return None
 
     def _groups(self, max_scim: int) -> list[dict]:
         raw = self.client.get_scim("Groups", max_items=max_scim)

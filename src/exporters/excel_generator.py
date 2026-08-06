@@ -37,6 +37,14 @@ _EXCEL_ALT_ROW = "F1F5F9"     # very light gray
 
 def _cell_text(value, fmt: str):
     """Plain-text / native value for an Excel cell — ported from the reference script."""
+    # Tri-state columns are checked BEFORE the empty guard: for them `None` is meaningful
+    # ("could not check"), not missing, so it must not fall through to a blank cell.
+    if fmt == "badge_bool_unknown":
+        if value is True or str(value).lower() in ("true", "1", "yes"):
+            return "Yes"
+        if value is False or str(value).lower() in ("false", "0", "no"):
+            return "No"
+        return "Could not check"
     if value is None or value == "":
         return ""
     if fmt in ("plain", "mono", "path", "trunc"):

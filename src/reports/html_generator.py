@@ -40,6 +40,16 @@ from src.reports.inventory_view import (
 def _cell_html(value, fmt: str) -> str:
     from datetime import datetime
 
+    # Tri-state columns are checked BEFORE the empty guard: for them `None` is meaningful
+    # ("could not check"), not missing, so it must not fall through to the "—" placeholder.
+    if fmt == "badge_bool_unknown":
+        if value is True or str(value).lower() in ("true", "1", "yes"):
+            return '<span class="badge badge-green">Yes</span>'
+        if value is False or str(value).lower() in ("false", "0", "no"):
+            return '<span class="badge badge-red">No</span>'
+        return ('<span class="badge badge-yellow" title="insufficient privilege to check — '
+                'needs account_admin">Could not check</span>')
+
     if value is None or value == "":
         return '<span class="na">—</span>'
 
