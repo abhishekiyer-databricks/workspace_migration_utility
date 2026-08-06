@@ -270,15 +270,25 @@ account-admin / customer IT.
   workspace; `direct` mode DOES call the source, via OAuth M2M** (see the Auth model section).
 - Generic first: no customer- or workspace-specific values in code; all in widgets/config.
 
-## Status (2026-08-05)
-- **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested** fvm1 → target_ws. The whole pipeline runs:
+## Status (2026-08-06)
+- **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested**. The whole pipeline runs:
   inventory → export → preflight → import (all 12 phases) → reports.
+- **Fixtures are now workspace-agnostic** and rebuilt on a fresh source workspace
+  (`source_ws` profile, a DIFFERENT account from the old fvm1). `tests/fixtures_fvm1.py` resolves
+  profile / catalog / identity / Azure tenant / CLI at runtime (`WSMIG_PROFILE`,
+  `WSMIG_ACCT_PROFILE`, `WSMIG_CATALOG`, `WSMIG_CLI`) instead of hardcoding fvm1, so the same
+  file populates any pair. 19 dependency-ordered phases, every one **idempotent** (several
+  creates — notably `service_principals.create` — do NOT dedupe by name and silently doubled
+  fixtures on re-run). Latest coverage report: **88/88 PASS, 176 export units, 0 failures**.
+  Entra-backed groups need the ACCOUNT profile (workspace SCIM drops `externalId`); a new
+  `acls` phase grants each object type its FULL permission ladder across every principal kind
+  (239 grants / 15 object types / 59 principal-kind×level pairs, vs the old CAN_MANAGE-skewed set).
 - **Plan 3 (import) is complete**: `src/state/state_store.py` + `sql_backend.py`, all 12 importers
   in `src/importers/` (identity, compute, workspace, secrets, jobs, sql, dlt, dashboards, genie,
   serving, misc, acls) + `base_importer` / `phases` / `import_runner` / `preflight`,
   `src/reports/import_report.py`, and the notebooks `00_Account_Preflight`, `04_Import`,
   `00_Main_EndToEnd`. `01`/`02` now have mode-aware role guards.
-- **Test suite**: 242 offline tests (`python3 -m pytest`), plus live harnesses:
+- **Test suite**: 243 offline tests (`python3 -m pytest`), plus live harnesses:
   `live_direct_mode.py` (OAuth M2M, 13/13), `live_state_store.py` (real Delta MERGE, 24/24),
   `live_e2e_migration.py` (the full migration + idempotency + update + adopt + retry + ACL parity).
   `pytest.ini` keeps the offline suite safe to run anywhere; live harnesses are invoked explicitly.
@@ -299,6 +309,14 @@ account-admin / customer IT.
   6. Secret-scope ACLs were being sent to `PUT permissions/...` (which 404s) instead of
      `secrets/acls/put`, and nothing populated the MANAGE principal — the secrets importer now reads
      it from `export/acls.json` (it is needed at create time; the ACL phase runs last).
+- **Bug found by the 2026-08-06 fixture rebuild** (regression test:
+  `test_dab_alert_v2_is_stamped_from_bundle_state_not_path`): a DAB-deployed **Alerts V2** was
+  classified Manual → `import_action=create`, so import would DUPLICATE an alert the customer's
+  bundle redeploys. Cause: `sql_collector` detects DAB by path, but the LIST call
+  `GET /api/2.0/alerts` **omits `parent_path`** entirely (only GET-by-id returns it), so the check
+  could never fire. Fixed by stamping alerts from the bundle state file
+  (`InventoryRunner._DAB_STAMP_TARGETS` + `_SQL_TYPE_FOR`, which also keeps the mixed `sql` bucket
+  from letting a warehouse inherit an alert's claim on the same id).
 - **Deferred to Plan 4** (unchanged): `03_Transform_Review` and `05_Validate` are still stubs — the
   cross-stage inventoried→exported→imported reconciliation. `import_results.json` is already written
   in the shape Plan 4 joins on.

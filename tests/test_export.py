@@ -1096,6 +1096,60 @@ def test_bundle_state_resolution():
     assert bs.resolve_inventory_run_id(cfg, "X", False) == ("X", "widget")
 
 
+def test_dab_alert_v2_is_stamped_from_bundle_state_not_path():
+    """A DAB-deployed Alerts V2 must be detected from the bundle STATE file.
+
+    Regression (found live 2026-08-06): `GET /api/2.0/alerts` — the LIST call the collector
+    uses — omits `parent_path` entirely; only GET-by-id returns it. So sql_collector's
+    path-based detection can never fire for alerts, and a bundle-owned alert was classified
+    Manual → import_action=create, which would DUPLICATE an alert the customer's bundle
+    redeploys on every release.
+    """
+    import json as _json
+
+    from src.collectors.inventory_runner import InventoryRunner
+
+    state_path = "/Shared/.bundle/b1/state/resources.json"
+    state_doc = {"state": {
+        # the shape a real CLI 1.5.0 resources.json uses
+        "resources.alerts.dab_alert": {"__id__": "999", "state": {"display_name": "dab_alert"}},
+        "resources.alerts.dab_alert.permissions": {"__id__": "/alertsv2/999", "state": {}},
+    }}
+    client = FakeClient(download_table={
+        "api/2.0/workspace/export": lambda p: (
+            _json.dumps(state_doc).encode() if p.get("path") == state_path else b"")})
+
+    # exactly what sql_collector emits: sql_type="alert", no parent_path from the list call
+    objects = {"sql": [
+        {"sql_type": "alert", "id": "999", "name": "dab_alert", "_natural_key": "dab_alert",
+         "deployed_by_dab": False, "dab_scope": ""},
+        {"sql_type": "alert", "id": "111", "name": "hand_made", "_natural_key": "hand_made",
+         "deployed_by_dab": False, "dab_scope": ""},
+        # a warehouse in the same mixed bucket must not be disturbed
+        {"sql_type": "warehouse", "id": "999", "name": "wh", "_natural_key": "wh",
+         "deployed_by_dab": False, "dab_scope": ""},
+    ]}
+    runner = InventoryRunner.__new__(InventoryRunner)
+    runner.client = client
+    runner._stamp_dab_ownership(objects, {state_path})
+
+    by_name = {r["name"]: r for r in objects["sql"]}
+    assert by_name["dab_alert"]["deployed_by_dab"] is True, \
+        "bundle-owned alert must be stamped from the state file"
+    assert by_name["dab_alert"]["dab_scope"] == "shared"
+    assert by_name["hand_made"]["deployed_by_dab"] is False, "hand-made alert must stay Manual"
+    # id 999 collides with the alert's id on purpose: the mixed `sql` bucket must be filtered by
+    # sql_type, or a warehouse would inherit an alert's DAB claim.
+    assert by_name["wh"]["deployed_by_dab"] is False, \
+        "warehouse must not inherit the alert's claim on the same id"
+
+    # and the exported unit must then carry the skip-on-import action
+    from src.exporters.asset_export import build_all
+    unit = build_all({"sql": [by_name["dab_alert"] | {"_raw": {"display_name": "dab_alert"}}]})
+    au = unit["alert_v2"][0]
+    assert au["export_status"] == "dab" and au["import_action"] == "dab_redeploy"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

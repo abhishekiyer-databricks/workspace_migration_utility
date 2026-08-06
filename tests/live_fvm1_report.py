@@ -4,7 +4,7 @@ element created by tests/fixtures_fvm1.py is present in the export bundle with t
 status. Produces a per-element PASS/FAIL test report.
 
 Run: python3 -m tests.live_fvm1_report
-Needs the `fvm1` CLI profile authenticated.
+Needs the source CLI profile authenticated (WSMIG_PROFILE, default `source_ws`).
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from src.collectors.inventory_runner import InventoryRunner
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.export_runner import ExportRunner
 
-PROFILE = "fvm1"
+PROFILE = os.environ.get("WSMIG_PROFILE", "source_ws")
 
 
 def _profile():
@@ -70,12 +70,21 @@ def run_export():
 EXPECT = [
     # identity
     ("user", "aman.bansal@databricks.com", {"success"}),
-    ("user", "vivek.ravichandran@databricks.com", {"success"}),
+    ("user", "vivek.ravichandran@databricks.com", {"success"}),   # the NON-Entra user
+    ("user", "vivek.ravichandiran@databricks.com", {"success"}),  # Entra/SCIM-provisioned
     ("user", "sanket.kelkar@databricks.com", {"success"}),
     ("user", "idris.chakera@databricks.com", {"success"}),
+    # Databricks-managed groups, incl. a THREE-level nest (grandchild → child → parent)
+    ("group", "wsmig_test_grandchild_grp", {"success"}),
     ("group", "wsmig_test_child_grp", {"success"}),
     ("group", "wsmig_test_parent_grp", {"success"}),
     ("group", "wsmig_test_plain_grp", {"success"}),
+    # mixed-member group: user + SP + nested Entra-backed group
+    ("group", "wsmig_test_mixed_grp", {"success"}),
+    # Entra-backed groups carry an externalId, so they must already exist on target → assign,
+    # not create. They come from the ACCOUNT (workspace SCIM drops externalId on create).
+    ("group", "wsmig_test_entra_grp", {"success", "covered"}),
+    ("group", "wsmig_test_entra_grp2", {"success", "covered"}),
     # Built-in groups are never recreated (they exist on target) → `covered`, but their
     # MEMBERSHIP is exported separately so source admins actually become target admins.
     ("group", "admins", {"covered"}),
@@ -84,29 +93,44 @@ EXPECT = [
     # SPNs: natural_key is the applicationId (per the identity model), so match by the
     # displayName carried in the payload instead (handled specially in verify()).
     ("service_principal", "@displayName:wsmig_test_db_sp", {"success"}),      # db-managed
-    # NOTE: wsmig_test_entra_sp is NOT actually Entra-backed — workspace SCIM silently drops
-    # `externalId` on create, so a fixture cannot manufacture an account-managed SP. It
-    # correctly classifies as db_managed_sp. `ai27_umi` is a REAL Azure managed identity
-    # imported into the workspace, so it's the genuine assign_on_target case (checked below).
-    ("service_principal", "@displayName:wsmig_test_entra_sp", {"success"}),
+    ("service_principal", "@displayName:wsmig_test_db_sp2", {"success"}),     # db-managed
+    # `ai27_umi` is a REAL Azure managed identity assigned into the workspace from the account,
+    # so it carries an externalId and is the genuine assign-on-target case. A fixture cannot
+    # manufacture one: workspace SCIM silently drops `externalId` on create.
     ("service_principal", "@displayName:ai27_umi", {"success"}),              # real Azure UMI
     # compute
     ("instance_pool", "wsmig_test_pool", {"success"}),
+    ("instance_pool", "wsmig_test_pool_single", {"success"}),   # max_capacity=1
+    ("instance_pool", "wsmig_test_pool_nomax", {"success"}),    # no max_capacity at all
     ("cluster_policy", "wsmig_test_policy", {"success"}),
+    ("cluster_policy", "wsmig_test_policy_strict", {"success"}),
     ("cluster", "wsmig_test_cluster", {"success"}),
+    ("cluster", "wsmig_test_cluster_autoscale", {"success"}),
+    ("cluster", "wsmig_test_cluster_singlenode", {"success"}),
+    ("cluster", "wsmig_test_cluster_pooled", {"success"}),      # references a pool id
+    ("cluster", "wsmig_test_cluster_policied", {"success"}),    # references a policy id
     # workspace content — languages
     ("notebook", "wsmig_test/py_nb", {"success"}),
     ("notebook", "wsmig_test/sql_nb", {"success"}),
     ("notebook", "wsmig_test/scala_nb", {"success"}),
     ("notebook", "wsmig_test/r_nb", {"success"}),
+    ("notebook", "jupyter_nb", {"success"}),                     # .ipynb format
+    ("notebook", "deepest/nested_nb", {"success"}),              # deep path
+    ("notebook", "wsmig test spaced nb", {"success"}),           # space in the name
     ("workspace_file", "wsmig_test/config.json", {"success"}),
     ("workspace_file", "wsmig_test/data.csv", {"success"}),
+    ("workspace_file", "plain_no_extension", {"success"}),
+    ("workspace_file", "binary.bin", {"success"}),
     ("workspace_file", "wsmig_test_big_file.csv", {"success"}),          # 11MB file → success
     ("notebook", "wsmig_test_big_nb", {"skipped_oversize", "__absent__"}),  # >10MB nb → never created
     ("directory", "wsmig_test", {"success"}),
-    ("repo", "wsmig_test_repo", {"success"}),
+    # Git repos are inventoried + exported as METADATA only and are out of scope for import
+    # (customer decision 2026-08-05) → the correct status is `manual`, not `success`.
+    ("repo", "wsmig_test_repo", {"manual"}),
     # secrets
     ("secret_scope", "wsmig_test_scope", {"success"}),
+    ("secret_scope", "wsmig_test_scope_single", {"success"}),
+    ("secret_scope", "wsmig_test_scope_empty", {"success"}),
     ("secret_scope", "wsmig_test_akv_scope", {"success"}),   # AZURE_KEYVAULT-backed
     ("secret_value", "wsmig_test_scope/api_key", {"manual"}),
     ("secret_value", "wsmig_test_scope/db_pass", {"manual"}),
@@ -115,14 +139,23 @@ EXPECT = [
     ("legacy_query", "wsmig_test_legacy_q", {"success"}),
     ("legacy_alert", "wsmig_test_legacy_alert", {"success"}),
     ("alert_v2", "wsmig_test_alert_v2", {"success"}),
-    ("sql_warehouse", "", {"success"}),   # at least one warehouse
+    ("alert_v2", "wsmig_dab_alert", {"dab"}),
+    ("sql_warehouse", "wsmig_test_wh_pro", {"success"}),         # PRO, non-serverless
+    ("sql_warehouse", "wsmig_test_wh_classic", {"success"}),     # CLASSIC
+    ("sql_warehouse", "wsmig_test_wh_serverless", {"success"}),  # PRO, serverless
     # jobs (plain + DAB)
     ("job", "wsmig_test_single_job", {"success"}),
     ("job", "wsmig_test_multi_job", {"success"}),
+    ("job", "wsmig_test_scheduled_job", {"success"}),            # UNPAUSED schedule
+    ("job", "wsmig_test_params_job", {"success"}),               # params/tags/retries/notifs
+    ("job", "wsmig_test_existing_cluster_job", {"success"}),     # existing_cluster_id ref
+    ("job", "wsmig_test_jobcluster_job", {"success"}),           # shared job_clusters block
     ("job", "wsmig_dab_shared_job", {"dab"}),
     ("job", "wsmig_dab_user_job", {"dab"}),
     # dlt (plain + DAB)
     ("dlt_pipeline", "wsmig_test_pipeline", {"success"}),
+    ("dlt_pipeline", "wsmig_test_pipeline_continuous", {"success"}),
+    ("dlt_pipeline", "wsmig_test_pipeline_classic", {"success"}),
     ("dlt_pipeline", "wsmig_dab_shared_pipeline", {"dab"}),
     ("dlt_pipeline", "wsmig_dab_user_pipeline", {"dab"}),
     # dashboards (plain + DAB) + genie
@@ -133,10 +166,12 @@ EXPECT = [
     # DAB supports `genie_spaces` (CLI v1.10.0+) → bundle-owned, never re-created via REST.
     ("genie_space", "wsmig_dab_genie", {"dab"}),
     # DAB-managed PATHLESS assets — detected from the bundle state file, not from a path.
+    # NOTE: instance_pools / cluster_policies / sql queries are NOT bundle resource types
+    # (CLI 1.5.0), so a DAB-owned twin of those is impossible — they're manual-only by nature.
     ("cluster", "wsmig_dab_cluster", {"dab"}),
-    ("instance_pool", "wsmig_dab_pool", {"dab"}),
     ("sql_warehouse", "wsmig_dab_wh", {"dab"}),
     ("secret_scope", "wsmig_dab_scope", {"dab"}),
+    ("serving_endpoint", "wsmig_dab_endpoint", {"dab"}),
     # cluster libraries: pypi/maven re-resolve on target; a dbfs-backed jar is a dangling ref
     ("cluster_library", "pypi", {"success"}),
     ("cluster_library", "maven", {"success"}),
@@ -145,7 +180,10 @@ EXPECT = [
     ("serving_endpoint", "wsmig_test_ext_endpoint", {"success"}),
     # misc
     ("global_init_script", "wsmig_test_gis", {"success"}),
+    ("global_init_script", "wsmig_test_gis_enabled", {"success"}),
     ("workspace_conf", "enableExportNotebook", {"success"}),
+    ("workspace_conf", "enableWebTerminal", {"success"}),
+    ("workspace_conf", "maxTokenLifetimeDays", {"success"}),
 ]
 
 
@@ -157,7 +195,7 @@ def verify(root):
         by_type.setdefault(u["asset_type"], []).append(u)
 
     print("\n" + "=" * 78)
-    print("FINAL TEST REPORT — fvm1 source export")
+    print(f"FINAL TEST REPORT — source export ({PROFILE})")
     print("=" * 78)
     print(f"{'ASSET TYPE':<22}{'FIXTURE (natural_key)':<34}{'STATUS':<12}RESULT")
     print("-" * 78)
@@ -216,7 +254,7 @@ def verify(root):
     # Every unit must carry a valid import_action — the workbook renders it as a column on every
     # sheet, and an unknown/blank value shows as "—", which is the blank-cell failure the
     # customer rejected. A DAB unit specifically must say dab_redeploy.
-    from src.exporters.asset_export import IMPORT_ACTIONS
+    from src.exporters.asset_export import IMPORT_ACTIONS, is_dab_content_path
     bad_act = [(u["asset_type"], u["natural_key"], u.get("import_action"))
                for u in units if u.get("import_action") not in IMPORT_ACTIONS]
     print(f"Units with an invalid/missing import_action: {len(bad_act)}  {bad_act[:5]}")

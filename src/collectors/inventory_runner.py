@@ -102,12 +102,20 @@ class InventoryRunner:
 
     # ── DAB ownership for pathless assets ─────────────────────────────────
     # (collector bucket, id field, asset_type as the bundle state names it)
+    # For the mixed `sql` bucket: asset_type → the `sql_type` the collector stamps on records.
+    _SQL_TYPE_FOR = {"sql_warehouse": "warehouse", "alert_v2": "alert"}
     _DAB_STAMP_TARGETS = (
         ("compute", "instance_pool_id", "instance_pool"),
         ("compute", "cluster_id", "cluster"),
         ("secret_scope", "name", "secret_scope"),
         ("serving_endpoint", "name", "serving_endpoint"),
         ("sql", "id", "sql_warehouse"),
+        # Alerts V2 need the state file too, even though an alert HAS a workspace path:
+        # `GET /api/2.0/alerts` (the LIST call) omits `parent_path` entirely — only GET-by-id
+        # returns it — so sql_collector's path-based detection can never fire for them.
+        # Verified live 2026-08-06; without this a DAB-deployed alert is classified Manual and
+        # the importer would DUPLICATE an alert the customer's bundle redeploys.
+        ("sql", "id", "alert_v2"),
     )
 
     def _stamp_dab_ownership(self, objects_by_type: dict, bundle_state_paths: set) -> None:
@@ -127,7 +135,9 @@ class InventoryRunner:
                 # only consider records of the right kind within a mixed bucket
                 if bucket == "compute" and not str(rec.get(id_field) or "").strip():
                     continue
-                if bucket == "sql" and rec.get("sql_type") != "warehouse":
+                # The `sql` bucket is mixed (warehouses, queries, alerts, dashboards), so only
+                # look at the sql_type this target is about.
+                if bucket == "sql" and rec.get("sql_type") != self._SQL_TYPE_FOR[asset_type]:
                     continue
                 if reg.owns(asset_type, rec.get(id_field)):
                     rec["deployed_by_dab"] = True
