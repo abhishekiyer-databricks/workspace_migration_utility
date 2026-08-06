@@ -102,17 +102,21 @@ def _assign_to_workspace(principal_id, permissions=("USER",)):
 
 
 def _aad_object_id(name: str) -> tuple[str, str]:
-    """An Azure AD group objectId to back an Entra-classified Databricks group.
+    """An externalId to back an Entra-classified Databricks group.
 
-    Preference order, best fidelity first:
-      1. an AAD group of our own with this name (created if we're allowed to),
-      2. a REAL pre-existing AAD group in the tenant, borrowed by objectId,
-      3. a synthetic uuid.
+    Uses an AAD group of our OWN if we can make one, otherwise a **synthetic uuid**.
 
-    Step 1 needs Graph group-create rights, which a GUEST (`#EXT#`) account in the tenant does
-    NOT have — it fails `Authorization_RequestDenied`. That's an environment limitation, not a
-    code bug: the collector classifies on the PRESENCE of externalId, so a borrowed real
-    objectId exercises exactly the same Entra/SCIM path.
+    NEVER borrow a real pre-existing AAD group's objectId. Tried that on 2026-08-06 and it did
+    real damage: Entra SCIM recognises the objectId as a group it manages, takes ownership of the
+    Databricks group and RENAMES it to the real group's name — so `wsmig_test_entra_grp` silently
+    became someone else's `aso_ril_1` demo group, entangling fixtures with live directory objects.
+    (No Azure-side harm — we only ever create Databricks-side objects — but the fixture is gone
+    and a stranger's group appears in the workspace.)
+
+    A synthetic uuid is what we want anyway: the collector classifies on the PRESENCE of
+    `externalId`, not on what it resolves to, so this exercises the identical Entra/SCIM path with
+    nothing for a connector to claim. Creating our own group needs Graph group-create rights,
+    which a GUEST (`#EXT#`) account in the tenant does not have (`Authorization_RequestDenied`).
     """
     import uuid
 
@@ -125,44 +129,37 @@ def _aad_object_id(name: str) -> tuple[str, str]:
     if not r.returncode:
         return json.loads(r.stdout)["id"], "own AAD group (created)"
 
-    r = _az("ad", "group", "list", "--query", "[].id", "-o", "json")
-    if not r.returncode:
-        ids = sorted(json.loads(r.stdout) or [])
-        if ids:
-            # Stable pick, so re-runs bind the same AAD group to the same name. Python's hash()
-            # is salted per process and would pick a different group on every run.
-            import hashlib
-            digest = hashlib.sha256(name.encode()).hexdigest()
-            return ids[int(digest, 16) % len(ids)], "borrowed real AAD group (no create rights)"
-
-    return str(uuid.uuid4()), "SYNTHETIC (no AAD access)"
+    # Deterministic per name, so a re-run reuses the same externalId instead of churning it.
+    synthetic = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wsmig-fixture-entra-group/{name}"))
+    return synthetic, "synthetic uuid (no AAD create rights; never a borrowed real group)"
 
 
-def _entra_group(name: str, aad_members: list[str] | None = None) -> str | None:
+def _entra_group(name: str, members: list[str] | None = None) -> str | None:
     """An Entra-backed Databricks group.
 
     The collector classifies a group as Entra/SCIM-managed by the presence of `externalId`, and
-    the WORKSPACE SCIM API silently drops it — so this has to be an ACCOUNT group carrying a real
-    Azure AD objectId, then assigned into the workspace.
+    the WORKSPACE SCIM API silently drops it — so this has to be an ACCOUNT group carrying an
+    externalId, then assigned into the workspace.
     """
     object_id, provenance = _aad_object_id(name)
     log(f"entra group {name}: externalId={object_id} ({provenance})")
 
-    for upn in (aad_members or []):
-        m = _az("ad", "user", "show", "--id", upn, "-o", "json")
-        if not m.returncode:
-            _az("ad", "group", "member", "add", "--group", object_id,
-                "--member-id", json.loads(m.stdout)["id"], "-o", "none")
-
     a = _acct()
+    # Match on externalId as well as displayName: if a connector ever renames our group, looking
+    # up by name alone would miss it and create a duplicate on every re-run.
     existing = next(iter(a.groups.list(filter=f'displayName eq "{name}"')), None)
+    if existing is None:
+        existing = next((g for g in a.groups.list() if g.external_id == object_id), None)
+        if existing is not None:
+            log(f"  found by externalId under a DIFFERENT name: {existing.display_name!r} "
+                f"— a SCIM connector has claimed it")
     if existing:
-        log(f"account group exists: {name} (id={existing.id}, ext={existing.external_id})")
+        log(f"account group exists: {existing.display_name!r} "
+            f"(id={existing.id}, ext={existing.external_id})")
         gid = existing.id
     else:
-        from databricks.sdk.service import iam
         g = a.groups.create(display_name=name, external_id=object_id)
-        log(f"account group created: {name} (id={g.id}, ext={object_id} ← real Entra objectId)")
+        log(f"account group created: {name} (id={g.id}, ext={object_id})")
         gid = g.id
     try:
         _assign_to_workspace(gid)
@@ -216,9 +213,9 @@ def phase_identity():
         except Exception as e:
             log(f"  entitlements {email}: {str(e)[:90]}")
 
-    # 2. Entra-backed groups (real AAD object → account group → assigned to workspace).
-    _entra_group("wsmig_test_entra_grp", aad_members=[ME, ENTRA_USERS[0]])
-    _entra_group("wsmig_test_entra_grp2", aad_members=[ENTRA_USERS[1]])
+    # 2. Entra-backed groups (account group carrying an externalId → assigned to workspace).
+    _entra_group("wsmig_test_entra_grp")
+    _entra_group("wsmig_test_entra_grp2")
 
     # 3. Databricks-managed groups (workspace-local, no externalId) + entitlements
     def mk_group(name, entitlements=None, members=None):
