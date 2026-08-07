@@ -21,7 +21,7 @@ def _run_ok(coll):
 
 def test_identity_and_classifier():
     from src.collectors.identity_collector import IdentityCollector
-    from src.identity.classifier import classify_all, IdentityClass
+    from src.identity.classifier import classify_all, IdentityKind
     scim = {
         "Users": [{"id": "u1", "userName": "alice@corp.com",
                    "emails": [{"value": "alice@corp.com", "primary": True}],
@@ -30,13 +30,18 @@ def test_identity_and_classifier():
             {"id": "s1", "applicationId": "app-entra", "displayName": "umi", "externalId": "e"},
             {"id": "s2", "applicationId": "app-dbx", "displayName": "dbx"}],
         "Groups": [
+            # Account group, Entra-backed. `meta.resourceType` (NOT externalId) is the signal.
             {"id": "g1", "displayName": "acct", "externalId": "eg",
+             "meta": {"resourceType": "Group"},
              "members": [{"value": "u1", "display": "alice@corp.com", "$ref": "Users/u1"}]},
-            {"id": "g2", "displayName": "eng", "members": [
+            {"id": "g2", "displayName": "eng", "meta": {"resourceType": "WorkspaceGroup"},
+             "members": [
                 {"value": "g1", "display": "acct", "$ref": "Groups/g1"},
                 {"value": "app-dbx", "display": "dbx", "$ref": "ServicePrincipals/s2"}]},
-            {"id": "g3", "displayName": "admins", "members": []},   # built-in — never recreate
-            {"id": "g4", "displayName": "users", "members": []}],   # built-in — never recreate
+            {"id": "g3", "displayName": "admins", "members": [],
+             "meta": {"resourceType": "WorkspaceGroup"}},   # built-in — never recreate
+            {"id": "g4", "displayName": "users", "members": [],
+             "meta": {"resourceType": "WorkspaceGroup"}}],   # built-in — never recreate
     }
     # SP OAuth-secrets proxy: s2 has a secret, s1 has none (Plan 1a §6).
     gt = {"api/2.0/accounts/servicePrincipals/s2/credentials/secrets":
@@ -50,28 +55,31 @@ def test_identity_and_classifier():
     sps = {o.get("applicationId"): o for o in objs if o.get("identity_type") == "service_principal"}
     assert sps["app-dbx"]["has_secrets"] is True and sps["app-entra"]["has_secrets"] is False
     classify_all(objs)
-    byname = {(o.get("userName") or o.get("applicationId") or o.get("displayName")): o["classification"] for o in objs}
-    assert byname["alice@corp.com"] == IdentityClass.ENTRA_USER.value
-    assert byname["app-entra"] == IdentityClass.UMI_OR_ENTRA_SP.value
-    assert byname["app-dbx"] == IdentityClass.DB_MANAGED_SP.value
-    assert byname["acct"] == IdentityClass.ACCOUNT_GROUP.value
-    assert byname["eng"] == IdentityClass.DB_MANAGED_GROUP.value
-    assert byname["admins"] == IdentityClass.BUILTIN_GROUP.value
-    assert byname["users"] == IdentityClass.BUILTIN_GROUP.value
+    byname = {(o.get("userName") or o.get("applicationId") or o.get("displayName")): o["kind"]
+              for o in objs}
+    # Users and SPs are ALWAYS account principals (Plan 6 F3) — externalId is irrelevant here, so
+    # the Entra SP and the Databricks SP classify identically.
+    assert byname["alice@corp.com"] == IdentityKind.ACCOUNT.value
+    assert byname["app-entra"] == IdentityKind.ACCOUNT.value
+    assert byname["app-dbx"] == IdentityKind.ACCOUNT.value
+    # Groups split on meta.resourceType, not externalId.
+    assert byname["acct"] == IdentityKind.ACCOUNT.value
+    assert byname["eng"] == IdentityKind.WORKSPACE_LOCAL.value
+    assert byname["admins"] == IdentityKind.SYSTEM.value
+    assert byname["users"] == IdentityKind.SYSTEM.value
 
 
-def test_azure_umi_sp_classifies_as_account_managed():
-    """A real Azure managed identity imported as a Databricks SP must be ASSIGN, not CREATE.
+def test_every_sp_is_account_managed_regardless_of_externalId():
+    """Both an Azure UMI and a "Databricks-managed" SP must ASSIGN (adopt by appId), never CREATE.
 
-    Verbatim SCIM shape of `ai27_umi` on fvm1 (a UMI created in Azure then imported into the
-    workspace) — the first genuinely account-managed SP available to test against. Two details
-    the synthetic fixture missed:
-      * the workspace SCIM API returns `externalId: null` (an explicit JSON null) for
-        Databricks-managed SPs, not an absent key — `_has_external_id` must treat both alike;
-      * classification must flow through to `import_action`, since recreating a UMI on the
-        target would mint a NEW appId and silently break every ACL that referenced it.
+    Verbatim SCIM shapes from a live workspace. The old code split these on `externalId` and
+    "recreated" the second one — minting a NEW applicationId and orphaning every ACL that
+    referenced it. Plan 6 F3/F4 established that BOTH are account principals and both are adopted
+    by passing `applicationId`, so they classify identically and both get `adopt_or_assign` —
+    the label that means "no human step needed", as distinct from an account GROUP's
+    `assign_on_target`.
     """
-    from src.identity.classifier import classify_all, IdentityClass
+    from src.identity.classifier import classify_all, IdentityKind
     from src.exporters.asset_export import build_all
     objs = [
         {"identity_type": "service_principal", "id": "147404773209245",
@@ -89,20 +97,23 @@ def test_azure_umi_sp_classifies_as_account_managed():
     ]
     classify_all(objs)
     by_name = {o["displayName"]: o for o in objs}
-    assert by_name["ai27_umi"]["classification"] == IdentityClass.UMI_OR_ENTRA_SP.value
-    assert by_name["wsmig_test_db_sp"]["classification"] == IdentityClass.DB_MANAGED_SP.value
+    assert by_name["ai27_umi"]["kind"] == IdentityKind.ACCOUNT.value
+    assert by_name["wsmig_test_db_sp"]["kind"] == IdentityKind.ACCOUNT.value, \
+        "a 'Databricks-managed' SP is still an ACCOUNT principal — recreating it mints a new appId"
 
     units = {u["natural_key"]: u for u in build_all({"identity": objs})["service_principal"]}
     umi = units["5f491556-5401-4d38-b0b7-16ffd932f073"]
-    assert umi["import_action"] == "assign_on_target", \
+    assert umi["import_action"] == "adopt_or_assign", \
         "recreating a UMI would mint a new appId and orphan its ACLs"
-    assert units["18abea3e-5de8-4f74-b678-de67cf2270a2"]["import_action"] == "create"
+    assert units["18abea3e-5de8-4f74-b678-de67cf2270a2"]["import_action"] == "adopt_or_assign", \
+        "the Databricks-managed SP must ALSO be adopted by appId, not recreated"
     # the stable Azure appId is what the target assigns by, so it must survive the export
     assert umi["payload"]["applicationId"] == "5f491556-5401-4d38-b0b7-16ffd932f073"
 
     # and the report labels it as Entra-managed rather than blank
     from src.reports.inventory_view import _sp_managed
-    assert _sp_managed(by_name["ai27_umi"]["classification"]) == "Entra / UMI"
+    assert _sp_managed(by_name["ai27_umi"]["kind"],
+                       by_name["ai27_umi"]["entra_backed"]) == "Entra / UMI (account)"
 
 
 def test_compute():
@@ -338,8 +349,10 @@ def test_view_adapter_acls_and_managed_metadata():
     assert {"cluster", "job", "lakeview_dashboard", "genie_space", "legacy_query",
             "secret_scope"} <= otypes
     # Managed-by + new metadata surfaced as columns.
-    assert data["groups"][0]["_managed"] == "Databricks-managed"
-    assert data["service_principals"][0]["_managed"] == "Entra / UMI"
+    # These records carry the LEGACY classification values (no `kind`), so this also pins the
+    # back-compat path an old bundle relies on.
+    assert data["groups"][0]["_managed"] == "Workspace-local"
+    assert data["service_principals"][0]["_managed"] == "Entra / UMI (account)"
     assert data["service_principals"][0]["_has_secrets"] is True
     assert data["jobs"][0]["_deployed_by_dab"] is True
     assert data["clusters"][0]["_pinned"] is True and data["clusters"][0]["_acls"] == 2
@@ -427,3 +440,29 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_the_account_worklist_lists_ONLY_groups_and_says_who_fixes_each():
+    """Account GROUPS are the only identities that can still need a human (Plan 6).
+
+    Users and SPs are assigned automatically by the workspace SCIM POST, so listing them here would
+    send an operator chasing account-admin work that the tool already does. Each entry must also say
+    WHO fixes it — Entra SCIM for an externally-provisioned group, an account admin otherwise.
+    """
+    from src.identity.classifier import classify_all, needs_account_action
+    objs = [
+        {"identity_type": "group", "displayName": "acct-native", "resource_type": "Group"},
+        {"identity_type": "group", "displayName": "acct-entra", "resource_type": "Group",
+         "externalId": "entra-oid"},
+        {"identity_type": "group", "displayName": "ws-local", "resource_type": "WorkspaceGroup"},
+        {"identity_type": "group", "displayName": "admins", "resource_type": "WorkspaceGroup"},
+        {"identity_type": "user", "userName": "a@b.com"},
+        {"identity_type": "service_principal", "applicationId": "app-1"},
+    ]
+    classify_all(objs)
+    work = needs_account_action(objs)
+    names = [w["displayName"] for w in work]
+    assert names == ["acct-native", "acct-entra"], f"unexpected worklist: {names}"
+    by_name = {w["displayName"]: w for w in work}
+    assert "account admin" in by_name["acct-native"]["required_action"]
+    assert "Entra SCIM" in by_name["acct-entra"]["required_action"]

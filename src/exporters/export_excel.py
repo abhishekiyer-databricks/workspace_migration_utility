@@ -119,7 +119,8 @@ def _status_lookup(index: dict) -> dict:
 _IMPORT_ACTION_LABEL = {
     "create": "CREATE on target",
     "create_and_upload": "CREATE + UPLOAD content",
-    "assign_on_target": "ASSIGN (must pre-exist)",
+    "assign_on_target": "ASSIGN (must pre-exist in account)",
+    "adopt_or_assign": "AUTO — adopt/assign (no action needed)",
     "add_members": "ADD MEMBERS (group exists)",
     "dab_redeploy": "DAB REDEPLOY (import skips)",
     "via_native_asset": "NONE — via native asset",
@@ -138,7 +139,8 @@ _IMPORT_ACTION_FILL = {
     "install": "DCFCE7",             # green — the utility does it (attach to existing cluster)
     "set_conf": "DCFCE7",            # green — the utility does it (conf API)
     "apply_acl": "DCFCE7",           # green — the utility does it (permissions API)
-    "assign_on_target": "DBEAFE",    # blue  — account/IT prerequisite
+    "adopt_or_assign": "DCFCE7",     # green — the utility does it (POST adopts/assigns; appId kept)
+    "assign_on_target": "DBEAFE",    # blue  — account/IT prerequisite (account GROUPS only)
     "dab_redeploy": "DBEAFE",        # blue  — the customer's bundle pipeline owns it
     "via_native_asset": "CFFAFE",    # cyan  — happens as a side effect, no separate action
     "manual": "FEF3C7",              # amber — a human must do it on target
@@ -150,7 +152,7 @@ _IMPORT_ACTION_FILL = {
 # Actions whose cell should also show the unit's note: the note is where the actual caveat lives
 # ("UC tables must pre-exist", "copy the DBFS jar by hand", "client secret not exportable").
 _ACTION_SHOW_NOTE = {"manual", "dab_redeploy", "review_required", "assign_on_target",
-                     "create", "install"}
+                     "adopt_or_assign", "create", "install"}
 
 # Fail loudly if a new action is added to the producer without a label here — otherwise it would
 # render as "—", which is the blank-cell failure mode the customer explicitly rejected.

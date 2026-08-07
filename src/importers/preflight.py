@@ -180,13 +180,20 @@ class Preflight:
                       "no identity classification in the bundle — nothing to verify")
             return
 
+        # Plan 6: users and SPs no longer need pre-assignment — the workspace SCIM POST creates
+        # them at the account and assigns them, and an SP POST carrying `applicationId` ADOPTS the
+        # existing account SP with its id intact. So the only identity that can still block is an
+        # account GROUP, which must already exist in the target account before it can be assigned.
+        def _kind(identity: dict) -> str:
+            return safe_str(identity.get("kind")) or safe_str(identity.get("classification"))
+
         account_managed = [i for i in identities
-                           if safe_str(i.get("classification")) in
-                           ("entra_user", "umi_or_entra_sp", "account_group")]
+                           if i.get("identity_type") == "group"
+                           and _kind(i) in ("account", "account_group")]
         if not account_managed:
-            self._add("account identities present on target", True, DEGRADING,
-                      "the bundle has no account-managed identities — every identity is "
-                      "workspace-local and will be recreated by this tool")
+            self._add("account groups present on target account", True, DEGRADING,
+                      "the bundle has no account groups — every group is workspace-local and will "
+                      "be recreated by this tool; users and SPs are assigned automatically")
             return
 
         target_users, target_sps, target_groups = set(), set(), set()
@@ -201,32 +208,50 @@ class Preflight:
                       f"could not list target identities: {str(exc)[:200]}")
             return
 
-        missing = []
+        # A workspace-local group on TARGET holding an account group's name is worse than missing:
+        # it permanently blocks the assignment (Plan 6 F6) and needs a manual delete, so it is
+        # reported separately and as BLOCKING for that group.
+        target_group_kinds = {}
+        try:
+            for g in self.client.get_scim("Groups"):
+                target_group_kinds[safe_str(g.get("displayName"))] = safe_str(
+                    (g.get("meta") or {}).get("resourceType")).lower()
+        except Exception:  # noqa: BLE001 — already reported above if listing failed
+            pass
+
+        missing, shadowed = [], []
         for identity in account_managed:
-            cls = safe_str(identity.get("classification"))
-            if cls == "entra_user":
-                key = safe_str(identity.get("userName"))
-                present = key in target_users
-            elif cls == "umi_or_entra_sp":
-                key = safe_str(identity.get("applicationId"))
-                present = key in target_sps
-            else:
-                key = safe_str(identity.get("displayName"))
-                present = key in target_groups
-            if not present and key:
-                missing.append(f"{cls}:{key}")
+            key = safe_str(identity.get("displayName"))
+            if not key:
+                continue
+            if target_group_kinds.get(key) == "workspacegroup":
+                shadowed.append(key)
+            elif key not in target_groups:
+                missing.append(
+                    f"{key} ({'Entra/SCIM' if identity.get('entra_backed') else 'account admin'})")
+
+        if shadowed:
+            self._add(
+                "account groups not shadowed on target", False, BLOCKING,
+                f"{len(shadowed)} account group(s) already exist on the TARGET as WORKSPACE-LOCAL "
+                f"groups of the same name. That shadow permanently blocks assigning the real "
+                f"account group ('Workspace group with name X already exists'). Delete each "
+                f"workspace-local group on target, then re-run.", affected=shadowed)
+        else:
+            self._add("account groups not shadowed on target", True, BLOCKING,
+                      "no account group is shadowed by a workspace-local group of the same name")
 
         if missing:
             self._add(
-                "account identities present on target", False, DEGRADING,
-                f"{len(missing)} of {len(account_managed)} account-managed identities are NOT "
-                f"assigned to this workspace. This tool must not create them (creating an account "
-                f"SP mints a new applicationId and orphans every ACL), so each must be assigned by "
-                f"Entra SCIM or an account admin. Until then, their objects import but their GRANTS "
-                f"and group memberships will be incomplete.", affected=missing)
+                "account groups present on target account", False, DEGRADING,
+                f"{len(missing)} of {len(account_managed)} account groups are not yet in the "
+                f"target account/workspace. They cannot be created by this tool (that would make a "
+                f"workspace-local shadow), so Entra SCIM or an account admin must provision them; "
+                f"then re-run with retry_mode=failed_only. Users and SPs are unaffected — they are "
+                f"assigned automatically.", affected=missing)
         else:
-            self._add("account identities present on target", True, DEGRADING,
-                      f"all {len(account_managed)} account-managed identities are assigned")
+            self._add("account groups present on target account", True, DEGRADING,
+                      f"all {len(account_managed)} account groups are present")
 
     def check_account_admin_capability(self) -> None:
         """DEGRADING: account-admin is OPTIONAL — it only unlocks auto-assignment.

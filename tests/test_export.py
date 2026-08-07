@@ -139,29 +139,43 @@ def test_dab_owned_pathless_assets_are_not_recreated():
     assert units["secret_value"][0]["migration_mode"] == "manual"
 
 
-def test_identity_import_action_create_vs_assign():
-    """export_status=success only means "exported". `import_action` must carry create-vs-assign."""
+def test_identity_import_action_distinguishes_automatic_from_prerequisite():
+    """`import_action` must say who does the work, and users/SPNs vs account GROUPS differ.
+
+    `adopt_or_assign` = the utility handles it with no human step (the workspace SCIM POST creates
+    at the account and assigns; an SPN POST carrying applicationId adopts the existing account SPN).
+    `assign_on_target` = an account GROUP that must ALREADY exist in the target account, because the
+    utility must not create it (that makes a workspace-local shadow which permanently blocks the
+    real group). Collapsing both into one "must pre-exist" label sent operators chasing
+    account-admin work for every user and SPN that is in fact automatic.
+    """
     from src.exporters.asset_export import build_all
     ids = [
         {"identity_type": "user", "userName": "a@x.com", "id": "1",
-         "classification": "entra_user", "_raw": {"userName": "a@x.com"}},
+         "kind": "account", "_raw": {"userName": "a@x.com"}},
         {"identity_type": "user", "userName": "b@x.com", "id": "2",
-         "classification": "needs_review", "_raw": {"userName": "b@x.com"}},
+         "kind": "needs_review", "_raw": {"userName": "b@x.com"}},
         {"identity_type": "service_principal", "applicationId": "app1", "id": "3",
-         "classification": "db_managed_sp", "_raw": {"applicationId": "app1"}},
-        {"identity_type": "service_principal", "applicationId": "app2", "id": "4",
-         "classification": "umi_or_entra_sp", "_raw": {"applicationId": "app2"}},
+         "kind": "account", "_raw": {"applicationId": "app1"}},
+        {"identity_type": "group", "displayName": "acct-grp", "id": "5",
+         "kind": "account", "resource_type": "Group", "_raw": {"displayName": "acct-grp"}},
+        {"identity_type": "group", "displayName": "ws-grp", "id": "6",
+         "kind": "workspace_local", "resource_type": "WorkspaceGroup",
+         "_raw": {"displayName": "ws-grp"}},
     ]
     u = build_all({"identity": ids})
     users = {x["natural_key"]: x for x in u["user"]}
     sps = {x["natural_key"]: x for x in u["service_principal"]}
+    groups = {x["natural_key"]: x for x in u["group"]}
     # everything was exported fine...
     assert all(x["export_status"] == "success" for x in list(users.values()) + list(sps.values()))
-    # ...but the target action differs
-    assert users["a@x.com"]["import_action"] == "assign_on_target"
+    # ...but the target action differs, and AUTOMATIC must not read as a prerequisite
+    assert users["a@x.com"]["import_action"] == "adopt_or_assign"
     assert users["b@x.com"]["import_action"] == "review_required"
-    assert sps["app1"]["import_action"] == "create"
-    assert sps["app2"]["import_action"] == "assign_on_target"
+    assert sps["app1"]["import_action"] == "adopt_or_assign"
+    assert groups["ws-grp"]["import_action"] == "create"
+    assert groups["acct-grp"]["import_action"] == "assign_on_target", \
+        "an account GROUP is the ONE identity that can still need an account admin"
 
 
 def test_every_unit_has_a_known_import_action():
@@ -1165,3 +1179,65 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_managed_by_labels_cover_every_kind_in_BOTH_html_and_excel():
+    """The "Managed By" column must never show a raw internal value like "account".
+
+    HTML and Excel each used to keep their OWN copy of this label map, and both knew only the
+    pre-Plan-6 vocabulary — so a new `kind` fell through to `str(value)` and rendered as the raw
+    string. They now share one map; this pins that every kind has a human label in both.
+    """
+    from src.reports.inventory_view import MANAGED_BY_LABEL, managed_by_label
+    from src.identity.classifier import IdentityKind
+    for kind in IdentityKind:
+        assert kind.value in MANAGED_BY_LABEL, f"`{kind.value}` has no Managed By label"
+        assert managed_by_label(kind.value) != kind.value, \
+            f"`{kind.value}` renders as its raw internal value"
+    # the legacy vocabulary must still render, so old reports/bundles stay readable
+    for legacy in ("entra_user", "umi_or_entra_sp", "db_managed_sp", "account_group",
+                   "db_managed_group", "builtin_group"):
+        assert managed_by_label(legacy) != legacy
+
+    # and the two renderers must agree, character for character
+    from src.reports.html_generator import _cell_html as html_cell
+    from src.exporters.excel_generator import _cell_text as excel_cell
+    for kind in IdentityKind:
+        excel = str(excel_cell(kind.value, "cls_managed"))
+        assert excel in html_cell(kind.value, "cls_managed"), \
+            f"HTML and Excel disagree on the label for `{kind.value}`"
+
+
+def test_import_action_labels_cover_the_closed_vocabulary():
+    """Every action in IMPORT_ACTIONS needs an Excel label, or it silently renders as "—"."""
+    from src.exporters.asset_export import IMPORT_ACTIONS
+    from src.exporters.export_excel import _IMPORT_ACTION_LABEL, _IMPORT_ACTION_FILL
+    for action in IMPORT_ACTIONS:
+        assert action in _IMPORT_ACTION_LABEL, f"`{action}` has no Excel label"
+        assert action in _IMPORT_ACTION_FILL, f"`{action}` has no Excel fill colour"
+    # the automatic path must NOT be coloured/worded as a human prerequisite
+    assert "must pre-exist" not in _IMPORT_ACTION_LABEL["adopt_or_assign"]
+    assert _IMPORT_ACTION_FILL["adopt_or_assign"] == _IMPORT_ACTION_FILL["create"], \
+        "adopt_or_assign is fully automatic, so it must be green like create — not prerequisite blue"
+    assert "pre-exist" in _IMPORT_ACTION_LABEL["assign_on_target"]
+
+
+def test_payload_files_carry_the_fields_import_branches_on():
+    """Export writes TWO places — the index (ledger) and the per-asset payload files — and the
+    importer merges them. `_artifact_unit`'s allowlist decides what survives into the payload file.
+
+    `kind` was missing from it, so import got the field only from the index. Anything reading the
+    payload file (and the runner's carry-over list does) would have seen no `kind` and degraded every
+    group to NEEDS_REVIEW. Both allowlists must agree on the identity fields.
+    """
+    from src.exporters.export_runner import ExportRunner
+    from src.importers.import_runner import ImportRunner
+    unit = {"asset_type": "group", "natural_key": "g", "payload": {}, "kind": "account",
+            "entra_backed": True, "members_are_account_owned": True,
+            "workspace_permissions": ["ADMIN"], "externalId": "oid", "classification": "account"}
+    written = ExportRunner._artifact_unit(unit)
+    for field in ("kind", "entra_backed", "members_are_account_owned", "workspace_permissions"):
+        assert field in written, f"`{field}` is dropped when writing the payload file"
+        # ...and the importer must actually pick it up off that file
+        assert field in ImportRunner._PAYLOAD_CARRY_FIELDS, \
+            f"`{field}` is written but never merged back onto the unit"

@@ -50,12 +50,22 @@ def _store(cfg):
     return st
 
 
-def _scim_client(users=(), sps=(), groups=(), warehouses=(("wh-1", "target-wh"),)):
+def _scim_client(users=(), sps=(), groups=(), warehouses=(("wh-1", "target-wh"),),
+                 account_groups=()):
+    """`groups` are workspace-local on target; `account_groups` are assigned account groups.
+
+    The distinction matters: a workspace-local group holding an ACCOUNT group's name is the shadow
+    that permanently blocks assignment (Plan 6 F6), so preflight must tell them apart via
+    `meta.resourceType` exactly as the live API does.
+    """
     client = RecordingClient(get_table={
         "api/2.0/sql/warehouses": {"warehouses": [{"id": i, "name": n} for i, n in warehouses]},
         "scim:Users": [{"userName": u} for u in users],
         "scim:ServicePrincipals": [{"applicationId": s} for s in sps],
-        "scim:Groups": [{"displayName": g} for g in groups],
+        "scim:Groups": ([{"displayName": g, "meta": {"resourceType": "WorkspaceGroup"}}
+                         for g in groups]
+                        + [{"displayName": g, "meta": {"resourceType": "Group"}}
+                           for g in account_groups]),
     })
     return client
 
@@ -116,26 +126,49 @@ def test_a_target_without_admin_rights_is_BLOCKING():
     assert _find(report, "workspace-admin")["grade"] == BLOCKING
 
 
-def test_a_missing_account_identity_is_DEGRADING_and_NAMES_the_identities():
-    """WARN not BLOCK, because the fix is a customer-IT action and the rest is still worth running —
-    but each missing identity must name itself, or the finding is unactionable."""
+def test_a_missing_account_GROUP_is_DEGRADING_and_NAMES_it():
+    """An account GROUP is the only identity that can still be a prerequisite (Plan 6).
+
+    Users and SPs are assigned automatically — the workspace SCIM POST creates them at the account,
+    and an SP POST carrying `applicationId` adopts the existing account SP. So neither may appear
+    here any more; only a group absent from the target account can hold up the migration, and it
+    must NAME itself or the finding is unactionable.
+    """
     cfg, aw = _bundle(files={
         "identity_classification.json": {"identities": [
-            {"identity_type": "user", "userName": "present@corp.com",
-             "classification": "entra_user"},
-            {"identity_type": "user", "userName": "absent@corp.com", "classification": "entra_user"},
-            {"identity_type": "service_principal", "applicationId": "umi-app",
-             "classification": "umi_or_entra_sp"},
+            {"identity_type": "group", "displayName": "present-grp", "kind": "account"},
+            {"identity_type": "group", "displayName": "absent-grp", "kind": "account"},
+            {"identity_type": "group", "displayName": "entra-grp", "kind": "account",
+             "entra_backed": True},
+            # Neither of these may ever be reported as a prerequisite again.
+            {"identity_type": "user", "userName": "anyone@corp.com", "kind": "account"},
+            {"identity_type": "service_principal", "applicationId": "umi-app", "kind": "account"},
         ]}})
-    report = Preflight(_scim_client(users=["present@corp.com"]), cfg, aw,
+    report = Preflight(_scim_client(account_groups=["present-grp"]), cfg, aw,
                        state=_store(cfg)).run()
-    finding = _find(report, "account identities present")
+    finding = _find(report, "account groups present")
     assert finding["grade"] == DEGRADING and not finding["ok"]
-    assert report["verdict"] == GO_WITH_WARNINGS, "a missing account identity must not BLOCK"
-    assert "entra_user:absent@corp.com" in finding["affected_units"]
-    assert "umi_or_entra_sp:umi-app" in finding["affected_units"]
-    assert "present@corp.com" not in str(finding["affected_units"])
-    assert "orphans every ACL" in finding["detail"], "the WHY must be stated"
+    assert report["verdict"] == GO_WITH_WARNINGS, "a missing account group must not BLOCK"
+    affected = str(finding["affected_units"])
+    assert "absent-grp" in affected and "entra-grp" in affected
+    assert "present-grp" not in affected
+    # each names WHO must fix it
+    assert "Entra/SCIM" in affected and "account admin" in affected
+    assert "anyone@corp.com" not in affected and "umi-app" not in affected, \
+        "users and SPs are assigned automatically and must not be reported as prerequisites"
+
+
+def test_an_account_group_shadowed_on_target_is_BLOCKING_in_preflight():
+    """A workspace-local group squatting an account group's name blocks the assignment forever, so
+    it must be caught BEFORE import writes anything."""
+    cfg, aw = _bundle(files={
+        "identity_classification.json": {"identities": [
+            {"identity_type": "group", "displayName": "corp-analysts", "kind": "account"}]}})
+    client = _scim_client(groups=["corp-analysts"])
+    report = Preflight(client, cfg, aw, state=_store(cfg)).run()
+    finding = _find(report, "not shadowed")
+    assert finding["grade"] == BLOCKING and not finding["ok"]
+    assert "corp-analysts" in str(finding["affected_units"])
 
 
 def test_direct_mode_source_connectivity_is_BLOCKING_when_it_fails():

@@ -86,11 +86,18 @@ def _refreshing_client(profile: str) -> ApiClient:
     Harness-only concern: a live end-to-end run can outlast the CLI token, and a 403 halfway through
     would look like a tool bug. Production uses the runtime's managed notebook-context token.
     """
+    # 600s was too slack: an Azure CLI OAuth token can expire sooner than that, so there was a
+    # window where the provider happily served a DEAD token and every write 403'd "Invalid Token"
+    # mid-run (102 of them in one run) — which reads exactly like a tool bug. Refresh well inside
+    # the shortest plausible lifetime, and ask the CLI (which caches) rather than tracking expiry.
     cache = {"tok": _token(profile), "ts": time.time()}
 
     def provider():
-        if time.time() - cache["ts"] > 600:
-            cache["tok"] = _token(profile)
+        if time.time() - cache["ts"] > 120:
+            try:
+                cache["tok"] = _token(profile)
+            except Exception:  # noqa: BLE001 — keep the old token; the retry layer will surface it
+                pass
             cache["ts"] = time.time()
         return cache["tok"]
 
@@ -137,8 +144,12 @@ def _cfg(staging, run_id, *, dry_run, catalog, warehouse, import_assets="all",
                     "import_assets": [s.strip() for s in import_assets.split(",")],
                     "retry_mode": retry_mode, "force_full_import": force_full,
                     "preflight_enforce": False},
-        # Keep the live run bounded so it completes in minutes rather than an hour.
-        "max_workspace_items": 250, "max_ws_api_calls": 400,
+        # Keep the live run bounded so it completes in minutes rather than an hour. These MUST stay
+        # comfortably above the source workspace's real object count: at 250 the walk truncated
+        # before reaching /Shared's children, so the fixture notebook was never inventoried and two
+        # checks failed for a reason that had nothing to do with the code under test. Raise these if
+        # the fixture set grows again.
+        "max_workspace_items": 2000, "max_ws_api_calls": 3000,
         "ctx": {"workspace_url": _host(TARGET_PROFILE), "token": _token(TARGET_PROFILE)},
     })
 
@@ -374,7 +385,7 @@ def main(keep: bool = False) -> int:
         CHECKS.add("A", "inventory read the source over OAuth M2M",
                    sum(inv["counts"].values()) > 0, f"counts={inv['counts']}")
 
-        exp = ExportRunner(source_client, cfg_a, aw, content_fetch_workers=8).run()
+        exp = ExportRunner(source_client, cfg_a, aw, content_fetch_workers=4).run()
         CHECKS.add("A", "export produced a bundle", exp["total"] > 0,
                    f"{exp['total']} units, {exp['success']} captured, {exp['failure']} failed")
         CHECKS.add("A", "export had NO failures", exp["failure"] == 0,
@@ -471,6 +482,78 @@ def main(keep: bool = False) -> int:
                    f"users={len(id_map['user_map'])} groups={len(id_map['group_map'])} "
                    f"sps={len(id_map['sp_mapping'])}")
 
+        # ── identity PARITY: the Plan 6 contract, asserted against both live workspaces ──
+        # These were verified by hand while building Plan 6; encoding them here means a regression
+        # in create-vs-assign can never again pass this harness.
+        def _scim_all(cl, resource):
+            return cl.get_scim(resource)
+
+        # 1. Every SPN keeps its SOURCE applicationId. Omitting applicationId on create mints a new
+        #    one and orphans every ACL / job run_as / secret grant — invisible in any report.
+        src_apps = {safe(sp.get("applicationId"))
+                    for sp in _scim_all(source_client, "ServicePrincipals")}
+        tgt_apps = {safe(sp.get("applicationId"))
+                    for sp in _scim_all(target_client, "ServicePrincipals")}
+        missing_apps = sorted(a for a in src_apps if a and a not in tgt_apps)
+        CHECKS.add("C", "every source SPN exists on target with the SAME applicationId",
+                   not missing_apps,
+                   f"{len(src_apps & tgt_apps)}/{len(src_apps)} preserved; missing={missing_apps[:5]}")
+
+        # 2. Groups: an ACCOUNT group keeps its ACCOUNT id; a WORKSPACE-LOCAL group gets a NEW id.
+        #    A workspace-local group on target holding an account group's name is the shadow that
+        #    permanently blocks assignment, so identity of kind matters as much as presence.
+        def _groups(cl):
+            return {safe(g.get("displayName")):
+                    (safe(g.get("id")), safe((g.get("meta") or {}).get("resourceType")))
+                    for g in _scim_all(cl, "Groups")}
+        sg, tg = _groups(source_client), _groups(target_client)
+        wrong_kind, acct_id_changed, ws_id_reused = [], [], []
+        for name, (sid, srt) in sg.items():
+            if name in ("admins", "users") or name not in tg:
+                continue
+            tid, trt = tg[name]
+            if srt != trt:
+                wrong_kind.append(f"{name}: {srt}->{trt}")
+            elif srt == "Group" and tid != sid:
+                acct_id_changed.append(f"{name}: {sid}->{tid}")
+            elif srt == "WorkspaceGroup" and tid == sid:
+                ws_id_reused.append(name)
+        CHECKS.add("C", "no group changed KIND between source and target (no shadow groups)",
+                   not wrong_kind, str(wrong_kind[:5]))
+        CHECKS.add("C", "account groups kept their ACCOUNT id (assigned, not recreated)",
+                   not acct_id_changed, str(acct_id_changed[:5]))
+
+        # 3. Built-in group MEMBERSHIP must carry over, or a source admin is not an admin on target.
+        for builtin in ("admins", "users"):
+            def _members(cl, gname):
+                for g in _scim_all(cl, "Groups"):
+                    if safe(g.get("displayName")) == gname:
+                        return {safe(m.get("display")) for m in (g.get("members") or [])}
+                return set()
+            s_mem, t_mem = _members(source_client, builtin), _members(target_client, builtin)
+            CHECKS.add("C", f"`{builtin}` membership carried over to target",
+                       bool(s_mem) and not (s_mem - t_mem),
+                       f"source={len(s_mem)} target={len(t_mem)} missing={sorted(s_mem - t_mem)[:5]}")
+
+        # 4. Workspace ADMIN vs USER. It lives ONLY in permissionassignments, so without this an
+        #    admin-by-assignment silently migrates as a plain USER.
+        def _assignments(cl):
+            data = cl.get("api/2.0/preview/permissionassignments") or {}
+            out = {}
+            for a in data.get("permission_assignments", []) or []:
+                pr = a.get("principal") or {}
+                key = (safe(pr.get("group_name")) or safe(pr.get("user_name"))
+                       or safe(pr.get("service_principal_name")))
+                if key:
+                    out[key] = sorted(a.get("permissions") or [])
+            return out
+        s_pa, t_pa = _assignments(source_client), _assignments(target_client)
+        perm_bad = [f"{k}: src={v} tgt={t_pa.get(k)}" for k, v in s_pa.items()
+                    if t_pa.get(k) != v]
+        CHECKS.add("C", "workspace ADMIN/USER matches source for every principal",
+                   not perm_bad,
+                   f"{len(s_pa) - len(perm_bad)}/{len(s_pa)} match; mismatched={perm_bad[:5]}")
+
         # ── PHASE D: re-run ⇒ SKIP ─────────────────────────────────────────
         print("\n== PHASE D: RE-RUN with no source change (must SKIP, not duplicate) ==")
         cfg_d = _cfg(staging, run_id, dry_run=False, catalog=catalog, warehouse=warehouse,
@@ -498,7 +581,7 @@ def main(keep: bool = False) -> int:
         cfg_e_exp = _cfg(staging, run_id2, dry_run=True, catalog=catalog, warehouse=warehouse)
         aw_e = ArtifactWriter(cfg_e_exp)
         InventoryRunner(source_client, cfg_e_exp, aw_e).run()
-        ExportRunner(source_client, cfg_e_exp, aw_e, content_fetch_workers=8).run()
+        ExportRunner(source_client, cfg_e_exp, aw_e, content_fetch_workers=4).run()
 
         index2 = aw_e.read_json("export_index.json") or {}
         nb_unit2 = next((u for u in index2.get("units", [])

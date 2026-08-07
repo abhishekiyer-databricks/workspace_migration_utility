@@ -89,11 +89,11 @@ def _cell_html(value, fmt: str) -> str:
         color = "purple" if "Databricks" in s else ("green" if s else "gray")
         return f'<span class="badge badge-{color}">{_esc(s)}</span>' if s else '<span class="na">—</span>'
     if fmt == "cls_managed":
-        # Map a raw classification value to a friendly "Managed By" badge.
-        label = {"entra_user": "Entra / SCIM", "umi_or_entra_sp": "Entra / UMI",
-                 "db_managed_sp": "Databricks-managed", "account_group": "Account / Entra",
-                 "db_managed_group": "Databricks-managed", "builtin_group": "Built-in",
-                 "needs_review": "Needs review"}.get(str(value), str(value))
+        # Map a raw kind/classification to a friendly "Managed By" badge. The label map is shared
+        # with the Excel formatter so the two can't drift (they used to keep separate copies, and
+        # both knew only the pre-Plan-6 vocabulary).
+        from src.reports.inventory_view import managed_by_label
+        label = managed_by_label(value)
         color = ("purple" if "Databricks" in label else
                  "yellow" if label == "Needs review" else
                  "green" if label else "gray")
@@ -152,14 +152,39 @@ def _cell_html(value, fmt: str) -> str:
 # Identity classification badge (this utility's enhancement).
 # ---------------------------------------------------------------------------
 
+# What the utility DOES for each kind. Shown next to the badge because the kind alone doesn't tell
+# an operator whether they have work to do — and only ONE row here ever means they might.
+_KIND_ACTION = {
+    "account": "Adopted / assigned automatically (users and SPNs keep their key; account groups "
+               "must already exist in the target account)",
+    "workspace_local": "Recreated on the target, with members and entitlements",
+    "system": "Already exists on the target; membership is re-applied",
+    "needs_review": "Kind could not be determined — confirm before importing",
+    # legacy vocabulary, so an older report still renders
+    "entra_user": "Adopted / assigned automatically",
+    "umi_or_entra_sp": "Adopted / assigned automatically (applicationId preserved)",
+    "db_managed_sp": "Adopted / assigned automatically (applicationId preserved)",
+    "account_group": "Assigned to the workspace; must already exist in the target account",
+    "db_managed_group": "Recreated on the target, with members and entitlements",
+    "builtin_group": "Already exists on the target; membership is re-applied",
+}
+
+
 def _cls_badge(name: str) -> str:
+    """A readable "Managed By"-style badge for an identity kind.
+
+    Renders the friendly label, never the raw internal value: the summary keys are `kind` values
+    like `account`/`workspace_local`, which mean nothing to a reader. Green = the utility does it
+    unattended; blue = it recreates the object; amber = a human must look.
+    """
+    from src.reports.inventory_view import managed_by_label
     if name == "needs_review":
         color = "yellow"
-    elif name in ("entra_user", "umi_or_entra_sp", "account_group", "builtin_group"):
-        color = "green"
-    else:  # db_managed_sp / db_managed_group / unknown
-        color = "blue"
-    return f'<span class="badge badge-{color}">{_esc(name)}</span>'
+    elif name in ("workspace_local", "db_managed_group", "db_managed_sp"):
+        color = "blue"     # recreated on target
+    else:
+        color = "green"    # adopted/assigned, or already present
+    return f'<span class="badge badge-{color}">{_esc(managed_by_label(name))}</span>'
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +305,17 @@ def render_inventory(
     # ── Identity classification section (our enhancement) ────────────────
     if identity_summary:
         id_rows = "".join(
-            f"<tr><td>{_cls_badge(k)}</td><td><span class='count'>{v}</span></td></tr>"
+            f"<tr><td>{_cls_badge(k)}</td><td><span class='count'>{v}</span></td>"
+            f"<td>{_KIND_ACTION.get(k, '')}</td></tr>"
             for k, v in sorted(identity_summary.items()))
         classification_html = f"""
       <div class="classification-box">
         <h3>Identity classification</h3>
-        <p>How each source identity will be treated on the target (this utility's identity engine).</p>
-        <table class="cls-table"><thead><tr><th>Classification</th><th>Count</th></tr></thead>
+        <p>How each source identity will be treated on the target. Users and service principals are
+        handled automatically; only an <b>account group missing from the target account</b> needs a
+        human (an account admin or Entra SCIM).</p>
+        <table class="cls-table"><thead><tr><th>Managed By</th><th>Count</th>
+        <th>What the utility does</th></tr></thead>
         <tbody>{id_rows}</tbody></table>
       </div>"""
     else:

@@ -57,10 +57,8 @@ def _cell_text(value, fmt: str):
     if fmt in ("badge_state", "badge_type", "badge_lang", "badge_managed"):
         return str(value)
     if fmt == "cls_managed":
-        return {"entra_user": "Entra / SCIM", "umi_or_entra_sp": "Entra / UMI",
-                "db_managed_sp": "Databricks-managed", "account_group": "Account / Entra",
-                "db_managed_group": "Databricks-managed", "builtin_group": "Built-in",
-                "needs_review": "Needs review"}.get(str(value), str(value))
+        from src.reports.inventory_view import managed_by_label
+        return managed_by_label(value)
     if fmt == "count":
         return len(value) if isinstance(value, list) else 0
     if fmt == "first_email":

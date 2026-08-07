@@ -441,14 +441,16 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         for i in _by(identity, "identity_type", "user")]
     data["service_principals"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),
-               _managed=_sp_managed(i.get("classification")),
+               _managed=_sp_managed(i.get("kind") or i.get("classification"),
+                                                    bool(i.get("entra_backed"))),
                # NOT bool(): `None` means "could not check" (insufficient privilege) and must
                # stay distinct from a real False, or the report understates manual work.
                _has_secrets=i.get("has_secrets"))
         for i in _by(identity, "identity_type", "service_principal")]
     data["groups"] = [
         _merge(i, classification=i.get("classification"), _entitlements=_ent(i),
-               _managed=_group_managed(i.get("classification")),
+               _managed=_group_managed(i.get("kind") or i.get("classification"),
+                                                       bool(i.get("entra_backed"))),
                _member_count=i.get("member_count"),
                _nested=i.get("has_nested_groups"))
         for i in _by(identity, "identity_type", "group")]
@@ -549,17 +551,55 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
 # ── Metadata helpers (Entra-vs-Databricks-managed etc.) ───────────────────
 
-def _sp_managed(classification: Any) -> str:
-    """Human 'Managed by' label for a service principal (Entra/UMI vs Databricks-local)."""
-    return {"umi_or_entra_sp": "Entra / UMI",
-            "db_managed_sp": "Databricks-managed"}.get(classification, "")
+# Raw `kind` (Plan 6) / legacy `classification` → the friendly "Managed By" label. Defined ONCE here
+# and imported by both the HTML and Excel formatters, which previously each carried their own copy
+# and knew only the pre-Plan-6 vocabulary — so a new `kind` rendered as the raw string "account".
+MANAGED_BY_LABEL = {
+    # Plan 6 kinds
+    "account": "Account",
+    "workspace_local": "Workspace-local",
+    "system": "Built-in",
+    "needs_review": "Needs review",
+    # legacy classifications (older bundles / reports)
+    "entra_user": "Entra / SCIM",
+    "umi_or_entra_sp": "Entra / UMI",
+    "db_managed_sp": "Databricks (account)",
+    "account_group": "Account / Entra",
+    "db_managed_group": "Workspace-local",
+    "builtin_group": "Built-in",
+}
 
 
-def _group_managed(classification: Any) -> str:
-    """Human 'Managed by' label for a group (account/Entra vs Databricks-local vs built-in)."""
-    return {"account_group": "Account / Entra",
-            "db_managed_group": "Databricks-managed",
-            "builtin_group": "Built-in"}.get(classification, "")
+def managed_by_label(value) -> str:
+    """Friendly "Managed By" text for a raw kind/classification value."""
+    return MANAGED_BY_LABEL.get(str(value), str(value))
+
+
+def _sp_managed(kind: Any, entra_backed: bool = False) -> str:
+    """Human 'Managed by' label for a service principal.
+
+    Under Plan 6 every SP is an ACCOUNT principal (the workspace SCIM POST writes at the account),
+    so `kind` no longer distinguishes Entra from Databricks-native — `entra_backed` does. The
+    distinction is presentational only: both are adopted by `applicationId` on exactly the same
+    code path.
+    """
+    if kind in ("account", "umi_or_entra_sp", "db_managed_sp"):
+        # Legacy classifications still imply their origin; the new model reads entra_backed.
+        if entra_backed or kind == "umi_or_entra_sp":
+            return "Entra / UMI (account)"
+        return "Databricks (account)"
+    return ""
+
+
+def _group_managed(kind: Any, entra_backed: bool = False) -> str:
+    """Human 'Managed by' label for a group — the one identity where the kind changes behaviour."""
+    if kind in ("account", "account_group"):
+        return "Account / Entra" if (entra_backed or kind == "account_group") else "Account"
+    if kind in ("workspace_local", "db_managed_group"):
+        return "Workspace-local"
+    if kind in ("system", "builtin_group"):
+        return "Built-in"
+    return ""
 
 
 def _dab_label(rec: Dict[str, Any]) -> str:

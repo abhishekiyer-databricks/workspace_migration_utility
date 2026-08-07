@@ -48,12 +48,48 @@ class IdentityCollector(BaseCollector):
         # (scim_id, error) for every SP whose OAuth-secret check failed — collapsed into ONE
         # warning below, since the usual cause is a single missing privilege, not N problems.
         self._secret_check_failures: list[tuple] = []
+        # Read assignments FIRST so every identity below can be stamped with ADMIN vs USER.
+        self._assignments = self._permission_assignments()
         out: list[dict] = []
         out.extend(self._users(max_scim))
         out.extend(self._service_principals(max_scim))
         out.extend(self._groups(max_scim))
         self._warn_secret_check_failures()
         return out
+
+    # ── workspace permission assignments (ADMIN vs USER) ──────────────────
+    def _permission_assignments(self):
+        """`{principal_id: ["ADMIN"|"USER"]}` for every principal assigned to this workspace.
+
+        This is the ONLY place workspace ADMIN-vs-USER is visible — SCIM `entitlements` does not
+        carry it (Plan 6 F8), so without this an admin-by-assignment silently migrates as a plain
+        USER. `principal_id` equals the workspace SCIM `id` for users, SPs and groups alike (F6),
+        so it joins onto the identity rows with no new key.
+
+        Returns `None` (NOT `{}`) if the call fails. `{}` would read as "nobody has permissions"
+        and would silently downgrade every admin on target; unknown must stay distinguishable from
+        none — the same discipline as `_sp_has_secrets`.
+        """
+        try:
+            data = self.client.get("api/2.0/preview/permissionassignments")
+        except Exception as exc:  # noqa: BLE001 — never fail inventory over this
+            self.log.warning(
+                "could not read workspace permission assignments — ADMIN vs USER will be "
+                "reported as 'Could not check' (NOT as 'USER')", error=str(exc)[:200])
+            return None
+        out: dict = {}
+        for entry in (data or {}).get("permission_assignments", []) or []:
+            principal = entry.get("principal") or {}
+            pid = safe_str(principal.get("principal_id"))
+            if pid:
+                out[pid] = [p for p in (entry.get("permissions") or []) if p]
+        return out
+
+    def _permissions_for(self, scim_id: str):
+        """This identity's workspace permissions: `["ADMIN"]`/`["USER"]`, `[]`, or `None`."""
+        if self._assignments is None:
+            return None                      # could not check — must not read as "no permissions"
+        return self._assignments.get(safe_str(scim_id), [])
 
     def _warn_secret_check_failures(self) -> None:
         if not self._secret_check_failures:
@@ -134,9 +170,11 @@ class IdentityCollector(BaseCollector):
             "displayName": safe_str(u.get("displayName")),
             "email": safe_str(primary),
             "active": u.get("active", True),
-            "externalId": safe_str(u.get("externalId")),  # classifier signal
+            "externalId": safe_str(u.get("externalId")),  # reported only (entra_backed)
             "entitlements": _entitlements(u),
             "roles": _roles(u),
+            # ADMIN vs USER — invisible in SCIM entitlements, so it must come from here (F8).
+            "workspace_permissions": self._permissions_for(u.get("id")),
             "group_memberships": [g.get("display") for g in u.get("groups", [])],
             "_raw": u,
         }
@@ -149,9 +187,10 @@ class IdentityCollector(BaseCollector):
             "applicationId": safe_str(s.get("applicationId")),
             "displayName": safe_str(s.get("displayName")),
             "active": s.get("active", True),
-            "externalId": safe_str(s.get("externalId")),  # classifier signal
+            "externalId": safe_str(s.get("externalId")),  # reported only (entra_backed)
             "entitlements": _entitlements(s),
             "roles": _roles(s),
+            "workspace_permissions": self._permissions_for(scim_id),
             "has_secrets": self._sp_has_secrets(scim_id),  # OAuth secrets → manual on target
             "_raw": s,
         }
@@ -168,9 +207,14 @@ class IdentityCollector(BaseCollector):
             "identity_type": "group",
             "id": safe_str(g.get("id")),
             "displayName": safe_str(g.get("displayName")),
-            "externalId": safe_str(g.get("externalId")),  # classifier signal
+            "externalId": safe_str(g.get("externalId")),  # reported only (entra_backed)
+            # THE workspace-vs-account signal (Plan 6 F1): "WorkspaceGroup" | "Group". Free — it is
+            # already in the LIST response. Getting this wrong shadows an account group and blocks
+            # it permanently (F6), so it is captured verbatim and never inferred.
+            "resource_type": safe_str((g.get("meta") or {}).get("resourceType")),
             "entitlements": _entitlements(g),
             "roles": _roles(g),
+            "workspace_permissions": self._permissions_for(g.get("id")),
             "members": members,
             "member_count": len(members),
             "has_nested_groups": any(m["kind"] == "group" for m in members),

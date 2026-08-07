@@ -306,13 +306,16 @@ class ExportRunner:
     @staticmethod
     def _artifact_unit(u: dict) -> dict:
         """The unit as written into a per-asset payload file (payload kept; index-only noise out)."""
-        # `import_action` rides along with the payload, not just in the index: the importer
-        # reads these per-asset files to decide CREATE vs ASSIGN, and for an account-managed
-        # identity (Azure UMI / Entra SP) that distinction is load-bearing — creating one
-        # instead of assigning it mints a new applicationId and orphans its ACLs.
+        # `import_action` and `kind` ride along with the payload, not just in the index: the importer
+        # reads these per-asset files to decide CREATE vs ASSIGN, and that distinction is
+        # load-bearing. Creating an account SPN instead of adopting it mints a new applicationId and
+        # orphans its ACLs; POSTing an account GROUP makes a workspace-local shadow that permanently
+        # blocks assigning the real one. `members_are_account_owned` keeps import from patching an
+        # account group's account-global membership, and `entra_backed` only words the remediation.
         keep = ("asset_type", "natural_key", "source_id", "fingerprint", "migration_mode",
-                "content_ref", "content_route", "payload", "classification", "import_action",
-                "owner")
+                "content_ref", "content_route", "payload", "classification", "kind",
+                "entra_backed", "members_are_account_owned", "workspace_permissions", "externalId",
+                "import_action", "owner")
         return {k: u[k] for k in keep if k in u}
 
     # ── index (the ledger) ─────────────────────────────────────────────────

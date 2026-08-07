@@ -49,7 +49,15 @@ def _client() -> FakeClient:
         "Users": [{"id": "u1", "userName": "alice@corp.com", "emails": [{"value": "alice@corp.com", "primary": True}],
                    "externalId": "ext", "entitlements": [{"value": "allow-cluster-create"}]}],
         "ServicePrincipals": [{"id": "s2", "applicationId": "app-dbx", "displayName": "dbx"}],  # DB-managed
-        "Groups": [{"id": "g2", "displayName": "eng", "members": [{"value": "u1", "display": "alice@corp.com", "$ref": "Users/u1"}]}],
+        # meta.resourceType is what makes a group workspace-local vs account (Plan 6 F1).
+        "Groups": [{"id": "g2", "displayName": "eng", "meta": {"resourceType": "WorkspaceGroup"},
+                    "members": [{"value": "u1", "display": "alice@corp.com",
+                                 "$ref": "Users/u1"}]},
+                   # An ACCOUNT group, so the needs_account_action branch actually RUNS. Without one
+                   # here that code path was never executed offline and a NameError in it reached
+                   # the live run instead of the test suite.
+                   {"id": "g3", "displayName": "acct-grp", "meta": {"resourceType": "Group"},
+                    "members": []}],
     }
     c = FakeClient(get_table=get_table, paginated_table=paginated, scim_table=scim)
     c.get_table["api/2.0/permissions/jobs/j1"] = {"access_control_list": [{"all_permissions": [{"permission_level": "IS_OWNER"}]}]}
@@ -69,9 +77,10 @@ def test_inventory_end_to_end():
 
     # JSON artifacts exist + parse
     inv = json.load(open(f"{root}/inventory.json"))
-    assert inv["counts"]["identity"] == 3 and inv["counts"]["compute"] == 3
+    assert inv["counts"]["identity"] == 4 and inv["counts"]["compute"] == 3
     idc = json.load(open(f"{root}/identity_classification.json"))
-    assert idc["summary"].get("db_managed_sp") == 1 and idc["summary"].get("db_managed_group") == 1
+    assert idc["summary"].get("account") == 3 and idc["summary"].get("workspace_local") == 1
+    assert [a["displayName"] for a in idc["needs_account_action"]] == ["acct-grp"]
 
     # config_resolved.json must NOT contain the token
     cr = json.load(open(f"{root}/config_resolved.json"))

@@ -20,7 +20,8 @@ from src.collectors.secrets_collector import SecretsCollector
 from src.collectors.serving_collector import ServingCollector
 from src.collectors.sql_collector import SqlCollector
 from src.collectors.workspace_collector import WorkspaceCollector
-from src.identity.classifier import classify_all, classification_summary
+from src.identity.classifier import (classify_all, classification_summary,
+                                     needs_account_action)
 from src.utils.helpers import now_iso
 from src.utils.logger import get_logger
 
@@ -78,10 +79,19 @@ class InventoryRunner:
             "objects_by_type": objects_by_type,
             "collector_stats": stats,
         })
+        # The account worklist: account GROUPS are the only identities that can still need a human
+        # (users/SPs are assigned automatically by the workspace SCIM POST). Emitted at INVENTORY
+        # time so the gap is known before export/import rather than surfacing as an import failure.
+        account_actions = needs_account_action(identities)
         self.aw.write_json("identity_classification.json", {
             "summary": id_summary,
+            "needs_account_action": account_actions,
             "identities": [{k: v for k, v in o.items() if k != "_raw"} for o in identities],
         })
+        if account_actions:
+            _LOG.info("account groups requiring provisioning in the TARGET account",
+                      count=len(account_actions),
+                      groups=[a["displayName"] for a in account_actions][:10])
         self.aw.write_json("config_resolved.json", self.config.redacted())
 
         self._write_html(objects_by_type, counts, stats, id_summary, warnings)

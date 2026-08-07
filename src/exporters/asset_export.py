@@ -53,17 +53,35 @@ _MODE_STATUS = {"auto": "success", "content": "success", "manual": "manual", "da
 # status stays `success` for all of these (we DID export them) — this field carries the
 # create-vs-assign distinction so the report can't be misread as "the tool will create it".
 #   create           — the utility creates the object on target (new id minted)
-#   assign_on_target — account-level identity: it must ALREADY exist in the target account;
-#                      the utility assigns it to the workspace + sets entitlements, never creates
+#   adopt_or_assign  — account user/SPN: adopted/assigned AUTOMATICALLY by the workspace SCIM POST
+#   assign_on_target — account GROUP: must ALREADY exist in the target account; the utility assigns
+#                      it to the workspace + sets entitlements, but never creates it
 #   review_required   — low-confidence classification; a human must confirm before import
+#
+# Plan 6 kinds. `account` covers users, SPs and account groups alike: for users/SPs the workspace
+# SCIM POST itself performs the assignment (so no account admin is needed), while an account GROUP
+# is assigned via permissionassignments. Both are "assign_on_target" from the reader's point of
+# view — the utility does not mint a new identity.
+# `adopt_or_assign` vs `assign_on_target` — the distinction MATTERS to a reader planning the cutover:
+#   adopt_or_assign  (users/SPNs, and account groups already assigned) — FULLY AUTOMATIC. The
+#                    workspace SCIM POST creates-at-account-and-assigns, and an SPN POST carrying
+#                    applicationId adopts the existing account SPN. No account admin, no waiting.
+#   assign_on_target (account GROUPS) — the group must already exist in the TARGET ACCOUNT; the
+#                    utility assigns it, but cannot create it (that would make a blocking shadow).
+# Collapsing both into "ASSIGN (must pre-exist)" was misleading: it told the operator to chase
+# account-admin work for every user and SPN that the tool already does by itself.
 _IMPORT_ACTION_BY_CLASS = {
-    "entra_user": "assign_on_target",
-    "umi_or_entra_sp": "assign_on_target",
+    "account": "adopt_or_assign",          # overridden to assign_on_target for GROUPS below
+    "workspace_local": "create",
+    "system": "add_members",
+    "needs_review": "review_required",
+    # Legacy classifications, kept so a bundle exported by an older version still imports.
+    "entra_user": "adopt_or_assign",
+    "umi_or_entra_sp": "adopt_or_assign",
     "account_group": "assign_on_target",
     "db_managed_sp": "create",
     "db_managed_group": "create",
     "builtin_group": "assign_on_target",
-    "needs_review": "review_required",
     "unknown": "review_required",
 }
 
@@ -73,7 +91,9 @@ _IMPORT_ACTION_BY_CLASS = {
 # is exactly how "DAB" got misread as "not exported". So every unit carries one of these:
 #   create             — the utility creates the object on target via REST
 #   create_and_upload  — create the object, then push its BYTES (notebooks / workspace files)
-#   assign_on_target   — account-level identity: must ALREADY exist on target; assign + entitle
+#   adopt_or_assign    — account user/SPN: the utility adopts or assigns it AUTOMATICALLY (no
+#                        account-admin step; an SPN keeps its applicationId)
+#   assign_on_target   — account GROUP: must ALREADY exist in the target ACCOUNT; assign + entitle
 #   add_members        — built-in group: PATCH members onto the group that already exists
 #   dab_redeploy       — bundle-owned; import SKIPS it, the customer's bundle redeploy owns it
 #   via_native_asset   — created as a side effect of its native asset (the on-disk twin)
@@ -90,7 +110,8 @@ _ACTION_DAB = "dab_redeploy"
 # from its map silently degrades to "—", so the label map is checked against this set at import
 # time (see export_excel) — a new action can't be added here and forgotten there.
 IMPORT_ACTIONS = frozenset({
-    "create", "create_and_upload", "assign_on_target", "add_members", "dab_redeploy",
+    "create", "create_and_upload", "assign_on_target", "adopt_or_assign", "add_members",
+    "dab_redeploy",
     "via_native_asset", "install", "set_conf", "apply_acl", "manual", "review_required", "none",
 })
 
@@ -217,7 +238,14 @@ def derive_import_action(unit: dict) -> str:
         # classification there; otherwise the classification is the authority.
         if mode == "dab":
             return _ACTION_DAB
-        return _IMPORT_ACTION_BY_CLASS.get(cls, "review_required")
+        action = _IMPORT_ACTION_BY_CLASS.get(cls, "review_required")
+        # An account GROUP is the only identity that can still need a human: it must already exist
+        # in the TARGET ACCOUNT before it can be assigned (the utility must not create it — that
+        # makes a workspace-local shadow which permanently blocks the real group). Users and SPNs
+        # keep `adopt_or_assign`, which is fully automatic.
+        if action == "adopt_or_assign" and asset_type == "group":
+            return "assign_on_target"
+        return action
     if mode == "auto" and asset_type in _ACTION_BY_ASSET_TYPE:
         return _ACTION_BY_ASSET_TYPE[asset_type]
     return _ACTION_BY_MODE.get(mode, "review_required")
@@ -370,10 +398,22 @@ def _identity_units(records: list[dict]) -> list[dict]:
     for r in records:
         itype = r.get("identity_type")
         raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
-        cls = safe_str(r.get("classification"))
+        # Plan 6: `kind` is the authority; `classification` is kept as its wire alias so an older
+        # importer still reads something meaningful and the reports keep one column name.
+        cls = safe_str(r.get("kind")) or safe_str(r.get("classification"))
+        # Carried on EVERY identity unit: the importer needs `kind` to choose create-vs-assign,
+        # `entra_backed` only to word a remediation message, and `workspace_permissions` to
+        # reproduce workspace ADMIN vs USER (invisible in SCIM entitlements).
+        id_extra = {
+            "classification": cls,
+            "kind": cls,
+            "entra_backed": bool(r.get("entra_backed")),
+            "workspace_permissions": r.get("workspace_permissions"),
+        }
         if itype == "user":
             out.append(_make_unit("user", safe_str(r.get("userName")), r.get("id"), raw,
-                                  mode="auto", extra={"classification": cls}))
+                                  mode="auto", extra=id_extra,
+                                  fingerprint_extra={"_ws_perms": r.get("workspace_permissions")}))
         elif itype == "service_principal":
             # Tri-state, NOT bool(): None means the check itself failed (a workspace-admin SP
             # cannot read another SP's credentials — needs account_admin). Reporting that as
@@ -397,11 +437,12 @@ def _identity_units(records: list[dict]) -> list[dict]:
             # migrate the secret — client secrets are never readable — only resurface the ask.
             out.append(_make_unit("service_principal", safe_str(r.get("applicationId")),
                                   r.get("id"), raw, mode="auto", note=note,
-                                  extra={"classification": cls},
-                                  fingerprint_extra={"_has_secrets": has_secrets}))
+                                  extra=id_extra,
+                                  fingerprint_extra={"_has_secrets": has_secrets,
+                                                     "_ws_perms": r.get("workspace_permissions")}))
         elif itype == "group":
             name = safe_str(r.get("displayName"))
-            if cls == "builtin_group":
+            if cls in ("system", "builtin_group"):
                 # The built-in group OBJECT already exists on target and must never be recreated
                 # — but its MEMBERSHIP does not carry over by itself. Without this, a source
                 # workspace admin would silently not be an admin on target. So we emit the group
@@ -412,17 +453,24 @@ def _identity_units(records: list[dict]) -> list[dict]:
                                       mode="covered",
                                       note="built-in group — exists on target; membership "
                                            "migrated via the group_membership unit",
-                                      extra={"classification": cls}))
+                                      extra=id_extra))
                 out.append(_make_unit(
                     "group_membership", name, r.get("id"),
                     {"displayName": name, "members": raw.get("members") or []},
                     mode="auto",
                     note="add these members to the EXISTING built-in group on target "
                          "(PATCH members; never create the group)",
-                    extra={"classification": cls}))
+                    extra=id_extra))
             else:
+                # An ACCOUNT group's members are account-global: patching them on target would
+                # change that group in every OTHER workspace sharing the account, and Entra would
+                # revert it anyway. Flagged so the importer assigns and leaves membership alone.
+                group_extra = dict(id_extra)
+                group_extra["members_are_account_owned"] = (cls == "account")
                 out.append(_make_unit("group", name, r.get("id"), raw,
-                                      mode="auto", extra={"classification": cls}))
+                                      mode="auto", extra=group_extra,
+                                      fingerprint_extra={
+                                          "_ws_perms": r.get("workspace_permissions")}))
     return out
 
 

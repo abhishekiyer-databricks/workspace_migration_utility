@@ -97,6 +97,14 @@ def _has_import_checkpoint(run_dir_path: str) -> bool:
 
 
 class ImportRunner:
+    # Fields that live on the PAYLOAD file rather than the ledger row, and must be merged back onto
+    # each unit before the importers see it. `kind` and `members_are_account_owned` are here because
+    # the identity importer branches on them: without `kind` every group degrades to NEEDS_REVIEW and
+    # is skipped, and without the members flag an account group's account-global membership would be
+    # patched — changing that group in every OTHER workspace sharing the account.
+    _PAYLOAD_CARRY_FIELDS = ("content_route", "classification", "owner", "kind", "entra_backed",
+                             "members_are_account_owned", "workspace_permissions", "externalId")
+
     def __init__(self, client, config, artifact_writer, state=None, dbutils=None,
                  preflight_verdict: Optional[dict] = None) -> None:
         self.client = client
@@ -260,8 +268,12 @@ class ImportRunner:
             payload_unit = payloads.get((at, nk))
             if payload_unit:
                 unit["payload"] = payload_unit.get("payload") or {}
-                # content_route/classification live on the payload file for content + identity
-                for extra in ("content_route", "classification", "owner"):
+                # content_route/classification live on the payload file for content + identity.
+                # `kind` and friends MUST be carried too: the identity importer chooses
+                # create-vs-assign from `kind`, and a missing one degrades every group to
+                # NEEDS_REVIEW (skipping it) — while `members_are_account_owned` is what stops an
+                # account group's account-global membership being patched.
+                for extra in ImportRunner._PAYLOAD_CARRY_FIELDS:
                     if extra in payload_unit:
                         unit[extra] = payload_unit[extra]
             else:
