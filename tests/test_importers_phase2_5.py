@@ -58,7 +58,13 @@ class RecordingClient:
             if p in self.status_paths:
                 return {"path": p, "object_type": "DIRECTORY"}
             raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
-        return self.get_table.get(path, {})
+        # A cluster the test force-started reports RUNNING on the next poll, so the
+        # start→poll→install→stop path can be exercised without real sleeps.
+        if path == "api/2.0/clusters/get" and getattr(self, "_started_clusters", None):
+            if (params or {}).get("cluster_id") in self._started_clusters:
+                return {"state": "RUNNING"}
+        entry = self.get_table.get(path, {})
+        return entry(params) if callable(entry) else entry
 
     def get_paginated(self, path, result_key, token_key="next_page_token", params=None,
                       max_pages=100000):
@@ -72,6 +78,10 @@ class RecordingClient:
         self.calls.append(("POST", path, body))
         if path in self.fail_paths:
             raise RuntimeError("INVALID_PARAMETER_VALUE: rejected")
+        # Track force-started clusters so a later clusters/get returns RUNNING (see get()).
+        if path == "api/2.0/clusters/start":
+            self._started_clusters = getattr(self, "_started_clusters", set())
+            self._started_clusters.add(str(body.get("cluster_id") or ""))
         self._n += 1
         return {"instance_pool_id": f"pool-{self._n}", "policy_id": f"pol-{self._n}",
                 "cluster_id": f"clu-{self._n}", "job_id": f"job-{self._n}", "id": f"id-{self._n}"}
@@ -101,7 +111,8 @@ class RecordingClient:
         return [c[2] for c in self.posts_to(path)]
 
 
-def _make(importer_cls, units, client, dry_run=False, context=None, staging_files=None):
+def _make(importer_cls, units, client, dry_run=False, context=None, staging_files=None,
+          identity_map=None):
     d = tempfile.mkdtemp()
     cfg = Config.from_dict({"role": "target", "source_workspace_id": "111", "run_id": "r1",
                             "target_staging_location": d, "dry_run": dry_run,
@@ -117,6 +128,7 @@ def _make(importer_cls, units, client, dry_run=False, context=None, staging_file
     for u in units:
         by_type.setdefault(u["asset_type"], []).append(u)
     imp = importer_cls(client, cfg, aw, state=st, units_by_type=by_type,
+                       identity_map=identity_map,
                        context=context if context is not None else {})
     return imp, st
 
@@ -255,6 +267,52 @@ def test_a_user_home_directory_is_reported_as_a_prerequisite_not_mkdird():
     row = st.row("directory", "/Users/missing@corp.com")
     assert row["failure_category"] == "prerequisite_missing"
     assert "provisioned" in row["last_error"]
+
+
+_OLD_APP = "9e15fb97-bd21-4abc-9def-0123456789ab"
+_NEW_APP = "11112222-3333-4444-5555-666677778888"
+
+
+def test_sp_home_content_is_remapped_to_the_new_application_id():
+    """IMP-6: a recreated SP gets a NEW applicationId, so its home `/Users/<oldAppId>/...` must be
+    rewritten to `/Users/<newAppId>/...` — otherwise content lands in a directory that can never
+    exist (the two failed dirs). The home ROOT is a skip (auto-provisioned at SP create); content
+    beneath it is created/uploaded at the remapped path."""
+    idmap = {"sp_mapping": {_OLD_APP: _NEW_APP}}
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"}),
+        _unit("directory", f"/Users/{_OLD_APP}/proj", {"path": f"/Users/{_OLD_APP}/proj"}),
+        _unit("notebook", f"/Users/{_OLD_APP}/proj/nb",
+              {"path": f"/Users/{_OLD_APP}/proj/nb", "language": "PYTHON"},
+              content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map=idmap)
+    res = imp.run()
+    assert res.failed == 0, "nothing should fail once the SP home is remapped"
+    # home root: skipped (auto-provisioned), not mkdir'd
+    mkdirs = [b["path"] for b in client.bodies_to("workspace/mkdirs")]
+    assert f"/Users/{_OLD_APP}" not in mkdirs, "the OLD-appId home root must never be mkdir'd"
+    assert f"/Users/{_NEW_APP}/proj" in mkdirs, "content dir must be created under the NEW appId"
+    # notebook uploaded to the remapped path
+    nb = client.bodies_to("workspace/import")[0]
+    assert nb["path"] == f"/Users/{_NEW_APP}/proj/nb"
+    # and every OLD-appId path is gone from what we sent
+    assert not any(_OLD_APP in b.get("path", "") for b in client.bodies_to("workspace/import"))
+
+
+def test_an_unmigrated_sp_home_is_a_clear_prerequisite_not_a_bare_failure():
+    """IMP-6: an SP home whose applicationId is NOT in the identity map (the SP was never migrated)
+    can't be created — say so plainly, distinct from a user-home prerequisite."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client,
+        identity_map={"sp_mapping": {}})
+    res = imp.run()
+    assert client.posts_to("workspace/mkdirs") == []
+    assert res.failed == 1
+    row = st.row("directory", f"/Users/{_OLD_APP}")
+    assert row["failure_category"] == "prerequisite_missing"
+    assert "SERVICE PRINCIPAL home" in row["last_error"] and "not migrated" in row["last_error"]
 
 
 def test_workspace_roots_are_skipped_not_created():
@@ -397,8 +455,20 @@ def test_a_named_manage_principal_is_deferred_to_an_acl_put_not_sent_at_create()
     assert res.units[0]["target_id"] == "app-secrets"
 
 
-def test_an_akv_scope_without_an_aad_token_fails_with_the_right_remediation():
-    """A Databricks token CANNOT make this call — and the message must say which fix applies."""
+def test_an_akv_scope_is_always_a_manual_step_never_attempted(monkeypatch):
+    """IMP-4 (reversed 2026-08-08): an AKV-backed scope CANNOT be created from this environment and
+    is not automatable — proven live. Creating it needs an Azure AD token that neither a Databricks
+    SPN credential (mints a Databricks token, wrong issuer) nor a managed-identity-backed SPN (can
+    only use IMDS, unreachable from a private/notebook-only workspace) can produce. So it must NEVER
+    be attempted: no scopes/create call, no Azure AD/IMDS call, a clean manual remediation naming the
+    vault. This guards against any regression that re-introduces a token-mint attempt."""
+    import requests
+    # any network attempt would be a bug — make them explode so the test catches it
+    monkeypatch.setattr(requests, "post", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no HTTP POST may happen for an AKV scope")))
+    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no IMDS/HTTP GET may happen for an AKV scope")))
+
     client = RecordingClient()
     imp, st = _make(SecretsImporter, [
         _unit("secret_scope", "kv-scope",
@@ -406,48 +476,22 @@ def test_an_akv_scope_without_an_aad_token_fails_with_the_right_remediation():
                "keyvault_metadata": {"dns_name": "https://v.vault.azure.net/",
                                      "resource_id": "/subscriptions/x/v"}})], client)
     res = imp.run()
-    assert client.posts_to("secrets/scopes/create") == [], \
-        "an AKV scope must not be attempted with a Databricks token"
+    assert client.posts_to("secrets/scopes/create") == [], "an AKV scope must never be created here"
     assert res.failed == 1
     err = st.row("secret_scope", "kv-scope")["last_error"]
-    assert "userAADToken" in err and "Entra SP" in err
     assert st.row("secret_scope", "kv-scope")["failure_category"] == "prerequisite_missing"
+    # message must be deterministic + actionable: name the vault, say create-by-hand, no false
+    # promise of an aad_tenant_id knob (which we proved cannot help).
+    assert "CREATE IT BY HAND" in err and "https://v.vault.azure.net/" in err
+    assert "userAADToken" in err
+    assert "aad_tenant_id" not in err, "must NOT suggest a tenant-id knob — it cannot help"
 
 
-def test_an_akv_scope_with_an_aad_token_links_to_the_source_vault(monkeypatch):
-    """With a token it links to the SAME vault, and says the cross-region dependency out loud."""
-    posted = {}
-
-    class FakeResp:
-        status_code = 200
-        text = "{}"
-
-        @staticmethod
-        def json():
-            return {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        posted["url"] = url
-        posted["auth"] = headers.get("Authorization")
-        posted["body"] = json
-        return FakeResp()
-
-    import requests
-    monkeypatch.setattr(requests, "post", fake_post)
-
-    client = RecordingClient()
-    imp, _st = _make(SecretsImporter, [
-        _unit("secret_scope", "kv-scope",
-              {"name": "kv-scope", "backend_type": "AZURE_KEYVAULT",
-               "keyvault_metadata": {"dns_name": "https://v.vault.azure.net/",
-                                     "resource_id": "/subscriptions/x/v"}})],
-        client, context={"aad_token": "AAD-TOKEN-XYZ"})
-    res = imp.run()
-    assert posted["auth"] == "Bearer AAD-TOKEN-XYZ", "the AAD token must be used for THIS call"
-    assert posted["body"]["scope_backend_type"] == "AZURE_KEYVAULT"
-    assert posted["body"]["backend_azure_keyvault"]["dns_name"] == "https://v.vault.azure.net/"
-    assert res.created == 1
-    assert "CROSS-REGION" in res.units[0]["note"]
+def test_that_mint_aad_token_no_longer_exists():
+    """IMP-4: the AAD token-minting entrypoint was removed — there is no code path to an Azure AD
+    token in this deployment, so the function must not exist to be accidentally wired up again."""
+    import src.auth.token_manager as tm
+    assert not hasattr(tm, "mint_aad_token"), "mint_aad_token must be gone (AKV is manual-only)"
 
 
 def test_a_secret_scope_has_no_edit_api_so_a_change_is_reported_not_applied():

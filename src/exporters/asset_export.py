@@ -74,6 +74,7 @@ _IMPORT_ACTION_BY_CLASS = {
     "account": "adopt_or_assign",          # overridden to assign_on_target for GROUPS below
     "workspace_local": "create",
     "system": "add_members",
+    "system_generated": "skip_generated",  # Databricks-minted artifact (users-clone-…) → do nothing
     "needs_review": "review_required",
     # Legacy classifications, kept so a bundle exported by an older version still imports.
     "entra_user": "adopt_or_assign",
@@ -111,7 +112,7 @@ _ACTION_DAB = "dab_redeploy"
 # time (see export_excel) — a new action can't be added here and forgotten there.
 IMPORT_ACTIONS = frozenset({
     "create", "create_and_upload", "assign_on_target", "adopt_or_assign", "add_members",
-    "dab_redeploy",
+    "dab_redeploy", "skip_generated",
     "via_native_asset", "install", "set_conf", "apply_acl", "manual", "review_required", "none",
 })
 
@@ -610,13 +611,28 @@ def _secret_units(records: list[dict]) -> list[dict]:
                     note="scope redeployed by DAB, but the secret VALUE is never readable via "
                          "the API — re-populate manually (≤128 KB)"))
             continue
+        backend = safe_str(r.get("backend_type")).upper() or "DATABRICKS"
         payload = {
             "name": name,
-            "backend_type": safe_str(r.get("backend_type")) or "DATABRICKS",
+            "backend_type": backend,
             "keyvault_metadata": r.get("keyvault_metadata"),
             "key_names": r.get("key_names") or [],
         }
-        out.append(_make_unit("secret_scope", name, name, payload, mode="auto"))
+        if backend == "AZURE_KEYVAULT":
+            # An AKV-backed scope needs an Azure AD `userAADToken` to create, which is NOT obtainable
+            # in this deployment (Databricks SPN secret → Databricks token; MI-backed SPN → IMDS,
+            # unreachable from a private/notebook-only workspace — IMP-4, proven live). So it is a
+            # MANUAL step, marked as such AT EXPORT (never attempted at import), with the vault named.
+            dns = safe_str((r.get("keyvault_metadata") or {}).get("dns_name")) or "the source vault"
+            out.append(_make_unit(
+                "secret_scope", name, name, payload, mode="manual", migratable=False,
+                note=(f"AZURE KEY VAULT-backed — recreate by hand on target against vault {dns} "
+                      f"(Create Scope → Azure Key Vault), then re-run with retry_mode=failed_only to "
+                      f"adopt it. Cannot be automated: creating it needs an Azure AD token that a "
+                      f"Databricks SPN credential / managed-identity-backed SPN cannot provide from a "
+                      f"private, notebook-only workspace. Its VALUES are re-populated manually too.")))
+        else:
+            out.append(_make_unit("secret_scope", name, name, payload, mode="auto"))
         # Values are never exportable → one manual unit per key so the target report lists each
         # value to re-populate (cap 128 KB; never readable via the API).
         for key in r.get("key_names") or []:
@@ -663,7 +679,17 @@ def _sql_units(records: list[dict]) -> list[dict]:
         elif st == "legacy_query":
             out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto"))
         elif st == "legacy_alert":
-            out.append(_make_unit("legacy_alert", nk, sid, raw, mode="auto"))
+            # Legacy alerts are MANUAL, like legacy dashboards (IMP-5). The v1 create API wants the
+            # old flat `options{column,op,value}` shape, but the read API only returns the newer
+            # `condition{}` shape, so a round-trip create fails — attempting it produced a permanent
+            # red result on every run. The underlying `legacy_query` still migrates, so only the
+            # alert's threshold/notification wrapper is rebuilt (as an Alerts V2 alert on target).
+            out.append(_make_unit(
+                "legacy_alert", nk, sid, None, mode="manual", migratable=False,
+                note="legacy SQL alerts use an obsolete create API (v1 `options` shape) that modern "
+                     "workspaces reject — rebuild this as an Alerts V2 alert on target. Its "
+                     "underlying query HAS migrated, so only the alert condition/notification is "
+                     "recreated by hand."))
         elif st == "legacy_dashboard":
             mode = "dab" if r.get("deployed_by_dab") else "auto"
             out.append(_make_unit("legacy_dashboard", nk, sid, None if mode == "dab" else raw,

@@ -176,6 +176,48 @@ def test_jobs_multitask():
     assert byname["bundle-job"]["deployed_by_dab"] is True
 
 
+def test_jobs_run_as_captured_from_get_by_id():
+    """INV-1: `jobs/list` omits run-as; only `jobs/get` returns it, at the TOP LEVEL as a resolved
+    `run_as_user_name` (email=user, bare UUID=SP), or as an explicit `settings.run_as` dict. The
+    collector must enrich via get-by-id and normalise into a typed dict so the importer can remap a
+    db-managed SP's applicationId. A blank column was the live bug this guards."""
+    from src.collectors.jobs_collector import JobsCollector
+    # list surface — run-as intentionally ABSENT, exactly as the live API returns it
+    pag = {"api/2.1/jobs/list": [
+        {"job_id": "ju", "settings": {"name": "user-job", "tasks": [{"task_key": "t"}]}},
+        {"job_id": "js", "settings": {"name": "sp-job", "tasks": [{"task_key": "t"}]}},
+        {"job_id": "je", "settings": {"name": "explicit-sp-job", "tasks": [{"task_key": "t"}]}}]}
+
+    def _get(params):
+        return {
+            # implicit user run-as (email) surfaced only at top level by get-by-id
+            "ju": {"job_id": "ju", "creator_user_name": "a@x.com",
+                   "run_as_user_name": "a@x.com",
+                   "settings": {"name": "user-job", "tasks": [{"task_key": "t"}]}},
+            # implicit SP run-as (bare applicationId UUID) at top level
+            "js": {"job_id": "js", "creator_user_name": "a@x.com",
+                   "run_as_user_name": "1111-2222-uuid",
+                   "settings": {"name": "sp-job", "tasks": [{"task_key": "t"}]}},
+            # explicit settings.run_as dict wins over the top-level echo
+            "je": {"job_id": "je", "creator_user_name": "a@x.com",
+                   "run_as_user_name": "a@x.com",
+                   "settings": {"name": "explicit-sp-job", "tasks": [{"task_key": "t"}],
+                                "run_as": {"service_principal_name": "3333-4444-uuid"}}},
+        }.get(params.get("job_id"), {})
+
+    gt = {"api/2.1/jobs/get": _get,
+          "api/2.0/permissions/jobs/ju": {"access_control_list": []},
+          "api/2.0/permissions/jobs/js": {"access_control_list": []},
+          "api/2.0/permissions/jobs/je": {"access_control_list": []}}
+    objs = _run_ok(JobsCollector(FakeClient(get_table=gt, paginated_table=pag), _cfg()))
+    byname = {o["name"]: o for o in objs}
+    assert byname["user-job"]["run_as"] == {"user_name": "a@x.com"}
+    assert byname["sp-job"]["run_as"] == {"service_principal_name": "1111-2222-uuid"}
+    assert byname["explicit-sp-job"]["run_as"] == {"service_principal_name": "3333-4444-uuid"}
+    # run_as is stamped into settings so it (a) renders and (b) is preserved+remapped on import
+    assert byname["sp-job"]["settings"]["run_as"] == {"service_principal_name": "1111-2222-uuid"}
+
+
 def test_sql_legacy_names():
     from src.collectors.sql_collector import SqlCollector
     gt = {"api/2.0/sql/warehouses": {"warehouses": [{"id": "w1", "name": "wh", "warehouse_type": "PRO"}]},

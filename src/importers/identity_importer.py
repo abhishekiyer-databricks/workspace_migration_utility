@@ -43,7 +43,8 @@ by source id — source ids are meaningless on the target.
 """
 from __future__ import annotations
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing
+from src.importers.base_importer import (BaseImporter, PrerequisiteMissing, SkippedNoObject,
+                                         CAT_NOT_SUPPORTED)
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
                                    ACTION_FAILED)
 from src.utils.helpers import safe_str
@@ -71,6 +72,7 @@ _ACCOUNT_LEVEL_ROLES = {"account_admin"}
 KIND_ACCOUNT = "account"
 KIND_WORKSPACE_LOCAL = "workspace_local"
 KIND_SYSTEM = "system"
+KIND_SYSTEM_GENERATED = "system_generated"   # Databricks-created artifact (users-clone-…) → SKIP
 
 # Bundles exported before Plan 6 carry the OLD classification vocabulary and no `kind`. Mapping them
 # forward keeps an old bundle importable instead of degrading every group to NEEDS_REVIEW (which
@@ -84,10 +86,16 @@ _LEGACY_KIND = {
 
 
 def _kind_of(unit: dict) -> str:
-    """The unit's kind, falling back to the legacy `classification` for pre-Plan-6 bundles."""
+    """The unit's kind, falling back to the legacy `classification` for pre-Plan-6 bundles.
+
+    Also re-detects a system-generated group (`users-clone-…`) from the NAME even if the bundle
+    predates that classification — so an old bundle can't sneak one past the skip (IMP-7a)."""
     kind = safe_str(unit.get("kind"))
-    if kind in (KIND_ACCOUNT, KIND_WORKSPACE_LOCAL, KIND_SYSTEM):
+    if kind in (KIND_ACCOUNT, KIND_WORKSPACE_LOCAL, KIND_SYSTEM, KIND_SYSTEM_GENERATED):
         return kind
+    from src.identity.classifier import is_system_generated_group
+    if is_system_generated_group({"displayName": safe_str(unit.get("natural_key"))}):
+        return KIND_SYSTEM_GENERATED
     return _LEGACY_KIND.get(safe_str(unit.get("classification")), kind)
 
 
@@ -181,6 +189,21 @@ class IdentityImporter(BaseImporter):
         out.update(self._target_groups)
         return out
 
+    def _index_display(self, created: dict, payload: dict, target_id: str,
+                       fallback: str = "") -> None:
+        """Record an identity's DISPLAY NAME → target scim id, for PASS-2 member resolution (IMP-7b).
+
+        SCIM group members are named by `display` (the display name). The per-kind maps are keyed by
+        userName / applicationId / group name, so without a display-name index a member pointing at
+        an identity CREATED in this run cannot be resolved. `existing_keys()` indexes pre-existing
+        identities; this does the same for ones we create/adopt, so the two populations behave
+        identically. Prefer the server's echoed displayName, then the payload's, then the fallback."""
+        display = (safe_str((created or {}).get("displayName"))
+                   or safe_str((payload or {}).get("displayName"))
+                   or safe_str(fallback))
+        if display and target_id:
+            self._target_by_display[display] = target_id
+
     def _read_target_assignments(self):
         """`{principal_id: [permissions]}` on target, or None if it could not be read."""
         try:
@@ -259,6 +282,11 @@ class IdentityImporter(BaseImporter):
         created = self.client.post(f"{_SCIM}/Users", body)
         target_id = safe_str(created.get("id"))
         self._target_users[key] = target_id
+        # Index the display name too (IMP-7b): a group member is identified by `display` (the
+        # display name), so a member referring to a user CREATED in this same pass must resolve in
+        # PASS 2 — not only users that pre-existed on target. Without this, freshly-created users
+        # (e.g. "Sanket Kelkar") could not be added to their groups, leaving them under-populated.
+        self._index_display(created, payload, target_id, fallback=key)
         self._record_identity_row("user", key, target_id, key, unit, ACTION_CREATED)
         self._apply_entitlements("Users", target_id, payload)
         # Workspace ADMIN vs USER lives only in permissionassignments (F8) — a source workspace
@@ -301,6 +329,7 @@ class IdentityImporter(BaseImporter):
             if not existing_id:
                 raise
             self._target_sps[source_app_id] = existing_id
+            self._index_display({}, payload, existing_id, fallback=source_app_id)
             self._record_identity_row("service_principal", source_app_id, existing_id,
                                       source_app_id, unit, ACTION_ADOPTED)
             self._apply_entitlements("ServicePrincipals", existing_id, payload)
@@ -312,6 +341,11 @@ class IdentityImporter(BaseImporter):
         new_app_id = safe_str(created.get("applicationId"))
         if new_app_id:
             self._target_sps[new_app_id] = target_id
+        # Also index by the OLD appId so a member/ACL referencing the source id still resolves, and
+        # by display name for PASS-2 membership (IMP-7b).
+        if source_app_id:
+            self._target_sps.setdefault(source_app_id, target_id)
+        self._index_display(created, payload, target_id, fallback=new_app_id or source_app_id)
 
         self._record_identity_row("service_principal", source_app_id, target_id, new_app_id,
                                   unit, ACTION_CREATED)
@@ -364,6 +398,15 @@ class IdentityImporter(BaseImporter):
         payload = unit.get("payload") or {}
         name = self.natural_key(unit)
         kind = _kind_of(unit)
+
+        if kind == KIND_SYSTEM_GENERATED:
+            # A Databricks-minted artifact (e.g. `users-clone-…`) — exists only as source-side
+            # platform bookkeeping. Recreating it makes a meaningless workspace-local group, so it
+            # is skipped with a clear note rather than migrated (IMP-7a).
+            raise SkippedNoObject(
+                f"group `{name}` is a Databricks-generated artifact (identity-federation "
+                f"bookkeeping), not a real customer group — skipped, never recreated on target.",
+                category=CAT_NOT_SUPPORTED)
 
         if kind == KIND_SYSTEM:
             # admins/users exist on every workspace; only their membership migrates.

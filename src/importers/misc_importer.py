@@ -130,9 +130,10 @@ class MiscImporter(BaseImporter):
                 + " has no target equivalent. Import the compute family first, then re-run with "
                   "retry_mode=failed_only.")
 
-        if not self.config.imports.library_force_start_clusters:
-            state = self._cluster_state(target_cluster)
-            if state != "RUNNING":
+        started_by_us = False
+        state = self._cluster_state(target_cluster)
+        if state != "RUNNING":
+            if not self.config.imports.library_force_start_clusters:
                 # Starting the cluster would spend the customer's money without being asked. So this
                 # is recorded as outstanding work with everything needed to finish it, not attempted.
                 raise PrerequisiteMissing(
@@ -142,11 +143,70 @@ class MiscImporter(BaseImporter):
                     f"stops clusters after creating them so it does not consume DBUs. Either start "
                     f"the cluster and re-run with retry_mode=failed_only, or set "
                     f"library_force_start_clusters=true to let the tool start it.")
+            # Flag is set: start the cluster, install, then stop it again so no DBUs are left
+            # burning. We remember WE started it, so a cluster the customer had already running is
+            # never stopped out from under them.
+            self._start_cluster_and_wait(target_cluster, key)
+            started_by_us = True
 
-        self.client.post("api/2.0/libraries/install",
-                         {"cluster_id": target_cluster, "libraries": [library]})
-        return {"target_id": f"{target_cluster}:{_library_label(library)}",
-                "note": f"installed on target cluster {key or target_cluster}"}
+        try:
+            self.client.post("api/2.0/libraries/install",
+                             {"cluster_id": target_cluster, "libraries": [library]})
+        finally:
+            if started_by_us:
+                # Stop it back down even if the install raised — we only turned it on to install.
+                self._stop_cluster(target_cluster)
+
+        note = f"installed on target cluster {key or target_cluster}"
+        if started_by_us:
+            note += " (cluster was force-started for the install, then stopped again — no idle DBUs)"
+        return {"target_id": f"{target_cluster}:{_library_label(library)}", "note": note}
+
+    # How long to wait for a force-started cluster to reach RUNNING before giving up. A cold start
+    # is typically 3–7 min; 15 min covers a slow pool-less start without hanging the phase forever.
+    _START_TIMEOUT_S = 900
+    _START_POLL_S = 15
+
+    def _start_cluster_and_wait(self, cluster_id: str, label: str) -> None:
+        """Force-start a cluster and block until RUNNING (library_force_start_clusters=true, D6).
+
+        Idempotent: `clusters/start` on an already-RUNNING/PENDING cluster is tolerated (a
+        "already ... " rejection is swallowed) and we simply poll. Raises PrerequisiteMissing on a
+        terminal state or timeout, so the failure is actionable rather than an opaque install error.
+        """
+        import time
+        try:
+            self.client.post("api/2.0/clusters/start", {"cluster_id": cluster_id})
+        except Exception as exc:  # noqa: BLE001 — an already-starting cluster is fine; just poll.
+            if "already" not in str(exc).lower():
+                raise PrerequisiteMissing(
+                    f"could not start target cluster `{label or cluster_id}` to install libraries: "
+                    f"{exc}")
+        waited = 0
+        while waited < self._START_TIMEOUT_S:
+            state = self._cluster_state(cluster_id)
+            if state == "RUNNING":
+                return
+            if state in ("TERMINATED", "ERROR", "UNKNOWN", ""):
+                # A cluster that goes back to TERMINATED/ERROR while we wait won't self-heal.
+                if waited:  # give the very first poll a chance (state can lag the start call)
+                    raise PrerequisiteMissing(
+                        f"target cluster `{label or cluster_id}` did not start (state={state or '?'}) "
+                        f"— check its config/quota, then re-run with retry_mode=failed_only.")
+            time.sleep(self._START_POLL_S)
+            waited += self._START_POLL_S
+        raise PrerequisiteMissing(
+            f"target cluster `{label or cluster_id}` did not reach RUNNING within "
+            f"{self._START_TIMEOUT_S // 60} min of a force-start — re-run with "
+            f"retry_mode=failed_only once it is up.")
+
+    def _stop_cluster(self, cluster_id: str) -> None:
+        """Best-effort stop of a cluster WE force-started — never fail the unit on the stop."""
+        try:
+            self.client.post("api/2.0/clusters/delete", {"cluster_id": cluster_id})
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("could not stop force-started cluster", cluster_id=cluster_id,
+                             error=str(exc))
 
     def _cluster_state(self, cluster_id: str) -> str:
         try:

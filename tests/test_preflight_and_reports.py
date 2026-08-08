@@ -353,6 +353,39 @@ def test_every_artifact_is_written_including_the_workbook():
         assert os.path.isfile(p) and os.path.getsize(p) > 0, f"{name} was not written"
 
 
+def test_import_workbook_has_one_sheet_per_asset_type_named_like_inventory():
+    """IMP-1: the import workbook must lay out ONE SHEET PER ASSET TYPE, named + ordered exactly
+    like inventory.xlsx / export_status.xlsx — not one sheet per family (which lumped pools +
+    policies + clusters into a single `compute` tab and diverged from the other two stages)."""
+    from openpyxl import load_workbook
+    from src.reports.inventory_view import _LABELS
+    cfg, aw = _bundle()
+    results = [_result_with_rows([
+        _row("cluster", "etl", "created"),
+        _row("instance_pool", "pool1", "created"),
+        _row("cluster_policy", "pol1", "created"),
+        _row("job", "nightly", "created"),
+        _row("user", "a@x.com", "created"),
+        _row("group", "grp", "created_with_warning"),
+        _row("secret_scope", "kv", "created"),
+        _row("genie_space", "space", "failed", failure_category="api_error"),
+    ])]
+    write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111",
+                                   "dry_run": False, "run_status": "completed",
+                                   "totals": {}, "per_phase": []}, results, {})
+    wb = load_workbook(os.path.join(aw.root, "import_status.xlsx"))
+    names = set(wb.sheetnames)
+    # per-asset-type tabs, using the SAME labels inventory uses — NOT a single "compute" family tab
+    assert "compute" not in names, "import workbook still groups by family"
+    assert {_LABELS["clusters"], _LABELS["instance_pools"], _LABELS["cluster_policies"],
+            _LABELS["jobs"], _LABELS["users"], _LABELS["groups"],
+            _LABELS["secret_scopes"], _LABELS["genie_spaces"]} <= names
+    # Instance Pools tab holds exactly its own rows, separate from clusters
+    ws = wb[_LABELS["instance_pools"]]
+    body = [row for row in ws.iter_rows(min_row=2, values_only=True) if row[0]]
+    assert all(r[0] == "instance_pool" for r in body) and len(body) == 1
+
+
 def test_the_manual_runbook_separates_the_four_kinds_of_outstanding_work():
     """Each needs a DIFFERENT action, so lumping them together would make the runbook useless."""
     cfg, aw = _bundle()

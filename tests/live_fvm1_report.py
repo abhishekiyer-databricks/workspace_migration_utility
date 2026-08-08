@@ -137,7 +137,7 @@ EXPECT = [
     # sql
     ("legacy_query", "wsmig_test_query", {"success"}),
     ("legacy_query", "wsmig_test_legacy_q", {"success"}),
-    ("legacy_alert", "wsmig_test_legacy_alert", {"success"}),
+    ("legacy_alert", "wsmig_test_legacy_alert", {"manual"}),   # IMP-5: v1 create API obsolete → manual
     ("alert_v2", "wsmig_test_alert_v2", {"success"}),
     ("alert_v2", "wsmig_dab_alert", {"dab"}),
     ("sql_warehouse", "wsmig_test_wh_pro", {"success"}),         # PRO, non-serverless

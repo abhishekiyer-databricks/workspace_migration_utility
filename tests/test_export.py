@@ -139,6 +139,25 @@ def test_dab_owned_pathless_assets_are_not_recreated():
     assert units["secret_value"][0]["migration_mode"] == "manual"
 
 
+def test_legacy_sql_alert_is_manual_at_export_and_never_attempted():
+    """IMP-5: legacy SQL alerts (like legacy dashboards) are MANUAL at export — the v1 create API
+    is obsolete, so attempting it produced permanent red. It must carry NO payload, action=manual,
+    and a note steering the operator to rebuild as Alerts V2. Alerts V2 still migrate as `auto`."""
+    from src.exporters.asset_export import build_all
+    units = build_all({"sql": [
+        {"sql_type": "legacy_alert", "_natural_key": "old_alert", "id": "a1",
+         "_raw": {"name": "old_alert", "condition": {"op": ">"}}},
+        {"sql_type": "alert", "_natural_key": "v2_alert", "id": "a2",
+         "_raw": {"display_name": "v2_alert"}},
+    ]})
+    la = units["legacy_alert"][0]
+    assert la["migration_mode"] == "manual" and la["import_action"] == "manual"
+    assert la["payload"] == {}, "a manual legacy alert must carry no create payload"
+    assert "Alerts V2" in la["note"] and "obsolete" in la["note"].lower()
+    # Alerts V2 are unaffected — still auto-migratable.
+    assert units["alert_v2"][0]["migration_mode"] == "auto"
+
+
 def test_identity_import_action_distinguishes_automatic_from_prerequisite():
     """`import_action` must say who does the work, and users/SPNs vs account GROUPS differ.
 
@@ -660,11 +679,13 @@ def test_acl_sheet_rows_on_bundle_content_read_dab_redeploy():
 
 def test_dab_flag_column_on_every_pathless_dab_capable_asset_tab():
     """`_COLUMNS` is the single registry all three renderers read (inventory HTML, inventory
-    Excel, export workbook), so the DAB column must be declared there AND populated by `adapt()`.
+    Excel, export workbook), so the DAB column must be declared there AND populated by `adapt()`
+    — but ONLY for asset types a bundle can actually own (`DAB_CAPABLE_ASSET_TYPES`).
 
-    Regression: warehouses/clusters/pools/scopes/serving endpoints CAN be bundle-owned (stamped
-    from the bundle state files by `_stamp_dab_ownership`) but had no column saying so — the
-    customer had to infer DAB-ness from an export status of "Skipped (DAB)" further along the row.
+    Regression: warehouses/clusters/scopes/serving endpoints CAN be bundle-owned (stamped from the
+    bundle state files by `_stamp_dab_ownership`) but had no column saying so. INV-2 refinement:
+    instance pools and legacy Redash dashboards are NOT bundle resources, so the column is dropped
+    from those tabs rather than showing a misleading bare "Manual".
     """
     from src.reports.inventory_view import _COLUMNS, _resolve_items, adapt
 
@@ -678,18 +699,19 @@ def test_dab_flag_column_on_every_pathless_dab_capable_asset_tab():
         "secret_scope": [dict(dab, name="kv", backend_type="DATABRICKS", key_names=["k"])],
         "serving_endpoint": [dict(dab, name="ep", migratable=True)],
     })
-    for card in ("sql_warehouses", "clusters", "instance_pools", "secret_scopes",
-                 "serving_endpoints", "sql_dashboards"):
+    # DAB-capable pathless tabs: column present AND populated.
+    for card in ("sql_warehouses", "clusters", "secret_scopes", "serving_endpoints"):
         labels = [lbl for (_k, lbl, _f) in _COLUMNS[card]]
         assert "Deployed by DAB" in labels, f"{card} has no DAB column"
-        # and the key the column reads is actually populated (a declared-but-unpopulated column
-        # renders blank, which is the failure mode this is guarding against)
         for row in _resolve_items(data, card):
             assert row.get("_dab"), f"{card} row has an empty _dab cell: {row!r}"
+    # Non-DAB-capable tabs: NO column at all (INV-2).
+    for card in ("instance_pools", "sql_dashboards"):
+        labels = [lbl for (_k, lbl, _f) in _COLUMNS[card]]
+        assert "Deployed by DAB" not in labels, f"{card} should NOT have a DAB column"
 
     # The label vocabulary matches the jobs tab (Manual / DAB (Shared) / DAB (User)).
     assert _resolve_items(data, "sql_warehouses")[0]["_dab"] == "DAB (Shared)"
-    assert _resolve_items(data, "instance_pools")[0]["_dab"] == "Manual"
 
 
 def test_dab_content_keeps_action_and_note_through_the_content_pass():

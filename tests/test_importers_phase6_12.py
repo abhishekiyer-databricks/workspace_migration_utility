@@ -366,7 +366,10 @@ def test_a_library_installs_when_the_cluster_is_already_running():
     assert res.created == 1
 
 
-def test_a_library_with_force_start_installs_on_a_stopped_cluster():
+def test_a_library_with_force_start_starts_installs_then_stops_the_cluster():
+    """IMP-3: with the opt-in, a stopped cluster is force-STARTED, the library installed, then the
+    cluster STOPPED again — so the install succeeds without leaving idle DBUs burning. The fake
+    flips the cluster to RUNNING once `clusters/start` is called."""
     client = RecordingClient(get_table={"api/2.0/clusters/get": {"state": "TERMINATED"}})
     imp, _st, _aw = _make(MiscImporter, [
         _unit("cluster_library", "SRC-CLU:requests",
@@ -375,8 +378,36 @@ def test_a_library_with_force_start_installs_on_a_stopped_cluster():
         config_over={"imports": {"library_force_start_clusters": True}})
     imp.units_by_type["cluster"] = [_unit("cluster", "etl", source_id="SRC-CLU")]
     res = imp.run()
-    assert client.posts_to("libraries/install"), "the opt-in must actually install"
     assert res.created == 1
+    # started → installed → stopped, all against the TARGET cluster id
+    started = client.bodies_to("clusters/start")
+    installed = client.bodies_to("libraries/install")
+    stopped = client.bodies_to("clusters/delete")
+    assert started and started[0] == {"cluster_id": "TGT-CLU"}, "must force-start the target cluster"
+    assert installed and installed[0]["cluster_id"] == "TGT-CLU", "must install after start"
+    assert stopped and stopped[0] == {"cluster_id": "TGT-CLU"}, \
+        "must stop the cluster it started so no idle DBUs are left"
+    note = _st.row("cluster_library", "SRC-CLU:requests").get("last_error") or ""
+    # the created note (recorded via state on success path is empty for error, so check result row)
+    row = next(r for r in res.units if r["asset_type"] == "cluster_library")
+    assert "force-started" in row["note"] and "no idle DBUs" in row["note"]
+
+
+def test_force_start_does_not_stop_a_cluster_the_customer_already_had_running():
+    """If the target cluster is ALREADY running, we install but must NOT stop it — we only stop
+    clusters WE started, never one the customer is actively using."""
+    client = RecordingClient(get_table={"api/2.0/clusters/get": {"state": "RUNNING"}})
+    imp, _st, _aw = _make(MiscImporter, [
+        _unit("cluster_library", "SRC-CLU:requests",
+              {"cluster_id": "SRC-CLU", "library": {"pypi": {"package": "requests"}}})], client,
+        context={"cluster_target_ids": {"etl": "TGT-CLU"}},
+        config_over={"imports": {"library_force_start_clusters": True}})
+    imp.units_by_type["cluster"] = [_unit("cluster", "etl", source_id="SRC-CLU")]
+    res = imp.run()
+    assert res.created == 1
+    assert client.posts_to("libraries/install"), "must install on the already-running cluster"
+    assert client.posts_to("clusters/start") == [], "must not start an already-running cluster"
+    assert client.posts_to("clusters/delete") == [], "must not stop a cluster it did not start"
 
 
 def test_an_unknown_workspace_conf_key_is_refused_not_blanket_written():

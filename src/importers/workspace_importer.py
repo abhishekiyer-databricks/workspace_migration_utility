@@ -66,9 +66,25 @@ def is_skippable_path(path: str) -> bool:
 
 
 def is_user_home(path: str) -> bool:
-    """`/Users/<email>` exactly — the one directory that cannot be created, only provisioned."""
+    """`/Users/<principal>` exactly — the one directory that cannot be created, only provisioned."""
     parts = [seg for seg in safe_str(path).split("/") if seg]
     return len(parts) == 2 and parts[0] == "Users"
+
+
+def home_owner(path: str) -> str:
+    """The `<principal>` segment of a `/Users/<principal>[/...]` path, else "".
+
+    A service principal's home is `/Users/<applicationId>` (a bare UUID), a user's is
+    `/Users/<email>`. Used to remap an SP home when the SP was recreated with a NEW applicationId.
+    """
+    parts = [seg for seg in safe_str(path).split("/") if seg]
+    return parts[1] if len(parts) >= 2 and parts[0] == "Users" else ""
+
+
+def _looks_like_app_id(owner: str) -> bool:
+    """A UUID-shaped owner is a service principal home; an email is a user home."""
+    o = safe_str(owner)
+    return "@" not in o and o.count("-") == 4 and len(o) >= 32
 
 
 class WorkspaceImporter(BaseImporter):
@@ -100,9 +116,14 @@ class WorkspaceImporter(BaseImporter):
             path = self.natural_key(unit)
             if not path or safe_str(unit.get("import_action")) in ("manual", "dab_redeploy"):
                 continue
-            if self._get_status(path):
-                found[path] = path
-                self.context.setdefault("workspace_paths", set()).add(path)
+            # Probe the TARGET path — an SP-home path is remapped to its new appId, so a re-run
+            # adopts the already-migrated content instead of trying to recreate it (IMP-6). The
+            # existence map is keyed by the SOURCE natural_key, since that is what the base loop
+            # matches a unit on.
+            target_path, _ = self._remap_home_path(path)
+            if self._get_status(target_path):
+                found[path] = target_path
+                self.context.setdefault("workspace_paths", set()).add(target_path)
         return found
 
     def _get_status(self, path: str) -> dict:
@@ -128,6 +149,28 @@ class WorkspaceImporter(BaseImporter):
                     "note": "a directory has no mutable attributes — nothing to update"}
         return self._upload_content(unit, overwrite=True)
 
+    def _remap_home_path(self, path: str) -> tuple[str, str]:
+        """Remap a service-principal HOME path from the source appId to the target appId (IMP-6).
+
+        A Databricks-managed SP is recreated on target with a NEW applicationId, but its home path
+        `/Users/<oldAppId>/...` was captured against the source id. Rewrite the owner segment to the
+        new appId (via `sp_mapping`), so the SP's files/notebooks land inside the SP's REAL home on
+        target instead of a `/Users/<oldAppId>` directory that can never exist (that was the two
+        failed dirs). Returns `(remapped_path, note)`; `note` is "" when nothing was remapped.
+
+        Account SPs and users keep their identifier (email / preserved appId), so they never appear
+        in `sp_mapping` and pass through unchanged — only genuinely recreated SPs are rewritten.
+        """
+        owner = home_owner(path)
+        if not (owner and _looks_like_app_id(owner)):
+            return path, ""
+        new_app_id = (self.identity_map.get("sp_mapping") or {}).get(owner, "")
+        if not new_app_id or new_app_id == owner:
+            return path, ""
+        remapped = path.replace(f"/Users/{owner}", f"/Users/{new_app_id}", 1)
+        return remapped, (f"service-principal home remapped {owner} → {new_app_id} "
+                          f"(the SP was recreated with a new applicationId on target)")
+
     # ── directories ───────────────────────────────────────────────────────
     def _create_directory(self, unit: dict) -> dict:
         path = self.natural_key(unit)
@@ -135,19 +178,36 @@ class WorkspaceImporter(BaseImporter):
             return {"target_id": path,
                     "note": "workspace root / Trash path — exists by construction, not created"}
         if is_user_home(path):
-            # A home directory appears when the USER is provisioned; it cannot be mkdir'd. Its
-            # absence means the owner isn't on this workspace — a prerequisite, not an API problem.
+            # A home directory appears when its OWNER is provisioned; it cannot be mkdir'd. For a
+            # RECREATED service principal the source home path (`/Users/<oldAppId>`) can never exist
+            # on target — but the SP's NEW home (`/Users/<newAppId>`) is auto-provisioned at SP
+            # create (verified live), so the home ROOT is a skip either way, not a failure.
+            remapped, note = self._remap_home_path(path)
+            if note:
+                return {"target_id": remapped,
+                        "note": f"SP home root — auto-provisioned when the SP was created; {note}"}
             if self._get_status(path):
                 return {"target_id": path, "note": "user home directory — already provisioned"}
-            owner = [s for s in path.split("/") if s][-1]
+            owner = home_owner(path)
+            # A UUID-shaped owner NOT in the SP map is an SP that was never migrated (out of the
+            # roster) — its home cannot and should not be created. Say so plainly (IMP-6).
+            if _looks_like_app_id(owner):
+                raise PrerequisiteMissing(
+                    f"`{path}` is a SERVICE PRINCIPAL home for applicationId `{owner}`, which was "
+                    f"NOT migrated (it is not in this run's identity map), so its home cannot be "
+                    f"created — an SP home only appears when the SP is provisioned. If this SP "
+                    f"should migrate, ensure it is in the source roster and re-run the identity "
+                    f"phase; otherwise its content is not migrated by design.")
             raise PrerequisiteMissing(
                 f"`{path}` is a USER HOME directory, which cannot be created — it appears only once "
                 f"`{owner}` is provisioned on this workspace. Assign that user (identity phase / "
                 f"Entra SCIM), then re-run with retry_mode=failed_only; the notebooks beneath it "
                 f"import once it exists.")
-        self.client.post("api/2.0/workspace/mkdirs", {"path": path})
-        self.context.setdefault("workspace_paths", set()).add(path)
-        return {"target_id": path}
+        # Content BELOW a home: remap the SP-home prefix so it lands in the SP's real target home.
+        remapped, note = self._remap_home_path(path)
+        self.client.post("api/2.0/workspace/mkdirs", {"path": remapped})
+        self.context.setdefault("workspace_paths", set()).add(remapped)
+        return {"target_id": remapped, "note": note}
 
     # ── notebooks + workspace files ───────────────────────────────────────
     def _upload_content(self, unit: dict, overwrite: bool = False) -> dict:
@@ -164,6 +224,9 @@ class WorkspaceImporter(BaseImporter):
             return {"target_id": path,
                     "note": "inside a platform-internal directory — owned by Databricks, not "
                             "recreated by this tool"}
+        # A notebook/file under a recreated SP's home must follow the home to its NEW appId path
+        # (IMP-6), or it would try to write into a `/Users/<oldAppId>` tree that cannot exist.
+        path, home_note = self._remap_home_path(path)
         content_ref = safe_str(unit.get("content_ref"))
         if not content_ref:
             raise PrerequisiteMissing(
@@ -192,9 +255,9 @@ class WorkspaceImporter(BaseImporter):
         if not is_notebook and len(data) > BASE64_IMPORT_CAP:
             self._stream_upload(path, data, overwrite)
             self.context.setdefault("workspace_paths", set()).add(path)
-            return {"target_id": path,
-                    "note": (f"{len(data)} bytes uploaded via the streaming workspace-files route "
-                             f"(over the {BASE64_IMPORT_CAP // (1024 * 1024)} MB base64 limit)")}
+            note = (f"{len(data)} bytes uploaded via the streaming workspace-files route "
+                    f"(over the {BASE64_IMPORT_CAP // (1024 * 1024)} MB base64 limit)")
+            return {"target_id": path, "note": f"{note}. {home_note}" if home_note else note}
 
         body = {"path": path, "content": base64.b64encode(data).decode("ascii"),
                 "overwrite": bool(overwrite)}
@@ -209,7 +272,8 @@ class WorkspaceImporter(BaseImporter):
 
         self.client.post("api/2.0/workspace/import", body)
         self.context.setdefault("workspace_paths", set()).add(path)
-        return {"target_id": path, "note": f"{len(data)} bytes uploaded"}
+        note = f"{len(data)} bytes uploaded"
+        return {"target_id": path, "note": f"{note}. {home_note}" if home_note else note}
 
     def _stream_upload(self, path: str, data: bytes, overwrite: bool) -> None:
         """Upload raw bytes via `workspace-files/import-file` (no base64, no 10 MB cap).

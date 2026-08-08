@@ -76,6 +76,11 @@ dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope holdin
 dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
 dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no scope/key; redacted)")
 
+# NOTE: no Azure Key Vault / AAD widgets. An AKV-backed secret scope cannot be created from this
+# environment — it needs an Azure AD token that a Databricks SPN credential / managed-identity-backed
+# SPN cannot provide from a private, notebook-only workspace (IMP-4, proven live). AKV-backed scopes
+# are therefore always reported as a clean manual step; Databricks-backed scopes migrate normally.
+
 # Transform options
 dbutils.widgets.dropdown("pause_job_schedules", "true", ["true", "false"],
                          "Pause imported job schedules AND continuous triggers")

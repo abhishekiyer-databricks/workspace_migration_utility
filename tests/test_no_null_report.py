@@ -221,6 +221,44 @@ def test_export_status_column_resolves_for_every_card():
     assert _row_natural_key("workspace_files", row) == "/Users/a/big.bin"
 
 
+def test_dab_column_absent_or_na_where_dab_impossible():
+    """INV-2: the 'Deployed by DAB' column must only carry real values for asset types a DAB
+    bundle CAN own. Instance pools & legacy Redash dashboards are NOT bundle resources, so the
+    column is dropped entirely (a bare "Manual" reads as "migrate by hand", which is wrong — they
+    auto-migrate). On the mixed Alerts tab, legacy alerts read "NA" while Alerts V2 keep the real
+    label."""
+    from src.reports.inventory_view import _COLUMNS, adapt, _dab_label
+    from src.collectors.dab_registry import DAB_CAPABLE_ASSET_TYPES
+
+    def _labels(key):
+        return [lbl for _f, lbl, _s in _COLUMNS[key]]
+
+    # column removed entirely for the two non-DAB-capable dedicated tabs
+    assert "Deployed by DAB" not in _labels("instance_pools")
+    assert "Deployed by DAB" not in _labels("sql_dashboards")
+    # still present for representative capable types
+    for key in ("jobs", "clusters", "sql_warehouses", "genie_spaces", "secret_scopes"):
+        assert "Deployed by DAB" in _labels(key), key
+
+    # capability set is the single source of truth
+    assert "instance_pool" not in DAB_CAPABLE_ASSET_TYPES
+    assert "cluster_policy" not in DAB_CAPABLE_ASSET_TYPES
+    assert {"job", "cluster", "genie_space", "alert_v2"} <= DAB_CAPABLE_ASSET_TYPES
+
+    # mixed Alerts tab: legacy → NA, V2 → real label; per-row, not per-column
+    data = adapt({"sql": [
+        {"sql_type": "legacy_alert", "name": "old", "_natural_key": "old",
+         "deployed_by_dab": False},
+        {"sql_type": "alert", "name": "v2dab", "_natural_key": "v2dab",
+         "deployed_by_dab": True, "dab_scope": "shared"}]})
+    by = {r["name"]: r for r in data["sql_alerts"]}
+    assert by["old"]["_dab"] == "NA"
+    assert by["v2dab"]["_dab"] == "DAB (Shared)"
+    # the helper itself: capable=False is NA, not Manual
+    assert _dab_label({"deployed_by_dab": False}, capable=False) == "NA"
+    assert _dab_label({"deployed_by_dab": False}, capable=True) == "Manual"
+
+
 if __name__ == "__main__":
     import sys
     try:

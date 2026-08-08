@@ -40,6 +40,7 @@ class IdentityKind(str, Enum):
     ACCOUNT = "account"                  # exists at account level → ASSIGN, never create
     WORKSPACE_LOCAL = "workspace_local"  # workspace-scoped group → RECREATE on target
     SYSTEM = "system"                    # admins/users — always exist; membership only
+    SYSTEM_GENERATED = "system_generated"  # Databricks-created artifact (e.g. `users-clone-…`) → SKIP
     NEEDS_REVIEW = "needs_review"        # group kind undetermined; operator must confirm
 
 
@@ -52,13 +53,32 @@ _RT_WORKSPACE = "workspacegroup"
 _RT_ACCOUNT = "group"
 
 
+def is_system_generated_group(group: dict) -> bool:
+    """A group Databricks created for its own bookkeeping, which must NOT be migrated (IMP-7a).
+
+    When identity federation / SCIM is (re)configured, Databricks mints internal groups named like
+    `users-clone-2026-08-06-2010-UTC (created by Databricks)`. They exist only on the source as a
+    platform artifact; recreating one on target makes a meaningless workspace-local group (and its
+    members resolve poorly since it mirrors the built-in `users`). Detected by the explicit
+    "(created by Databricks)" marker or the `<name>-clone-<UTC timestamp>` shape.
+    """
+    name = safe_str(group.get("displayName"))
+    if "(created by databricks)" in name.lower():
+        return True
+    import re
+    # e.g. "users-clone-2026-08-06-2010-UTC"
+    return bool(re.search(r"-clone-\d{4}-\d{2}-\d{2}-\d{4}-utc", name.lower()))
+
+
 def is_entra_backed(obj: dict) -> bool:
     """Whether an identity came from Entra/SCIM provisioning (reporting only — never a code path)."""
     return bool(safe_str(obj.get("externalId")).strip())
 
 
 def classify_group(group: dict) -> IdentityKind:
-    """Workspace-local vs account vs system, from `meta.resourceType` (Plan 6 F1)."""
+    """Workspace-local vs account vs system vs system-generated, from name + `meta.resourceType`."""
+    if is_system_generated_group(group):
+        return IdentityKind.SYSTEM_GENERATED
     if safe_str(group.get("displayName")) in _SYSTEM_GROUPS:
         return IdentityKind.SYSTEM
     resource_type = safe_str(group.get("resource_type")).strip().lower()

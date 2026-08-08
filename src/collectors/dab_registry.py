@@ -55,6 +55,23 @@ _RESOURCE_KIND_TO_ASSET = {
     "apps": "app",
 }
 
+# Fine-grained asset_types a DAB bundle CAN own — the ones for which a "Deployed by DAB" column
+# is meaningful (otherwise the cell is "NA", not "Manual"). Two sources of truth:
+#   • pathless resources declared in the CLI bundle schema (verified v0.291.0): jobs, pipelines,
+#     dashboards(=Lakeview), clusters, sql_warehouses, secret_scopes, model_serving_endpoints,
+#     alerts(=Alerts V2). Genie spaces are bundle-ownable too (proven live: a DAB-deployed genie
+#     space reports `resources.genie_spaces.*` in its state) even though the schema string search
+#     misses the key.
+#   • workspace-tree assets that live UNDER a bundle root and so are bundle-managed: notebooks,
+#     workspace files.
+# Deliberately EXCLUDED (no bundle resource type, verified live): instance_pool, cluster_policy,
+# cluster_library, global_init_script, legacy sql_query/alert/dashboard, repo, workspace_conf.
+DAB_CAPABLE_ASSET_TYPES = frozenset({
+    "job", "dlt_pipeline", "lakeview_dashboard", "genie_space", "cluster",
+    "sql_warehouse", "secret_scope", "serving_endpoint", "alert_v2",
+    "notebook", "workspace_file",
+})
+
 _STATE_FILES = ("resources.json", "terraform.tfstate")
 
 

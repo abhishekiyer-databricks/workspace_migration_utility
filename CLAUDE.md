@@ -273,6 +273,45 @@ account-admin / customer IT.
 ## Status (2026-08-06)
 - **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested**. The whole pipeline runs:
   inventory → export → preflight → import (all 12 phases) → reports.
+
+### Review-driven fixes 2026-08-08 (9 items, all live-verified on target_ws_3; 280 offline tests)
+Found by the first customer-style run (source_ws → target_ws_3, direct mode). Each has a regression test.
+1. **INV-1 jobs `run_as`** — `jobs/list` OMITS run-as; only `jobs/get` returns it, top-level as
+   `run_as_user_name` (email=user, bare UUID=SP). Collector now enriches per-id and normalises into
+   a typed `settings.run_as` dict so the report shows it AND the importer remaps a db-managed SP's
+   appId (`jobs_collector._normalise_run_as`).
+2. **INV-2 "Deployed by DAB" column** — shown only for DAB-capable asset types
+   (`dab_registry.DAB_CAPABLE_ASSET_TYPES`, sourced from the CLI bundle schema); dropped from
+   instance pools + legacy dashboards, per-row "NA" on the mixed SQL-alerts tab (legacy=NA, V2=real).
+3. **IMP-1 import Excel** — now one sheet PER ASSET TYPE (like inventory/export), not per family
+   (`import_report._ASSET_TYPE_TO_CARD`).
+4. **IMP-2 error surfacing** — `classify_error` ALWAYS carries the actual server message verbatim;
+   the `_ERROR_MAP` entry only appends a remediation HINT (was replacing it — a UC-table genie
+   failure showed as the false "needs workspace-admin"). Raw error added to report rows/columns.
+5. **IMP-3 `library_force_start_clusters`** — implemented start→poll-RUNNING→install→stop; only
+   stops clusters IT started (never one already running). Verified live (gson installed, cluster
+   left TERMINATED).
+6. **IMP-4 AKV secret scope — DETERMINISTICALLY MANUAL, never attempted** (investigated live
+   2026-08-08). AKV-backed scope creation needs an **Azure AD** token for app 2ff814a6… — and NO
+   credential available in this customer's setup can produce one: a Databricks SPN secret mints a
+   *Databricks* token (`iss=<ws>/oidc`, wrong issuer), and the SPN is backed by an Azure **managed
+   identity** that refuses secret auth (`AADSTS7000232`) and can only use Azure **IMDS**
+   (169.254.169.254) — unreachable from a front-end-private / VDI / notebook-only workspace. All
+   three facts proven live. So there is NO token-minting code (removed `mint_aad_token`): AKV-backed
+   scopes are marked `manual` at EXPORT (naming the vault) and never attempted at import;
+   Databricks-backed scopes migrate normally.
+7. **IMP-5 legacy SQL alerts** — marked `manual` at EXPORT (v1 create API obsolete), no longer
+   attempted at import (like legacy dashboards).
+8. **IMP-6 SP home dirs** — a recreated SP's `/Users/<oldAppId>/…` content is remapped to
+   `/Users/<newAppId>/…` via `sp_mapping`; the home ROOT is skipped (auto-provisioned at SP create,
+   verified live); an unmigrated-SP home is a clear prerequisite, not an opaque failure.
+9. **IMP-7a/7b identity** — (a) Databricks-generated groups (`*-clone-*UTC` / "(created by
+   Databricks)") detected by PATTERN (never the literal `users`) and skipped (`skip_generated`
+   action); (b) PASS-1 created users/SPs now indexed by displayName so group members resolve in
+   PASS-2 (fixes the `1/3 members added` under-population). `users`/`admins` membership reaches parity.
+- **Direct-mode source credential**: the old source SP secret rotated; a new workspace-admin SP
+  `wsmig_e2e_source_reader` (account ccb842e7…) is assigned to source_ws with an OAuth secret at
+  `/tmp/wsmig_source_sp_secret.txt` (client_id line 1, secret line 2) for live runs.
 - **Fixtures are now workspace-agnostic** and rebuilt on a fresh source workspace
   (`source_ws` profile, a DIFFERENT account from the old fvm1). `tests/fixtures_fvm1.py` resolves
   profile / catalog / identity / Azure tenant / CLI at runtime (`WSMIG_PROFILE`,

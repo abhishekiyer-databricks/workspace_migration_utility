@@ -353,6 +353,34 @@ def test_an_api_error_carries_the_servers_explanation(monkeypatch):
     assert "cluster_name is required" in message, "the server's message must reach the report"
 
 
+def test_classify_error_always_surfaces_the_actual_server_message():
+    """IMP-2 / user directive: NEVER replace the server error with a hardcoded string. A matched
+    entry may only APPEND a remediation hint. This was the genie bug — a real "table not found" /
+    warehouse-permission failure was reported as the canned "needs workspace-admin", sending the
+    operator down the wrong path when the SP already WAS an admin.
+    """
+    from src.importers.base_importer import (classify_error, CAT_PERMISSION_DENIED,
+                                             CAT_API_ERROR, PrerequisiteMissing)
+
+    # A PERMISSION_DENIED whose real cause is a missing table: the actual text must survive, and it
+    # must NOT be reduced to only "needs workspace-admin".
+    real = ("POST api/2.0/genie/spaces -> 403: PERMISSION_DENIED: cannot access table "
+            "main.sales.orders referenced by the space")
+    cat, msg = classify_error(RuntimeError(real))
+    assert cat == CAT_PERMISSION_DENIED
+    assert "main.sales.orders" in msg, "the actual server error must be surfaced verbatim"
+    assert msg.strip() != "the run-as identity lacks permission for this call — it needs " \
+                          "workspace-admin on the target", "must not be the old canned-only string"
+
+    # An unmapped error still carries the raw text (no marker matched).
+    cat, msg = classify_error(RuntimeError("SOME_NEW_CODE: totally novel failure"))
+    assert cat == CAT_API_ERROR and "totally novel failure" in msg
+
+    # Raiser-authored messages pass through verbatim (they're already the actionable text).
+    cat, msg = classify_error(PrerequisiteMissing("assign user X to the workspace first"))
+    assert msg == "assign user X to the workspace first"
+
+
 def test_an_already_exists_error_is_recognised_from_the_body(monkeypatch):
     """The adopt-on-race path depends on MATCHING the body text, so it only works if the body is
     carried through — this ties the two fixes together."""

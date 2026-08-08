@@ -110,64 +110,32 @@ class SecretsImporter(BaseImporter):
 
     def _create_akv_scope(self, unit: dict, body: dict, payload: dict,
                           deferred_manage: list = ()) -> dict:
-        """Link the scope to the SAME Azure Key Vault, using an AAD token (§6c/D4)."""
+        """An Azure Key Vault-backed scope is ALWAYS a manual step here — never attempted (IMP-4).
+
+        This is a hard Azure identity-model fact, proven live 2026-08-08, not a tool gap. Creating
+        an AKV-backed scope needs an AZURE AD token for app 2ff814a6… (`"must have userAADToken
+        defined!"`), but:
+          • the only credential the customer can supply is a DATABRICKS SPN secret, which mints a
+            DATABRICKS token (wrong issuer — `<workspace>/oidc`, not `login.microsoftonline.com`); and
+          • that SPN is backed by a User-Assigned Managed Identity, which refuses secret-based Azure
+            AD auth (`AADSTS7000232`) and can obtain a token only via Azure IMDS — reachable only
+            from Azure compute the MI is attached to, which a front-end-private / VDI / notebook-only
+            workspace does not provide.
+        There is therefore no code path to the required token, so the scope is reported as a clean
+        MANUAL step with the exact vault to recreate against. Databricks-backed scopes are unaffected.
+        """
         name = self.natural_key(unit)
         meta = payload.get("keyvault_metadata") or {}
-        resource_id = safe_str(meta.get("resource_id"))
-        dns_name = safe_str(meta.get("dns_name"))
-        if not (resource_id and dns_name):
-            raise PrerequisiteMissing(
-                f"scope `{name}` is Azure Key Vault-backed but the export carries no vault "
-                f"resource_id/dns_name, so there is nothing to link it to. Recreate it by hand "
-                f"against the correct vault.")
-
-        body = {**body, "scope_backend_type": _AKV,
-                "backend_azure_keyvault": {"resource_id": resource_id, "dns_name": dns_name}}
-
-        aad_token = safe_str(self.context.get("aad_token"))
-        if not aad_token:
-            # Distinguished from a vault-PERMISSION failure on purpose: the customer fixes these two
-            # causes differently, and one generic error would send them down the wrong path.
-            raise PrerequisiteMissing(
-                f"scope `{name}` is Azure Key Vault-backed, which needs an AZURE AD token for app "
-                f"2ff814a6-3304-4ab8-85cb-cd0e6f879c1d — a Databricks token cannot make this call "
-                f"(the API replies \"must have userAADToken defined!\"). None could be minted: the "
-                f"run-as identity must be an Entra SP / Azure managed identity with client "
-                f"credentials available to the run. Until then, create this scope by hand against "
-                f"vault {dns_name}.")
-
-        try:
-            # The AAD token is used for THIS CALL ONLY — everything else uses the Databricks token.
-            self._post_with_bearer("api/2.0/secrets/scopes/create", body, aad_token)
-        except Exception as exc:  # noqa: BLE001
-            raise PrerequisiteMissing(
-                f"scope `{name}`: the AAD token was minted, but linking to vault {dns_name} was "
-                f"REFUSED ({str(exc)[:200]}). Grant the run-as identity `get` + `list` on that vault "
-                f"(an access policy, or the *Key Vault Secrets User* role) — that is a grant on the "
-                f"AZURE VAULT, not on the Databricks scope.") from exc
-
-        self._grant_manage(name, list(deferred_manage))
-
-        return {"target_id": name,
-                "note": (f"linked to the SOURCE vault {dns_name} verbatim. NOTE this is a "
-                         f"CROSS-REGION dependency — a region-2 workspace now reads a region-1 "
-                         f"vault. That is the intended behaviour, but the target identity needs read "
-                         f"access to it and the network path must allow it.")}
-
-    def _post_with_bearer(self, path: str, body: dict, token: str):
-        """POST with a one-off Authorization header, leaving the shared client untouched.
-
-        Swapping the client's own token provider would leak the AAD token into every later call, so
-        the override is scoped to this single request.
-        """
-        import requests
-        url = f"{self.client.base_url}/{path.lstrip('/')}"
-        resp = requests.post(url, headers={"Authorization": f"Bearer {token}",
-                                           "Content-Type": "application/json"},
-                             json=body, timeout=60)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        return resp.json() if resp.text else {}
+        dns_name = safe_str(meta.get("dns_name")) or "the source vault"
+        raise PrerequisiteMissing(
+            f"scope `{name}` is Azure Key Vault-backed — CREATE IT BY HAND on the target against "
+            f"vault {dns_name}. This cannot be automated in this environment: the API needs an "
+            f"Azure AD token for app 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d (\"must have userAADToken "
+            f"defined!\"), but a Databricks SPN credential only yields a Databricks token, and a "
+            f"managed-identity-backed SPN can mint an Azure AD token only via Azure IMDS — which is "
+            f"unreachable from a front-end-private / notebook-only workspace. Recreate the scope in "
+            f"the UI/CLI (Create Scope → Azure Key Vault), then re-run with retry_mode=failed_only; "
+            f"the tool will adopt it. (Databricks-backed scopes migrate automatically.)")
 
     def _source_manage_grants(self) -> dict:
         """`{scope_name: [principal, ...]}` holding MANAGE on source, read from `export/acls.json`.

@@ -641,3 +641,63 @@ def test_members_resolve_by_DISPLAY_NAME_not_just_userName():
     values = {v["value"] for v in patch[0][2]["Operations"][0]["value"]}
     assert values == {"u-1", "sp-1"}, f"display-name members did not resolve: {values}"
     assert "2/2 members added" in str(res.units[0].get("note"))
+
+
+def test_members_created_in_THIS_run_resolve_by_display_name():
+    """IMP-7b: the live bug — `wsmig_test_child_grp` reported "could not resolve Sanket Kelkar /
+    Aman Bansal" even though both were CREATED in the same run. The display-name index was only
+    populated from PRE-EXISTING target identities, never from ones we create in PASS 1. Now a group
+    whose members are freshly-created users/SPs resolves them in PASS 2."""
+    client = FakeScimClient()   # target starts EMPTY — everything is created this run
+    imp, _st = _importer(client, [
+        _unit("user", "sanket.kelkar@corp.com", {"displayName": "Sanket Kelkar"}, kind="account"),
+        _unit("user", "aman.bansal@corp.com", {"displayName": "Aman Bansal"}, kind="account"),
+        _unit("service_principal", "db-sp-app", {"displayName": "wsmig_test_db_sp"},
+              kind="account"),
+        _unit("group", "wsmig_test_child_grp",
+              {"displayName": "wsmig_test_child_grp",
+               "members": [{"display": "Sanket Kelkar"}, {"display": "Aman Bansal"},
+                           {"display": "wsmig_test_db_sp"}]},
+              kind="workspace_local"),
+    ])
+    res = imp.run()
+    grp = next(u for u in res.units if u["asset_type"] == "group"
+               and u["natural_key"] == "wsmig_test_child_grp")
+    # all three members (2 freshly-created users + 1 freshly-created SP) must resolve
+    assert "3/3 members added" in safe_str_note(grp), \
+        f"created-in-run members did not resolve: {grp.get('note')}"
+
+
+def test_a_databricks_generated_users_clone_group_is_skipped_not_recreated():
+    """IMP-7a: `users-clone-<UTC> (created by Databricks)` is a platform artifact, not a customer
+    group. It must be SKIPPED, never POSTed as a workspace-local group on target."""
+    from src.identity.classifier import classify_group, IdentityKind, is_system_generated_group
+    assert is_system_generated_group(
+        {"displayName": "users-clone-2026-08-06-2010-UTC (created by Databricks)"})
+    assert classify_group(
+        {"displayName": "users-clone-2026-08-06-2010-UTC (created by Databricks)"}
+    ) == IdentityKind.SYSTEM_GENERATED
+    # a normal group is unaffected
+    assert not is_system_generated_group({"displayName": "wsmig_test_child_grp"})
+
+    # Export gives it a clean skip action (not review_required / manual — nothing for a human to do).
+    from src.exporters.asset_export import derive_import_action
+    assert derive_import_action(
+        {"asset_type": "group", "classification": "system_generated", "kind": "system_generated",
+         "migration_mode": "auto", "export_status": "success",
+         "natural_key": "users-clone-2026-08-06-2010-UTC (created by Databricks)"}
+    ) == "skip_generated"
+
+    client = FakeScimClient()
+    imp, _st = _importer(client, [
+        _unit("group", "users-clone-2026-08-06-2010-UTC (created by Databricks)",
+              {"displayName": "users-clone-2026-08-06-2010-UTC (created by Databricks)"},
+              kind="system_generated", import_action="skip_generated")])
+    res = imp.run()
+    assert client.posts_to("/Groups") == [], "a Databricks-generated group must never be created"
+    assert res.units[0]["import_status"] == "skipped"
+    assert "Databricks-generated" in res.units[0]["note"]
+
+
+def safe_str_note(unit) -> str:
+    return str(unit.get("note") or "")

@@ -163,6 +163,9 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_acls",           "ACL Grants",      "plain"),
         ("creator_user_name","Creator",         "plain"),
     ],
+    # Instance pools are NOT a DAB resource type (absent from the CLI bundle schema, verified
+    # v0.291.0), so NO "Deployed by DAB" column here — it could only ever say "Manual", which
+    # misreads as "migrate by hand". Pools ARE auto-migratable and imported normally (INV-2).
     "instance_pools": [
         ("instance_pool_name", "Pool Name",      "plain"),
         ("instance_pool_id",   "Pool ID",        "mono"),
@@ -170,7 +173,6 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("state",              "State",          "badge_state"),
         ("min_idle_instances", "Min Idle",       "plain"),
         ("max_capacity",       "Max Capacity",   "plain"),
-        ("_dab",               "Deployed by DAB","badge_type"),
         ("_acls",              "ACL Grants",     "plain"),
     ],
     "cluster_policies": [
@@ -217,12 +219,12 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("_acls",             "ACL Grants",   "plain"),
         ("create_time",       "Created",      "iso_ts"),
     ],
+    # Legacy (Redash) SQL dashboards are not a DAB resource type → no "Deployed by DAB" column.
     "sql_dashboards": [
         ("name",              "Dashboard Name", "plain"),
         ("id",                "ID",             "mono"),
         ("user.name",         "Owner",          "plain"),
         ("parent",            "Parent",         "path"),
-        ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
         ("updated_at",        "Updated",        "iso_ts"),
     ],
@@ -505,12 +507,16 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
     # Alerts tab shows BOTH legacy (/api/2.0/sql/alerts) and Alerts V2 (/api/2.0/alerts),
     # each tagged with a "Kind" so migration can tell them apart (only legacy migrate via
     # the legacy path; V2 alerts use the Alerts V2 API).
+    # This tab is MIXED: a legacy alert can never be DAB-owned (→ NA), while an Alerts V2 can
+    # (→ real Manual / DAB label). So capability is decided PER ROW by sql_type, not per column.
     data["sql_alerts"] = [
         _merge(s, _acls=_acl_count(s), _alert_kind=_alert_kind(s.get("sql_type")),
-               _dab=_dab_label(s))
+               _dab=_dab_label(s, capable=(s.get("sql_type") == "alert")))
         for s in sql if s.get("sql_type") in ("legacy_alert", "alert")]
+    # Legacy (Redash) SQL dashboards are not a DAB resource type (the schema's `dashboards` is
+    # Lakeview only) → no DAB column at all for this tab.
     data["sql_dashboards"] = [
-        _merge(s, _acls=_acl_count(s), _dab=_dab_label(s))
+        _merge(s, _acls=_acl_count(s))
         for s in _by(sql, "sql_type", "legacy_dashboard")]
 
     # ── Model serving endpoints (Agent Bricks agents are excluded at the collector —
@@ -559,6 +565,7 @@ MANAGED_BY_LABEL = {
     "account": "Account",
     "workspace_local": "Workspace-local",
     "system": "Built-in",
+    "system_generated": "Databricks-generated (skipped)",
     "needs_review": "Needs review",
     # legacy classifications (older bundles / reports)
     "entra_user": "Entra / SCIM",
@@ -602,11 +609,17 @@ def _group_managed(kind: Any, entra_backed: bool = False) -> str:
     return ""
 
 
-def _dab_label(rec: Dict[str, Any]) -> str:
-    """'Deployed by DAB' cell: Manual / DAB (Shared) / DAB (User). See helpers.dab_deploy_label.
+def _dab_label(rec: Dict[str, Any], capable: bool = True) -> str:
+    """'Deployed by DAB' cell: NA / Manual / DAB (Shared) / DAB (User).
+
+    `capable=False` (the asset type is not a DAB resource — see `DAB_CAPABLE_ASSET_TYPES`) yields
+    "NA", NOT "Manual": "Manual" reads as "migrate this by hand", but these assets migrate
+    automatically — DAB simply has no say over them, so the honest cell is "not applicable".
 
     The (Shared) vs (User) split matters to this customer: shared bundles are current staging +
     all prod; user-scoped bundles (username/uuid in path) are the legacy staging pattern."""
+    if not capable:
+        return "NA"
     from src.utils.helpers import dab_deploy_label
     return dab_deploy_label(rec.get("deployed_by_dab"), rec.get("dab_scope"))
 

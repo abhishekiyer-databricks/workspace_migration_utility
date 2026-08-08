@@ -45,6 +45,32 @@ _STATUS_STYLE = {
 _SUMMARY_ORDER = ("created", "updated", "adopted", "skipped", "created_with_warning", "manual",
                   "not_selected", "skipped_no_object", "failed")
 
+# Fine-grained importer `asset_type` → the inventory/export CARD KEY it belongs to, so the import
+# workbook lays out ONE SHEET PER ASSET TYPE exactly like inventory.xlsx / export_status.xlsx
+# (IMP-1: the three stages must be structurally identical, not one-sheet-per-family here and
+# one-per-type there). Any asset_type absent from this map falls back to its own name as a tab, so
+# a newly-added importer type is never silently dropped.
+_ASSET_TYPE_TO_CARD = {
+    "user": "users", "service_principal": "service_principals",
+    "group": "groups", "group_membership": "groups",
+    "notebook": "notebooks", "workspace_file": "workspace_files",
+    "directory": "notebooks", "repo": "repos",
+    "job": "jobs", "cluster": "clusters", "instance_pool": "instance_pools",
+    "cluster_policy": "cluster_policies", "cluster_library": "cluster_libraries",
+    "global_init_script": "global_init_scripts",
+    "sql_warehouse": "sql_warehouses", "legacy_query": "sql_queries",
+    "legacy_alert": "sql_alerts", "alert_v2": "sql_alerts",
+    "legacy_dashboard": "sql_dashboards",
+    "dlt_pipeline": "dlt_pipelines", "lakeview_dashboard": "lakeview_dashboards",
+    "genie_space": "genie_spaces", "serving_endpoint": "serving_endpoints",
+    "secret_scope": "secret_scopes", "secret_value": "secret_scopes",
+    "workspace_conf": "workspace_conf", "acl": "object_permissions",
+}
+
+
+def _card_for_asset_type(asset_type: str) -> str:
+    return _ASSET_TYPE_TO_CARD.get(safe_str(asset_type), safe_str(asset_type) or "other")
+
 
 def _all_rows(results: list) -> list[dict]:
     """Every per-unit row across all phases, failures first then by (asset_type, natural_key)."""
@@ -183,6 +209,8 @@ def _render_html(config, summary: dict, rows: list[dict]) -> str:
     unit_cols = [("Asset Type", "asset_type"), ("Natural Key", "natural_key"),
                  ("Import Status", "import_status"), ("Action Taken", "action_taken"),
                  ("Target Id", "target_id"), ("Note", "note")]
+    # Failures additionally show the COMPLETE server error verbatim (never hidden behind the note).
+    fail_cols = unit_cols + [("Actual server error", "error_raw")]
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Import Results — run {_esc(summary.get('run_id'))}</title>
@@ -217,7 +245,7 @@ def _render_html(config, summary: dict, rows: list[dict]) -> str:
 </header><main>
 {mode_banner}
 <div class="cards">{cards()}</div>
-{table(failures, unit_cols, "Failures — fix these, then re-run with retry_mode=failed_only", "fail")}
+{table(failures, fail_cols, "Failures — fix these, then re-run with retry_mode=failed_only", "fail")}
 {table(warned, unit_cols, "Created with warnings — exist on target but degraded", "warn")}
 {table(manual, unit_cols, "Manual steps required on target", "manual")}
 <h2>Per asset type</h2>
@@ -293,15 +321,20 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict]) -> st
     ws.cell(row=r, column=1, value=f"Failures ({len(failures)})").font = font(
         bold=True, color="B91C1C", size=12)
     r += 1
-    for col, h in enumerate(["Asset Type", "Natural Key", "Category", "Reason + remediation"], 1):
+    for col, h in enumerate(["Asset Type", "Natural Key", "Category",
+                             "Actual server error + hint"], 1):
         cc = ws.cell(row=r, column=col, value=h)
         cc.font = font(bold=True, color="FFFFFF")
         cc.fill = fill("B91C1C")
         cc.border = box
     for x in failures:
         r += 1
+        # Prefer the complete raw server error; fall back to the note (which already leads with the
+        # server text) so the operator always sees what the target actually said — never a canned
+        # message alone.
+        reason = safe_str(x.get("error_raw")) or safe_str(x.get("note"))
         for col, v in enumerate([x.get("asset_type"), x.get("natural_key"),
-                                 x.get("failure_category"), x.get("note")], 1):
+                                 x.get("failure_category"), reason], 1):
             cc = ws.cell(row=r, column=col, value=safe_str(v))
             cc.fill = fill("FEE2E2")
             cc.border = box
@@ -354,17 +387,32 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict]) -> st
     for i, w in enumerate([26, 52, 20, 70, 14, 14, 14, 14, 14, 14], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    # ── one sheet per family ─────────────────────────────────────────────
+    # ── one sheet PER ASSET TYPE, in inventory/export card order (IMP-1) ─────
+    # Import keeps its own import-specific columns (status / action / ids / note), but the SHEET
+    # LAYOUT — one tab per asset type, named + ordered like inventory.xlsx — now matches the other
+    # two stages so an operator reads the same tabs across all three workbooks.
+    from src.reports.inventory_view import _LABELS, _SUMMARY_CARD_KEYS
+
     cols = [("Asset Type", "asset_type", 24), ("Natural Key", "natural_key", 56),
             ("Import Status", "import_status", 22), ("Action Taken", "action_taken", 26),
             ("Target Id", "target_id", 24), ("Source Id", "source_id", 22),
-            ("Failure Category", "failure_category", 20), ("Note / reason", "note", 80)]
-    by_family: dict[str, list] = {}
-    for x in rows:
-        by_family.setdefault(safe_str(x.get("family")) or "other", []).append(x)
+            ("Failure Category", "failure_category", 20), ("Note / reason", "note", 70),
+            ("Actual server error", "error_raw", 80)]
 
-    for family in sorted(by_family):
-        sheet = wb.create_sheet(family[:31])
+    by_card: dict[str, list] = {}
+    for x in rows:
+        by_card.setdefault(_card_for_asset_type(x.get("asset_type")), []).append(x)
+
+    # Inventory card order first (so tabs line up with the other workbooks), then any leftover
+    # cards not in the canonical list (defensive — a new importer type still gets a tab).
+    ordered_cards = [k for k in _SUMMARY_CARD_KEYS if k in by_card]
+    ordered_cards += [k for k in sorted(by_card) if k not in _SUMMARY_CARD_KEYS]
+
+    import re as _re
+    for card in ordered_cards:
+        label = _LABELS.get(card, card.replace("_", " ").title())
+        sheet_name = _re.sub(r"[\\/?*\[\]:]", "-", label)[:31]
+        sheet = wb.create_sheet(sheet_name)
         sheet.sheet_view.showGridLines = False
         for col, (h, _k, w) in enumerate(cols, 1):
             cc = sheet.cell(row=1, column=col, value=h)
@@ -373,7 +421,7 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict]) -> st
             cc.border = box
             cc.alignment = centre
             sheet.column_dimensions[get_column_letter(col)].width = w
-        for i, x in enumerate(by_family[family], start=2):
+        for i, x in enumerate(by_card[card], start=2):
             status = safe_str(x.get("import_status"))
             _label, colour = _STATUS_STYLE.get(status, (status, "FFFFFF"))
             for col, (_h, key, _w) in enumerate(cols, 1):

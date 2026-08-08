@@ -15,9 +15,11 @@ only *how the SOURCE workspace is reached*:
   • The M2M secret is read at runtime from a target secret scope (preferred) or a widget, and is
     never logged, never persisted (`Config.redacted()` strips it).
 
-Also here: `mint_aad_token()` — an **Azure AD** token for the AzureDatabricks first-party app,
-which is the ONE call that cannot use a Databricks token: creating a secret scope BACKED BY an
-Azure Key Vault requires Databricks to prove to Azure who is asking (§6c).
+There is deliberately NO Azure AD token minting here (IMP-4, 2026-08-08): creating an Azure Key
+Vault-backed secret scope would need one, but no obtainable credential in this deployment can
+produce it (a Databricks SPN secret yields a Databricks token; a managed-identity-backed SPN can
+only use Azure IMDS, unreachable from a private/notebook-only workspace). AKV-backed scopes are
+handled as a MANUAL step in the secrets importer instead — see the note by `AZURE_DATABRICKS_APP_ID`.
 
 Auth strategy for the local client (adapted from the customer inventory notebook driver):
   1. SDK `WorkspaceClient()` ambient auth (works on serverless / shared / single-user) →
@@ -132,9 +134,21 @@ class StaticTokenProvider:
 # Azure AD first-party application id for **AzureDatabricks**. Creating a Databricks secret scope
 # that is BACKED BY an Azure Key Vault is the only call in this tool that a Databricks token cannot
 # make: Databricks must prove to Azure that the CALLER may read that vault, and a Databricks
-# OAuth/context token carries no Azure AD identity — the call fails with the famously unhelpful
-# `"must have userAADToken defined!"`. An AAD access token for this app id works (verified live on
-# fvm1). See Plan 3 §6c / memory `fvm1-test-fixtures-and-akv-state`.
+# OAuth/context token carries no Azure AD identity — the call fails with `"must have userAADToken
+# defined!"`.
+#
+# IMP-4 (2026-08-08) — AKV-backed scope creation is NOT AUTOMATABLE in this customer's setup, proven
+# live and stated deterministically:
+#   • The only credential the customer can supply is a DATABRICKS SPN client id + secret. That mints
+#     a DATABRICKS token (iss=<workspace>/oidc), NOT an Azure AD token (iss=login.microsoftonline.com,
+#     aud=this app id) — different issuer, unusable as `userAADToken`.
+#   • That SPN is backed by an Azure User-Assigned Managed Identity, which REFUSES secret-based Azure
+#     AD auth entirely: `AADSTS7000232: MSI identity should not use ClientSecretCredential`. A MI only
+#     gets tokens from Azure IMDS (169.254.169.254), reachable ONLY from Azure compute the MI is
+#     attached to — and the workspace is front-end-private / VDI-only with no terminal.
+# So there is no code path to an Azure AD token here. AKV-backed scopes are therefore reported as a
+# clean MANUAL step (never attempted); Databricks-backed scopes migrate normally. The app id is kept
+# only to name the exact resource in that manual remediation note.
 AZURE_DATABRICKS_APP_ID = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
 # Refresh a client-credentials token this many seconds BEFORE it expires, so a long phase can't
@@ -215,41 +229,12 @@ def oauth_m2m_token_provider(host: str, client_id: str, client_secret: str,
     return OAuthM2MTokenProvider(host, client_id, client_secret, scope=scope)
 
 
-def mint_aad_token(client_id: str, client_secret: str, tenant_id: str,
-                   resource_app_id: str = AZURE_DATABRICKS_APP_ID) -> str:
-    """Mint an **Azure AD** access token for the AzureDatabricks app, headlessly (§6c, D4).
-
-    This is required ONLY for `POST secrets/scopes/create` with
-    `scope_backend_type=AZURE_KEYVAULT` — the linking call. Everything else uses the Databricks
-    token. If the run-as identity is an Azure managed identity / Entra SP it can mint this itself
-    via client-credentials — no `az login`, no laptop.
-
-    Note this is separate from vault PERMISSIONS: the AAD token is *who is asking*; the vault's
-    access policy / RBAC grant is *whether they're allowed*. Both are needed, and the importer
-    distinguishes the two failures in its remediation note.
-    """
-    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-
-    def _do():
-        r = requests.post(url, data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": f"{resource_app_id}/.default",
-        }, timeout=60)
-        if is_retryable_status(r.status_code):
-            raise RetryableHTTPError(r.status_code, f"POST {url} -> {r.status_code}")
-        if r.status_code >= 400:
-            # Azure AD error bodies are safe to surface (they don't echo the secret) and the
-            # error code is what tells the customer what to fix.
-            raise RuntimeError(f"Azure AD token request failed: HTTP {r.status_code}: "
-                               f"{r.text[:300]}")
-        tok = (r.json() or {}).get("access_token") or ""
-        if not tok:
-            raise RuntimeError("Azure AD response carried no access_token")
-        return tok
-
-    return with_retry(_do)
+# NOTE: there is deliberately NO `mint_aad_token` here. Getting an Azure AD token for the
+# AzureDatabricks app would require EITHER an Azure AD app-registration secret (the customer's
+# Databricks SPN secret is a Databricks credential, not an Azure AD one) OR Azure IMDS (reachable
+# only from Azure compute the managed identity is attached to, which the front-end-private / VDI /
+# notebook-only setup does not provide). Both were proven impossible live (2026-08-08). So AKV-backed
+# secret scopes are handled as a MANUAL step in the secrets importer — never minted, never attempted.
 
 
 # ---------------------------------------------------------------------------

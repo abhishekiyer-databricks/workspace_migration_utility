@@ -49,32 +49,37 @@ from src.utils.logger import get_logger
 # end would lose all bookkeeping on a crash. Same batch size and rationale as the export pass.
 CHECKPOINT_BATCH = 200
 
-# API error text → (failure_category, human-readable cause + remediation). `last_error` must be
-# something an operator can act on, not a raw traceback — the raw text is kept in `last_error_raw`
-# for debugging. Matched case-insensitively as substrings, first match wins.
+# API error text → (failure_category, remediation HINT). The hint is only ever APPENDED to the
+# actual server error, never a replacement for it: the operator must always see what the target
+# really said (a canned string that guesses the cause — e.g. "needs workspace-admin" when the real
+# reason was a missing UC table — sends people down the wrong path). Matching only picks the retry
+# BUCKET (category) and adds guidance; the raw message is surfaced verbatim by `classify_error`.
+# Matched case-insensitively as substrings, first match wins.
 _ERROR_MAP: tuple[tuple[str, str, str], ...] = (
     ("RESOURCE_DOES_NOT_EXIST", CAT_DEPENDENCY_UNRESOLVED,
-     "a referenced object does not exist on target — most often an unrecreated Git folder or a "
-     "notebook path that was never imported. Recreate the dependency, then re-run with "
+     "hint: a referenced object does not exist on target — most often an unrecreated Git folder "
+     "or a notebook path that was never imported. Recreate the dependency, then re-run with "
      "retry_mode=failed_only"),
     ("PERMISSION_DENIED", CAT_PERMISSION_DENIED,
-     "the run-as identity lacks permission for this call — it needs workspace-admin on the target"),
+     "hint: this is usually workspace-admin on the target, but can also be a referenced object "
+     "(warehouse / UC table) the identity cannot see — read the server message above to tell "
+     "which"),
     ("must have userAADToken", CAT_PREREQUISITE_MISSING,
-     "linking an Azure Key Vault-backed secret scope needs an AZURE AD token, not a Databricks "
-     "token — the run-as identity must be an Entra SP / managed identity (Plan 3 §6c)"),
+     "hint: linking an Azure Key Vault-backed secret scope needs an AZURE AD token, not a "
+     "Databricks token — the run-as identity must be an Entra SP / managed identity (Plan 3 §6c)"),
     ("FEATURE_DISABLED", CAT_NOT_SUPPORTED,
-     "the feature is not enabled on the target workspace — enable it or accept the gap"),
+     "hint: the feature is not enabled on the target workspace — enable it or accept the gap"),
     ("QUOTA_EXCEEDED", CAT_PREREQUISITE_MISSING,
-     "a target-region quota was exceeded — raise the quota, then retry with "
+     "hint: a target-region quota was exceeded — raise the quota, then retry with "
      "retry_mode=failed_only"),
     ("INVALID_PARAMETER_VALUE", CAT_API_ERROR,
-     "the target rejected a field in the payload — see last_error_raw for which one"),
+     "hint: the target rejected a field in the payload — the offending field is named above"),
     ("TABLE_OR_VIEW_NOT_FOUND", CAT_PREREQUISITE_MISSING,
-     "the payload references a Unity Catalog table that does not exist on target. UC is OUT OF "
-     "SCOPE for this utility, so the table must be created by the UC migration before this asset "
-     "will work"),
+     "hint: the payload references a Unity Catalog table that does not exist on target. UC is OUT "
+     "OF SCOPE for this utility, so the table must be created by the UC migration before this "
+     "asset will work"),
     ("does not exist", CAT_DEPENDENCY_UNRESOLVED,
-     "a referenced object does not exist on target — check that the prerequisite family was "
+     "hint: a referenced object does not exist on target — check that the prerequisite family was "
      "imported first"),
 )
 
@@ -123,16 +128,26 @@ class UnsupportedOperation(RuntimeError):
 
 
 def classify_error(exc: Exception) -> tuple[str, str]:
-    """`(failure_category, human_message)` for an error — never a raw traceback in the report."""
-    raw = str(exc)
+    """`(failure_category, human_message)` for an error.
+
+    The message ALWAYS carries the actual server error verbatim — never a hardcoded string that
+    replaces it. A matched `_ERROR_MAP` entry only adds a remediation HINT (and picks the retry
+    bucket); it never hides what the target said. This is deliberate: a canned "needs
+    workspace-admin" once masked a missing-UC-table / warehouse-permission genie failure, which is
+    exactly the misdiagnosis this avoids. The full raw text is also kept in `error_raw`.
+    """
+    raw = str(exc).strip()
+    # Raiser-authored messages (PrerequisiteMissing / UnsupportedOperation) are already the actual,
+    # actionable text — pass through verbatim.
     if isinstance(exc, PrerequisiteMissing):
         return CAT_PREREQUISITE_MISSING, raw
     if isinstance(exc, UnsupportedOperation):
         return CAT_NOT_SUPPORTED, raw
-    for marker, category, message in _ERROR_MAP:
+    for marker, category, hint in _ERROR_MAP:
         if marker.lower() in raw.lower():
-            return category, message
-    return CAT_API_ERROR, f"the target API rejected this call: {raw[:300]}"
+            # actual server error FIRST, remediation hint appended — the operator sees both.
+            return category, f"{raw[:400]}  |  {hint}"
+    return CAT_API_ERROR, f"the target API rejected this call: {raw[:400]}"
 
 
 def is_already_exists(exc: Exception) -> bool:
@@ -461,6 +476,15 @@ class BaseImporter(ABC):
                          "bundle-owned — recreated by `databricks bundle deploy` on the target")
             return
 
+        # 2b. Databricks-generated artifact (e.g. a `users-clone-…` group, IMP-7a): a platform
+        #     bookkeeping object that exists only on the source. There is nothing for a human to do
+        #     and nothing to create — skip it cleanly rather than flagging it as manual work.
+        if safe_str(unit.get("import_action")) == "skip_generated":
+            self._record(unit, ACTION_SKIPPED, note=safe_str(unit.get("note")) or
+                         "Databricks-generated artifact (identity-federation bookkeeping) — not a "
+                         "real customer object; nothing to migrate")
+            return
+
         # 3. Resume: this attempt already did it. The recorded OUTCOME is restored (not just a
         #    done-flag), because import_results.json is written only at the end and so never
         #    exists after a crash — the checkpoint is the only resumable record.
@@ -617,6 +641,9 @@ class BaseImporter(ABC):
             "action_taken": _ACTION_TAKEN_LABEL.get(status, status),
             "fingerprint": safe_str(unit.get("fingerprint")),
             "note": note,
+            # The COMPLETE, untruncated server error — the report shows it verbatim so nothing is
+            # ever hidden behind a summarised note (blank for non-error outcomes).
+            "error_raw": safe_str(error_raw),
             "failure_category": category,
             "dry_run": bool(dry),
         }
