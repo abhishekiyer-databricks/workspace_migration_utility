@@ -28,7 +28,7 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
     reads source assets; **writes a bundle** to a **source staging location**.
   - **HANDOFF**: the **customer ops team physically moves** the bundle from the source
     location to a **target staging location** (download + upload), made readable by target.
-  - **TARGET side** (`03_Transform_Review`, `04_Import` — preflight runs inside it): runs
+  - **TARGET side** (`04_Import` — preflight + transforms run inside it): runs
     **inside the target workspace**; reads the bundle; writes target.
 - The same Git folder is pulled into **both** workspaces; the role is DERIVED from stage + mode
   (PLAN 7 §C — no `role` widget) and guards mis-runs. **No live cross-workspace REST call, ever.**
@@ -152,7 +152,7 @@ Thin notebooks + importable `src/` package. Same deploy pattern the customer alr
 Deployed twice — same Git folder pulled into BOTH workspaces; the role is DERIVED from
 `connectivity_mode` + which stage (PLAN 7 §C — no `role` widget any more).
 ```
-notebooks/   01_Inventory, 02_Export, 03_Transform_Review, 04_Import   (thin; widgets)
+notebooks/   01_Inventory, 02_Export, 04_Import   (thin; widgets)
              00_Install_Jobs (idempotent Jobs-API installer; deploys jobs/*.job.json)
 jobs/        *.job.json  (checked-in Jobs API 2.2 definitions; installed by 00_Install_Jobs)
 src/         config/  auth/(context-token client for THIS ws)  collectors/(read this ws)
@@ -216,12 +216,13 @@ Cloned locally at `/tmp/WorkspaceMigration_ref` during design (re-clone from the
 Role is DERIVED from stage + mode (no `role` widget).
 - `01_Inventory` — read-only enumeration + identity classification → report (Plan 1)
 - `02_Export` — dump enabled assets → staging **bundle** (JSON + notebook SOURCE/DBC) + manifest/checksums. Checkpointed.
-- `03_Transform_Review` — verify manifest; apply mappings/excludes → pre/post diff for sign-off (still a stub, Plan 4)
-- `04_Import` — create on target in dependency order; idempotent + checkpointed + dry-run. **Preflight runs INSIDE it** (verify-only gate).
+- `04_Import` — create on target in dependency order; idempotent + checkpointed + dry-run. **Preflight AND the transforms (mappings/excludes/pause) run INSIDE it.**
 - `00_Install_Jobs` — idempotent Jobs-API installer: fills every config value ONCE and deploys the selected `jobs/*.job.json` (PLAN 7 §E).
-DELETED in PLAN 7 §B1: `00_Account_Preflight` (preflight is inside `04_Import`), `05_Validate`
-(deferred Plan 4), `00_Main_Source`/`00_Main_Target`/`00_Main_EndToEnd` (stitching moved into the
-packaged multi-task Jobs). Reusable logic lives in the importable `src/` package; notebooks stay thin.
+DELETED in PLAN 7 §B1: `00_Account_Preflight` (preflight is inside `04_Import`), `05_Validate` and
+`03_Transform_Review` (both deferred to Plan 4 — manifest verify + transforms already run inside
+`04_Import`, so the stub had no unique job left), `00_Main_Source`/`00_Main_Target`/`00_Main_EndToEnd`
+(stitching moved into the packaged multi-task Jobs). Reusable logic lives in the importable `src/`
+package; notebooks stay thin. Plan 4 will add the cross-stage review/reconciliation report as a new notebook when that work is built.
 
 ### Packaged jobs (PLAN 7 §E — `jobs/*.job.json`, non-DAB, Git-folder friendly)
 Checked-in Jobs API 2.2 definitions, installed by `00_Install_Jobs` (which projects the ONE-time
@@ -396,7 +397,8 @@ Found by the first customer-style run (source_ws → target_ws_3, direct mode). 
   could never fire. Fixed by stamping alerts from the bundle state file
   (`InventoryRunner._DAB_STAMP_TARGETS` + `_SQL_TYPE_FOR`, which also keeps the mixed `sql` bucket
   from letting a warehouse inherit an alert's claim on the same id).
-- **Deferred to Plan 4**: `03_Transform_Review` is still a stub — the cross-stage
-  inventoried→exported→imported reconciliation. `misc/import_results.json` is already written in the
-  shape Plan 4 joins on. (`05_Validate` was deleted in PLAN 7 §B1; Plan 4 will re-add reconciliation
-  into `03_Transform_Review` or a successor rather than a separate validate notebook.)
+- **Deferred to Plan 4**: the cross-stage inventoried→exported→imported reconciliation + a
+  review/sign-off diff report. `misc/import_results.json` is already written in the shape Plan 4
+  joins on. (Both stub notebooks that used to hold this — `05_Validate` and `03_Transform_Review` —
+  were deleted in PLAN 7 §B1 since manifest-verify + transforms already run inside `04_Import`; Plan
+  4 adds a fresh notebook for the reconciliation/diff when that work is actually built.)

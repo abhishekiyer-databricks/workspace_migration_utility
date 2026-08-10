@@ -15,7 +15,7 @@ Two distinct responsibilities live here:
      • `normalize(payload)` — the canonical JSON string the fingerprint hashes (sorted keys, no
        whitespace); exposed so callers/tests can inspect exactly what was hashed.
 
-2. TARGET side (Plans 3–7 — STUBS, applied on staged copies in 03_Transform_Review/04_Import):
+2. TARGET side (applied inside 04_Import; the cross-stage review/diff report is deferred to Plan 4):
      apply_user_mappings / apply_excludes / pause_schedules / remap_references.
    Reference remapping (source ids → new target ids) is deliberately NOT done at export — the
    export payloads still reference source ids; the map old→new only exists after identity import.

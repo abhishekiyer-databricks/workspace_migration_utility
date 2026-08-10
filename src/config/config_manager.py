@@ -133,7 +133,7 @@ class AssetToggles:
 
 @dataclass
 class TransformConfig:
-    """Mapping + exclude + schedule options applied in 03_Transform_Review / 04_Import."""
+    """Mapping + exclude + schedule options applied inside 04_Import."""
     pause_job_schedules: bool = True
     user_domain_mapping: dict = field(default_factory=dict)   # old.com -> new.com
     user_id_mapping: dict = field(default_factory=dict)       # old@a.com -> new@b.com
