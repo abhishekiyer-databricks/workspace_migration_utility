@@ -23,6 +23,7 @@
           "source_sp_client_id": "",
           "source_sp_secret_scope": "",
           "source_sp_secret_key": "",
+          "spn_secret_value": "",
           "dry_run": "true",
           "state_catalog": "",
           "state_schema": "",

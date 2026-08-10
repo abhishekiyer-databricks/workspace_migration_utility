@@ -193,13 +193,28 @@ def test_dry_and_live_end_to_end_differ_only_in_the_import_dry_run():
     assert [t["task_key"] for t in dry["tasks"]] == [t["task_key"] for t in live["tasks"]]
 
 
-def test_secret_scope_pointer_is_persisted_but_the_raw_secret_is_never_in_the_spec():
-    """The scope pointer is safe to bake in; a raw spn_secret_value must never reach a job param."""
-    spec = _render("direct_end_to_end_live")
+def test_secret_scope_pointer_is_persisted_and_spn_secret_value_stays_blank_by_default():
+    """The scope pointer is safe to bake in. `spn_secret_value` is a declared key now, but with the
+    default config (no raw secret projected) it must stay BLANK — the scope path leaks nothing."""
+    spec = _render("direct_end_to_end_live")   # _render passes scope keys, no spn_secret_value
     blob = json.dumps(spec)
     assert "kv" in blob and "\"source_sp_secret_scope\"" in blob   # pointer kept
-    # spn_secret_value is not even a declared key on any task, so a raw secret can't be projected
-    assert "spn_secret_value" not in blob
+    for task in spec["tasks"]:
+        bp = task["notebook_task"]["base_parameters"]
+        # declared (so a raw-secret opt-in CAN fill it), but empty here
+        assert bp.get("spn_secret_value", "") == "", "a raw secret must not leak by default"
+
+
+def test_raw_secret_is_baked_in_only_when_explicitly_opted_in():
+    """The installer's opt-in path: passing spn_secret_value in params (which the notebook does only
+    when allow_secret_in_job_params=true) fills the declared key on every source-reading task."""
+    spec = _render("direct_end_to_end_dry_run", source_sp_secret_scope="", source_sp_secret_key="",
+                   spn_secret_value="RAW-SECRET-XYZ")
+    for task in spec["tasks"]:
+        bp = task["notebook_task"]["base_parameters"]
+        # every task that reads the source now carries the raw secret
+        if "source_sp_client_id" in bp:
+            assert bp["spn_secret_value"] == "RAW-SECRET-XYZ"
 
 
 def test_airgap_job_pins_connectivity_mode_even_when_config_says_direct():
