@@ -188,7 +188,7 @@ EXPECT = [
 
 
 def verify(root):
-    index = json.load(open(f"{root}/export_index.json"))
+    index = json.load(open(f"{root}/misc/export_index.json"))
     units = index["units"]
     by_type = {}
     for u in units:
@@ -307,7 +307,7 @@ def _extra_checks(root, by_type):
           f"{'✓ PASS' if aok else '✗ FAIL'}")
     # import_action: BOTH the create and the assign path must appear live, so a reader can
     # tell "we exported it" (export_status) from "the utility will create it" (import_action).
-    index = json.load(open(f"{root}/export_index.json"))
+    index = json.load(open(f"{root}/misc/export_index.json"))
     actions = {}
     for u in index["units"]:
         if u.get("import_action"):
@@ -355,7 +355,7 @@ def _extra_checks(root, by_type):
     # manifest verifies
     from src.config.config_manager import Config
     # (manifest presence already implies complete; check file exists)
-    mok = os.path.isfile(f"{root}/manifest.json")
+    mok = os.path.isfile(f"{root}/misc/manifest.json")
     print(f"{'manifest.json':<22}{'written (bundle complete)':<34}{'':<12}"
           f"{'✓ PASS' if mok else '✗ FAIL'}")
 

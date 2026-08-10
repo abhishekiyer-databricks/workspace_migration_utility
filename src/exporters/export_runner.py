@@ -29,6 +29,7 @@ from src.exporters.asset_export import (
     index_record,
     is_dab_content_path,
 )
+from src.exporters import bundle_paths as BP
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
 from src.transform.transforms import fingerprint
@@ -80,12 +81,12 @@ class ExportRunner:
 
     # ── inventory input ────────────────────────────────────────────────────
     def _load_inventory(self) -> dict:
-        inv = self.aw.read_json("inventory.json")
+        inv = self.aw.read_json(BP.INVENTORY_JSON)
         if inv is None:
             _LOG.warning("inventory.json absent — running inventory first for a consistent bundle")
             from src.collectors.inventory_runner import InventoryRunner
             InventoryRunner(self.client, self.config, self.aw, self.dbutils).run()
-            inv = self.aw.read_json("inventory.json") or {}
+            inv = self.aw.read_json(BP.INVENTORY_JSON) or {}
         return inv
 
     def run(self) -> dict:
@@ -101,7 +102,7 @@ class ExportRunner:
 
         # 4. ACLs → acls.json + stamp counts.
         acls = collect_acls(objects_by_type)
-        self.aw.write_json("export/acls.json", acls)
+        self.aw.write_json(BP.EXPORT_ACLS_JSON, acls)
         counts_by_key = acl_counts(acls)
         for units in units_by_type.values():
             for u in units:
@@ -117,11 +118,11 @@ class ExportRunner:
 
         # 6. Write artifacts.
         self._write_artifact_files(units_by_type)
-        self.aw.write_json("export/oversize_artifacts.json", oversize_rows)
+        self.aw.write_json(BP.EXPORT_OVERSIZE_JSON, oversize_rows)
         self._write_manual_actions(units_by_type, oversize_rows)
 
         index = self._build_index(units_by_type)
-        self.aw.write_json("export_index.json", index)
+        self.aw.write_json(BP.EXPORT_INDEX_JSON, index)
         self._append_export_config()
         self._write_excel(objects_by_type, index)
 
@@ -275,7 +276,7 @@ class ExportRunner:
         return shared.value["oversize"]
 
     def _prior_index_by_key(self) -> dict:
-        prior = self.aw.read_json("export_index.json") or {}
+        prior = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
         out = {}
         for row in prior.get("units", []) or []:
             out[(row.get("asset_type"), row.get("natural_key"))] = row
@@ -396,19 +397,19 @@ class ExportRunner:
                 lines.append(f"- `{o.get('natural_key', o.get('path'))}` "
                              f"({o.get('size', 0)} bytes) — {o.get('recommended', '')}")
             lines.append("")
-        self.aw.write_bytes("export/manual/manual_actions.md", "\n".join(lines).encode("utf-8"))
+        self.aw.write_bytes(BP.EXPORT_MANUAL_ACTIONS_MD, "\n".join(lines).encode("utf-8"))
 
     def _append_export_config(self) -> None:
-        cfg = self.aw.read_json("config_resolved.json") or {}
+        cfg = self.aw.read_json(BP.CONFIG_RESOLVED_JSON) or {}
         cfg["export_options"] = {"content_fetch_workers": self.workers,
                                  "force_full_export": self.force_full}
-        self.aw.write_json("config_resolved.json", cfg)
+        self.aw.write_json(BP.CONFIG_RESOLVED_JSON, cfg)
 
     def _write_excel(self, objects_by_type: dict, index: dict) -> None:
         try:
             from src.exporters.export_excel import generate_export_excel
             self.aw.write_text_local_then_copy(
-                "export_status.xlsx",
+                BP.EXPORT_STATUS_XLSX,
                 lambda local: generate_export_excel(objects_by_type, index, local, self.config),
             )
         except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run

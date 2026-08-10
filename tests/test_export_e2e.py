@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 
+from src.exporters import bundle_paths as BP
 from src.config.config_manager import Config
 from src.collectors.inventory_runner import InventoryRunner
 from src.exporters.artifact_writer import ArtifactWriter
@@ -115,13 +116,13 @@ def test_export_end_to_end():
 
     aw = ArtifactWriter(cfg)
     InventoryRunner(client, cfg, aw).run()
-    inv = aw.read_json("inventory.json")
+    inv = aw.read_json(BP.INVENTORY_JSON)
 
     result = ExportRunner(client, cfg, aw, content_fetch_workers=4).run()
     root = result["output_path"]
 
     # ── export_index.json exists + reconciles 1:1 with inventory unit counts ──
-    index = json.load(open(f"{root}/export_index.json"))
+    index = json.load(open(f"{root}/misc/export_index.json"))
     units = index["units"]
     # every unit has a status + fingerprint + natural_key.
     assert all(u["export_status"] and u["fingerprint"].startswith("sha256:") and u["natural_key"]
@@ -180,7 +181,7 @@ def test_export_end_to_end():
     assert os.path.isfile(f"{root}/export/manual/manual_actions.md")
     md = open(f"{root}/export/manual/manual_actions.md").read()
     assert "secret_value" in md   # secret values are always manual
-    xlsx = f"{root}/export_status.xlsx"
+    xlsx = f"{root}/reports/export_status.xlsx"
     assert os.path.getsize(xlsx) > 0
     from openpyxl import load_workbook
     wb = load_workbook(xlsx)
@@ -191,7 +192,7 @@ def test_export_end_to_end():
     assert "Export Status" in header
 
     # config_resolved.json got export_options AND still no token.
-    cr = json.load(open(f"{root}/config_resolved.json"))
+    cr = json.load(open(f"{root}/misc/config_resolved.json"))
     assert cr["export_options"]["content_fetch_workers"] == 4
     assert "SECRET" not in json.dumps(cr)
 
@@ -203,7 +204,7 @@ def test_export_end_to_end():
     client.download_table = {}
     aw2 = ArtifactWriter(cfg)
     result2 = ExportRunner(client, cfg, aw2, content_fetch_workers=4).run()
-    index2 = json.load(open(f"{root}/export_index.json"))
+    index2 = json.load(open(f"{root}/misc/export_index.json"))
     nb2 = [u for u in index2["units"] if u["asset_type"] == "notebook"]
     assert all(u["export_status"] == "success" for u in nb2), "resume must reuse prior content"
     assert result2["failure"] == 0

@@ -1,31 +1,32 @@
 """
 ConfigManager — centralises all runtime configuration for the workspace migration utility.
 
-TWO connectivity modes, both supported (master §1a; the `connectivity_mode` widget picks one):
+TWO connectivity modes, both supported (master §1a; the `connectivity_mode` widget picks one).
+The ROLE is DERIVED from the pipeline stage + mode (PLAN 7 §C — `role_for_stage`), not a widget,
+and there is a single `staging_location` widget rather than two:
 
-  • MODE A `airgap` (default) — the two-sided model. The tool runs on two sides that never talk
-    to each other, and a `role` widget declares which side this run is:
-      - role="source"  → inventory/export; reads THIS (source) workspace; WRITES the bundle to
-        `source_staging_location`. Ops then physically moves the bundle.
-      - role="target"  → preflight/transform/import/validate; READS the bundle from
-        `target_staging_location`; writes THIS (target) workspace.
-  • MODE B `direct` — EVERY stage runs in the TARGET workspace (so `role="target"` throughout).
+  • MODE A `airgap` — the two-sided model. The tool runs on two sides that never talk to each other:
+      - inventory/export (role=source): read THIS (source) workspace; WRITE the bundle to
+        `staging_location`. Ops then physically moves the bundle.
+      - import (role=target): READ the bundle from `staging_location`; write THIS (target) workspace.
+  • MODE B `direct` (default) — EVERY stage runs in the TARGET workspace (role=target throughout).
     Inventory/export reach the SOURCE over REST using a source workspace-admin SP's client id +
-    secret (OAuth M2M), and the bundle is written straight to `target_staging_location`, so there
-    is no manual hop and the whole migration can run as one Job.
+    secret (OAuth M2M), and the bundle is written straight to the single `staging_location`, so
+    there is no manual hop and the whole migration can run as one Job.
 
-Both modes emit the IDENTICAL bundle, so transform/import/validate are mode-agnostic — the mode
-only decides *who reads the source* and *whether the file hop is manual*.
+Both modes emit the IDENTICAL bundle, so transform/import are mode-agnostic — the mode only decides
+*who reads the source* and *whether the file hop is manual*.
 
 Auth: the workspace a notebook RUNS IN is always reached with the run-as SP's notebook-context
 token. In `direct` mode the SOURCE is additionally reached via OAuth M2M (auth/token_manager.py).
 No PATs in either mode. The M2M secret is NEVER persisted — `redacted()` strips it, and a test
 asserts the literal appears in no written artifact.
 
-Mirrors the `Config` dataclass pattern of uc-inventory-migration, EXTENDED to hold role + mode +
-staging locations + per-asset TOGGLES (all default True) + transform options + the target-side
-import controls (state table, selector, retry mode).
-Config is WIDGET-based: `from_dbutils()` reads notebook widgets / job params. No config files.
+Mirrors the `Config` dataclass pattern of uc-inventory-migration, EXTENDED to hold the derived role +
+mode + the single staging location + per-asset TOGGLES (all default True) + transform options + the
+target-side import controls (state table, selector, retry mode).
+Config is WIDGET-based: `from_dbutils(..., stage=)` reads notebook widgets / job params. No config
+files. (The old `source_/target_staging_location` widgets survive only as an upgrade fallback.)
 """
 from __future__ import annotations
 
@@ -39,6 +40,31 @@ _VALID_ROLES = (ROLE_SOURCE, ROLE_TARGET)
 MODE_AIRGAP = "airgap"
 MODE_DIRECT = "direct"
 _VALID_MODES = (MODE_AIRGAP, MODE_DIRECT)
+
+# Pipeline stages, so a notebook can DERIVE its role rather than expose a `role` widget (PLAN 7 §C):
+# inventory + export are the SOURCE-READING stages (role=source in airgap, role=target in direct,
+# because in direct EVERY stage runs in the target and reaches the source over REST); import is
+# always the target stage.
+STAGE_INVENTORY = "inventory"
+STAGE_EXPORT = "export"
+STAGE_IMPORT = "import"
+_SOURCE_READING_STAGES = (STAGE_INVENTORY, STAGE_EXPORT)
+
+
+def role_for_stage(stage: str, mode: str) -> str:
+    """The role a given pipeline stage runs as, derived from the connectivity mode (PLAN 7 §C).
+
+    This replaces the `role` widget: the role was never a free choice, it was always a function of
+    "which stage is this" and "which mode". `import` is always target; the source-reading stages are
+    source in airgap (they run inside the source) and target in direct (they run in the target and
+    read the source over REST).
+    """
+    if stage == STAGE_IMPORT:
+        return ROLE_TARGET
+    if stage in _SOURCE_READING_STAGES:
+        return ROLE_TARGET if mode == MODE_DIRECT else ROLE_SOURCE
+    raise ValueError(f"unknown stage {stage!r}; expected one of "
+                     f"{(STAGE_INVENTORY, STAGE_EXPORT, STAGE_IMPORT)}")
 
 # The asset families `import_assets` can select, in phase order (Plan 3 §5, §6). `acls` is
 # deliberately selectable ON ITS OWN — replaying permissions is the pass most likely to need a
@@ -160,10 +186,15 @@ class Config:
     imports: ImportOptions = field(default_factory=ImportOptions)
     run_id: str = ""
     source_workspace_id: str = ""    # identifies the bundle: .../wsmig/<source_ws_id>/<run_id>
-    # Staging locations — each a UC Volume path ("/Volumes/…"; managed or ADLS-backed
-    # external volume; never raw abfss://):
-    source_staging_location: str = ""   # airgap role=source WRITES the bundle here
-    target_staging_location: str = ""   # role=target READS the bundle here (direct: also writes)
+    # ONE staging location (PLAN 7 §C): a UC Volume path ("/Volumes/…"; managed or ADLS-backed
+    # external volume; never raw abfss://). Each run writes/reads exactly one location — the airgap
+    # file hop is just "source side sets location A, target side sets location B", two separate runs
+    # each with their own single value. `source_staging_location`/`target_staging_location` are
+    # retained ONLY as an upgrade fallback in `from_dbutils` so an in-flight job-param JSON that
+    # still carries the old names keeps working; the merged value is the source of truth.
+    staging_location_widget: str = ""
+    source_staging_location: str = ""   # DEPRECATED (upgrade fallback only)
+    target_staging_location: str = ""   # DEPRECATED (upgrade fallback only)
     dry_run: bool = True
     # Source-side safety caps (0 = unlimited), carried from the inventory script.
     max_scim: int = 0
@@ -177,18 +208,22 @@ class Config:
 
     @property
     def staging_location(self) -> str:
-        """The staging root for THIS run.
+        """The single staging root for THIS run (PLAN 7 §C).
 
-        In `direct` mode EVERYTHING lives in `target_staging_location` — both halves of the run
-        are in the target workspace, so `source_staging_location` is unused (validate() enforces
-        the right widget per mode). In `airgap` mode the role picks the side's own location.
+        Each run writes/reads exactly ONE location, so there is one `staging_location`. The old
+        `source_staging_location`/`target_staging_location` are consulted ONLY as an upgrade
+        fallback (an in-flight job-param JSON that still carries them), picked by role/mode exactly
+        as before so nothing in flight breaks. New runs set `staging_location_widget` and the
+        role/mode fallback never fires.
         """
-        if self.is_direct:
-            loc = self.target_staging_location
-        else:
-            loc = (self.source_staging_location if self.role == ROLE_SOURCE
-                   else self.target_staging_location)
-        return loc.rstrip("/")
+        loc = self.staging_location_widget
+        if not loc:
+            if self.is_direct:
+                loc = self.target_staging_location
+            else:
+                loc = (self.source_staging_location if self.role == ROLE_SOURCE
+                       else self.target_staging_location)
+        return (loc or "").rstrip("/")
 
     @property
     def output_path(self) -> str:
@@ -244,8 +279,13 @@ class Config:
         return val if val not in (None, "") else default
 
     @classmethod
-    def from_dbutils(cls, dbutils, spark, context_resolver=None) -> "Config":
+    def from_dbutils(cls, dbutils, spark, context_resolver=None, stage=None) -> "Config":
         """Build config from widgets / job params + this workspace's notebook context.
+
+        `stage` (PLAN 7 §C) is the pipeline stage the calling notebook is — one of
+        `inventory`/`export`/`import`. When given, the role is DERIVED from stage + mode and no
+        `role` widget is read (the trimmed notebooks pass it). When omitted, the legacy `role`
+        widget is honoured, so an in-flight job-param JSON still works.
 
         `context_resolver` is an optional callable returning a WorkspaceContext-like object
         (used for testing / to inject auth.token_manager.resolve_context). If None, the
@@ -256,14 +296,21 @@ class Config:
 
         w = lambda n, d="": cls._widget(dbutils, n, d)  # noqa: E731
 
-        role = (w("role") or "").strip().lower()
-        if role not in _VALID_ROLES:
-            raise ValueError(f"widget `role` must be one of {_VALID_ROLES}, got {role!r}")
-
-        mode = (w("connectivity_mode", MODE_AIRGAP) or MODE_AIRGAP).strip().lower()
+        mode = (w("connectivity_mode", MODE_DIRECT) or MODE_DIRECT).strip().lower()
         if mode not in _VALID_MODES:
             raise ValueError(f"widget `connectivity_mode` must be one of {_VALID_MODES}, "
                              f"got {mode!r}")
+
+        if stage is not None:
+            role = role_for_stage(stage, mode)   # derived, no `role` widget (PLAN 7 §C)
+        else:
+            role = (w("role") or "").strip().lower()
+            if role not in _VALID_ROLES:
+                raise ValueError(f"widget `role` must be one of {_VALID_ROLES}, got {role!r}")
+
+        # ONE staging widget now (PLAN 7 §C), with the old two as an upgrade fallback so an
+        # in-flight job-param JSON that still carries them keeps working.
+        staging_widget = w("staging_location")
 
         toggles = AssetToggles(
             identity=parse_bool(w("migrate_identity", "true"), True),
@@ -318,6 +365,7 @@ class Config:
             imports=imports,
             run_id=w("run_id") or now_compact(),
             source_workspace_id=w("source_workspace_id"),
+            staging_location_widget=staging_widget,
             source_staging_location=w("source_staging_location"),
             target_staging_location=w("target_staging_location"),
             dry_run=parse_bool(w("dry_run", "true"), True),
@@ -338,12 +386,16 @@ class Config:
         if not self.source_workspace_id:
             raise ValueError("`source_workspace_id` is required")
 
+        # A single staging location is required in every mode/role now (PLAN 7 §C) — the merged
+        # `staging_location` property resolves the widget (or the old two as an upgrade fallback).
+        if not self.staging_location:
+            raise ValueError(
+                "`staging_location` is required (a UC Volume path, e.g. /Volumes/cat/sch/vol). In "
+                "airgap mode the source side sets its own location and the target side sets the "
+                "location ops uploaded the bundle to; in direct mode both halves use the one "
+                "target-side location.")
+
         if self.is_direct:
-            # Everything runs in the target, so that is the only staging location used.
-            if not self.target_staging_location:
-                raise ValueError(
-                    "connectivity_mode=direct requires `target_staging_location` (the bundle is "
-                    "written AND read there; `source_staging_location` is unused in this mode)")
             if self.role != ROLE_TARGET:
                 raise ValueError(
                     "connectivity_mode=direct runs every stage in the TARGET workspace, so "
@@ -359,11 +411,6 @@ class Config:
                     "connectivity_mode=direct needs the source SP secret via EITHER "
                     "`source_sp_secret_scope`+`source_sp_secret_key` (preferred — a widget value "
                     "is visible on the run page and kept in run history) OR `spn_secret_value`")
-        else:
-            if self.role == ROLE_SOURCE and not self.source_staging_location:
-                raise ValueError("role=source requires `source_staging_location`")
-            if self.role == ROLE_TARGET and not self.target_staging_location:
-                raise ValueError("role=target requires `target_staging_location`")
 
         if self.imports.retry_mode not in RETRY_MODES:
             raise ValueError(f"`retry_mode` must be one of {RETRY_MODES}, "
@@ -397,6 +444,7 @@ class Config:
             source=SourceConnection(**d.get("source", {})),
             run_id=d.get("run_id", ""),
             source_workspace_id=d.get("source_workspace_id", ""),
+            staging_location_widget=d.get("staging_location", d.get("staging_location_widget", "")),
             source_staging_location=d.get("source_staging_location", ""),
             target_staging_location=d.get("target_staging_location", ""),
             dry_run=d.get("dry_run", True),

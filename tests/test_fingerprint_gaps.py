@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 
+from src.exporters import bundle_paths as BP
 from src.config.config_manager import Config
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.export_runner import ExportRunner
@@ -50,9 +51,9 @@ def _export_once(staging, objects, client, run_id="r1"):
     cfg = _cfg(staging, run_id=run_id)
     aw = ArtifactWriter(cfg)
     aw.ensure_output_path()
-    aw.write_json("inventory.json", {"objects_by_type": objects})
+    aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": objects})
     ExportRunner(client, cfg, aw, content_fetch_workers=2).run()
-    index = aw.read_json("export_index.json") or {}
+    index = aw.read_json(BP.EXPORT_INDEX_JSON) or {}
     return {(u["asset_type"], u["natural_key"]): u for u in index.get("units", [])}
 
 
@@ -100,7 +101,7 @@ def test_content_hash_is_not_added_to_the_create_payload():
         cfg = _cfg(d)
         aw = ArtifactWriter(cfg)
         aw.ensure_output_path()
-        aw.write_json("inventory.json", {"objects_by_type": objects})
+        aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": objects})
         ExportRunner(client, cfg, aw, content_fetch_workers=2).run()
         payloads = aw.read_json("export/workspace/objects.json") or {}
     for u in payloads.get("units", []):
@@ -120,11 +121,11 @@ def test_resumed_content_unit_keeps_its_content_fingerprint():
         cfg = _cfg(d)
         aw = ArtifactWriter(cfg)
         aw.ensure_output_path()
-        aw.write_json("inventory.json", {"objects_by_type": objects})
+        aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": objects})
 
         first = ExportRunner(client, cfg, aw, content_fetch_workers=2).run()
         fp_first = {(u["asset_type"], u["natural_key"]): u["fingerprint"]
-                    for u in (aw.read_json("export_index.json") or {}).get("units", [])}
+                    for u in (aw.read_json(BP.EXPORT_INDEX_JSON) or {}).get("units", [])}
 
         # Second run over the SAME dir: the checkpoint marks the notebook done, so it resumes
         # without re-fetching (a client that would raise proves no fetch happened).
@@ -132,7 +133,7 @@ def test_resumed_content_unit_keeps_its_content_fingerprint():
             "api/2.0/workspace/export": AssertionError("must not re-fetch a resumed unit")})
         ExportRunner(exploding, cfg, aw, content_fetch_workers=2).run()
         fp_second = {(u["asset_type"], u["natural_key"]): u["fingerprint"]
-                     for u in (aw.read_json("export_index.json") or {}).get("units", [])}
+                     for u in (aw.read_json(BP.EXPORT_INDEX_JSON) or {}).get("units", [])}
 
     key = ("notebook", "/Shared/nb")
     assert fp_second[key] == fp_first[key], \
@@ -301,14 +302,14 @@ def test_latest_export_pointer_written_after_manifest_and_ties_to_it():
         cfg = _cfg(d)
         aw = ArtifactWriter(cfg)
         aw.ensure_output_path()
-        aw.write_json("inventory.json", {"objects_by_type": objects})
+        aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": objects})
         ExportRunner(client, cfg, aw, content_fetch_workers=2).run()
 
         pointer = read_latest_export_pointer(cfg)
         assert pointer is not None, "LATEST_EXPORT.json was not written"
         assert pointer["run_id"] == "r1"
         assert pointer["source_workspace_id"] == "111"
-        manifest = aw.read_json("manifest.json")
+        manifest = aw.read_json(BP.MANIFEST_JSON)
         assert pointer["manifest_checksum"] == manifest_checksum(manifest), \
             "pointer checksum does not tie to this bundle's manifest"
         # A pointer for a DIFFERENT bundle must be detectable.

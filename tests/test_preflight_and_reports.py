@@ -15,6 +15,7 @@ import os
 import tempfile
 
 from src.config.config_manager import Config
+from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.importers.base_importer import ImportResult
 from src.importers.preflight import BLOCKING, DEGRADING, GO, GO_WITH_WARNINGS, NO_GO, Preflight
@@ -77,8 +78,8 @@ def _find(report, check_substring):
 # ── verdicts + grading ─────────────────────────────────────────────────────
 
 def test_a_clean_bundle_on_a_healthy_target_is_GO():
-    cfg, aw = _bundle(files={"identity_classification.json": {"identities": []},
-                             "export_index.json": {"units": []}})
+    cfg, aw = _bundle(files={BP.IDENTITY_CLASSIFICATION_JSON: {"identities": []},
+                             BP.EXPORT_INDEX_JSON: {"units": []}})
     report = Preflight(_scim_client(), cfg, aw, state=_store(cfg)).run()
     assert report["verdict"] == GO, f"unexpected blockers/warnings: {report['blocking']} " \
                                    f"{report['degrading']}"
@@ -87,7 +88,7 @@ def test_a_clean_bundle_on_a_healthy_target_is_GO():
 def test_a_corrupt_bundle_is_a_BLOCKING_no_go():
     """A partial upload must never present as a partial migration (D7)."""
     cfg, aw = _bundle()
-    aw.write_json("manifest.json", {"files": [
+    aw.write_json(BP.MANIFEST_JSON, {"files": [
         {"path": "export/vanished.json", "bytes": 10, "sha256": "deadbeef"}]})
     report = Preflight(_scim_client(), cfg, aw, state=_store(cfg)).run()
     assert report["verdict"] == NO_GO
@@ -135,7 +136,7 @@ def test_a_missing_account_GROUP_is_DEGRADING_and_NAMES_it():
     must NAME itself or the finding is unactionable.
     """
     cfg, aw = _bundle(files={
-        "identity_classification.json": {"identities": [
+        BP.IDENTITY_CLASSIFICATION_JSON: {"identities": [
             {"identity_type": "group", "displayName": "present-grp", "kind": "account"},
             {"identity_type": "group", "displayName": "absent-grp", "kind": "account"},
             {"identity_type": "group", "displayName": "entra-grp", "kind": "account",
@@ -162,7 +163,7 @@ def test_an_account_group_shadowed_on_target_is_BLOCKING_in_preflight():
     """A workspace-local group squatting an account group's name blocks the assignment forever, so
     it must be caught BEFORE import writes anything."""
     cfg, aw = _bundle(files={
-        "identity_classification.json": {"identities": [
+        BP.IDENTITY_CLASSIFICATION_JSON: {"identities": [
             {"identity_type": "group", "displayName": "corp-analysts", "kind": "account"}]}})
     client = _scim_client(groups=["corp-analysts"])
     report = Preflight(client, cfg, aw, state=_store(cfg)).run()
@@ -276,12 +277,13 @@ def test_a_check_that_itself_errors_does_not_hide_the_others():
     assert report["verdict"] != NO_GO, "a broken check must not fabricate a blocker"
 
 
-def test_preflight_writes_both_report_formats_and_creates_nothing():
+def test_preflight_writes_the_json_report_and_creates_nothing():
     cfg, aw = _bundle()
     client = _scim_client()
     Preflight(client, cfg, aw, state=_store(cfg)).run()
-    assert os.path.isfile(os.path.join(aw.root, "preflight_report.json"))
-    assert os.path.isfile(os.path.join(aw.root, "preflight_report.html"))
+    assert os.path.isfile(os.path.join(aw.root, BP.PREFLIGHT_REPORT_JSON))
+    # PLAN 7 §B2: no HTML twin any more — the JSON is the only preflight artifact.
+    assert not os.path.isfile(os.path.join(aw.root, "preflight_report.html"))
     mutating = [c for c in client.calls if c[0] in ("POST", "PUT", "PATCH", "DELETE")]
     assert mutating == [], f"preflight must create NOTHING, but called: {mutating}"
 
@@ -316,7 +318,7 @@ def test_import_results_json_is_joinable_on_asset_type_and_natural_key():
                "totals": {"total": 2}, "per_phase": [r.as_dict() for r in results]}
     write_import_reports(aw, cfg, summary, results, {})
 
-    payload = aw.read_json("import_results.json")
+    payload = aw.read_json(BP.IMPORT_RESULTS_JSON)
     keys = {(u["asset_type"], u["natural_key"]) for u in payload["units"]}
     assert keys == {("cluster", "etl"), ("job", "nightly")}
     for unit in payload["units"]:
@@ -333,12 +335,13 @@ def test_failures_sort_to_the_top_of_the_report():
         _row("job", "zzz-last", "failed"),
     ])]
     write_import_reports(aw, cfg, {"run_id": "r", "totals": {}, "per_phase": []}, results, {})
-    units = aw.read_json("import_results.json")["units"]
+    units = aw.read_json(BP.IMPORT_RESULTS_JSON)["units"]
     assert units[0]["import_status"] == "failed", "failures must lead, whatever they're called"
 
 
 def test_every_artifact_is_written_including_the_workbook():
-    """Import owns its OWN customer-readable output set, Excel included (D16)."""
+    """Import owns its OWN customer-readable output set, Excel included (D16). The slimmed set
+    (PLAN 7 §B2) is json + xlsx + manual-actions — NO import_results.html any more."""
     cfg, aw = _bundle()
     results = [_result_with_rows([_row("cluster", "etl", "created"),
                                   _row("repo", "/Repos/me/app", "manual"),
@@ -347,10 +350,11 @@ def test_every_artifact_is_written_including_the_workbook():
     write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111",
                                    "dry_run": False, "run_status": "completed",
                                    "totals": {}, "per_phase": []}, results, {})
-    for name in ("import_results.json", "import_results.html", "import_status.xlsx",
-                 "manual_actions_import.md"):
-        p = os.path.join(aw.root, name)
-        assert os.path.isfile(p) and os.path.getsize(p) > 0, f"{name} was not written"
+    for rel in (BP.IMPORT_RESULTS_JSON, BP.IMPORT_STATUS_XLSX, BP.MANUAL_ACTIONS_IMPORT_MD):
+        p = os.path.join(aw.root, rel)
+        assert os.path.isfile(p) and os.path.getsize(p) > 0, f"{rel} was not written"
+    # the removed HTML must NOT reappear
+    assert not os.path.isfile(os.path.join(aw.root, "import_results.html"))
 
 
 def test_import_workbook_has_one_sheet_per_asset_type_named_like_inventory():
@@ -373,7 +377,7 @@ def test_import_workbook_has_one_sheet_per_asset_type_named_like_inventory():
     write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111",
                                    "dry_run": False, "run_status": "completed",
                                    "totals": {}, "per_phase": []}, results, {})
-    wb = load_workbook(os.path.join(aw.root, "import_status.xlsx"))
+    wb = load_workbook(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
     names = set(wb.sheetnames)
     # per-asset-type tabs, using the SAME labels inventory uses — NOT a single "compute" family tab
     assert "compute" not in names, "import workbook still groups by family"
@@ -397,34 +401,71 @@ def test_the_manual_runbook_separates_the_four_kinds_of_outstanding_work():
              failure_category="dab_redeploy", note="bundle-owned"),
     ])]
     write_import_reports(aw, cfg, {"run_id": "r1", "totals": {}, "per_phase": []}, results, {})
-    md = open(os.path.join(aw.root, "manual_actions_import.md")).read()
+    md = open(os.path.join(aw.root, BP.MANUAL_ACTIONS_IMPORT_MD)).read()
     assert "Manual recreate" in md
     assert "retry_mode=failed_only" in md, "the retry instruction must be in the runbook"
     assert "Created but degraded" in md
     assert "import_assets=acls" in md and "retry_mode=skipped_only" in md
 
 
-def test_a_dry_run_report_says_so_loudly():
-    """Nobody should mistake a rehearsal for a migration."""
+def test_a_dry_run_report_says_so_loudly_and_uses_its_own_filename():
+    """Nobody should mistake a rehearsal for a migration, and a rehearsal must NOT overwrite a live
+    run's report — it writes `import_status_dry_run.xlsx` (A1) and the runbook says DRY RUN."""
     cfg, aw = _bundle()
     results = [_result_with_rows([_row("cluster", "etl", "created", dry_run=True)])]
     write_import_reports(aw, cfg, {"run_id": "r1", "dry_run": True, "run_status": "completed",
                                    "totals": {}, "per_phase": []}, results, {})
-    html = open(os.path.join(aw.root, "import_results.html")).read()
-    assert "DRY RUN" in html and "NOTHING was written" in html
-    md = open(os.path.join(aw.root, "manual_actions_import.md")).read()
+    # the dry-run workbook is written; the LIVE name is left untouched
+    assert os.path.isfile(os.path.join(aw.root, BP.IMPORT_STATUS_DRYRUN_XLSX))
+    assert not os.path.isfile(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+    md = open(os.path.join(aw.root, BP.MANUAL_ACTIONS_IMPORT_MD)).read()
     assert "DRY RUN" in md
 
 
+def test_a_live_run_does_not_overwrite_the_dry_run_report():
+    """A1 the other way round: a live run writes the plain name and leaves the rehearsal's alone."""
+    cfg, aw = _bundle(dry_run=False)
+    # rehearsal first
+    write_import_reports(aw, cfg, {"run_id": "r1", "dry_run": True, "run_status": "completed",
+                                   "totals": {}, "per_phase": []},
+                         [_result_with_rows([_row("cluster", "etl", "created", dry_run=True)])], {})
+    # then a live run
+    write_import_reports(aw, cfg, {"run_id": "r1", "dry_run": False, "run_status": "completed",
+                                   "totals": {}, "per_phase": []},
+                         [_result_with_rows([_row("cluster", "etl", "created")])], {})
+    assert os.path.isfile(os.path.join(aw.root, BP.IMPORT_STATUS_DRYRUN_XLSX)), \
+        "the rehearsal's report must survive the live run"
+    assert os.path.isfile(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+
+
 def test_an_aborted_run_is_visibly_partial():
-    """An abort must never look clean — the `finally` writes a report marked aborted."""
+    """An abort must never look clean — the results json is marked aborted."""
     cfg, aw = _bundle()
     results = [_result_with_rows([_row("cluster", "etl", "created")])]
     write_import_reports(aw, cfg, {"run_id": "r1", "run_status": "aborted",
                                    "abort_reason": "driver killed", "totals": {},
                                    "per_phase": []}, results, {})
-    html = open(os.path.join(aw.root, "import_results.html")).read()
-    assert "RUN ABORTED" in html and "PARTIAL" in html
+    payload = aw.read_json(BP.IMPORT_RESULTS_JSON)
+    assert payload["run_status"] == "aborted"
+
+
+def test_acl_parity_is_folded_into_the_workbook_as_a_sheet():
+    """D-1: parity is no longer a standalone acl_parity_report.{json,html}; it becomes the
+    'ACL Parity' sheet of import_status.xlsx and the standalone files are NOT written."""
+    from openpyxl import load_workbook
+    cfg, aw = _bundle(dry_run=False)
+    results = [_result_with_rows([_row("acl", "clusters:etl", "created")])]
+    parity = {"run_id": "r1", "objects_checked": 1, "counts": {"match": 1},
+              "known_limitation": "a platform quirk",
+              "objects": [{"perm_object_type": "clusters", "object": "etl", "verdict": "match",
+                           "missing_on_target": [], "extra_on_target": []}]}
+    write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                                   "run_status": "completed", "totals": {}, "per_phase": []},
+                         results, {"acl_parity": parity})
+    wb = load_workbook(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+    assert "ACL Parity" in wb.sheetnames
+    assert not os.path.isfile(os.path.join(aw.root, "acl_parity_report.json"))
+    assert not os.path.isfile(os.path.join(aw.root, "acl_parity_report.html"))
 
 
 def test_deleted_in_source_is_reported_as_review_not_deletion():
@@ -432,6 +473,6 @@ def test_deleted_in_source_is_reported_as_review_not_deletion():
     results = [_result_with_rows([_row("cluster", "etl", "created")])]
     write_import_reports(aw, cfg, {"run_id": "r1", "totals": {}, "per_phase": []}, results,
                          {"deleted_in_source": {"job": ["retired-job"]}})
-    md = open(os.path.join(aw.root, "manual_actions_import.md")).read()
+    md = open(os.path.join(aw.root, BP.MANUAL_ACTIONS_IMPORT_MD)).read()
     assert "Deleted in source" in md and "retired-job" in md
     assert "allow_deletes=true" in md, "the report must say deletion did NOT happen"

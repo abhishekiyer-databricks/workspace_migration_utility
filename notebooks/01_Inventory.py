@@ -12,19 +12,16 @@
 
 # COMMAND ----------
 
-# MAGIC %md ## Widgets  ( `role` MUST be **source** )
+# MAGIC %md ## Widgets
+# MAGIC The role is DERIVED from the mode (PLAN 7 §C): `direct` (default) runs this in the TARGET
+# MAGIC and reads the source over REST via OAuth M2M; `airgap` runs it INSIDE the source. Same
+# MAGIC collectors, different client (master §1a) — no `role` widget.
 
 # COMMAND ----------
 
-# `airgap` (default): this notebook runs INSIDE the source workspace with role=source. `direct`: it
-# runs in the TARGET with role=target and reads the source over REST via OAuth M2M — same collectors,
-# different client (master §1a).
-dbutils.widgets.dropdown("connectivity_mode", "airgap", ["airgap", "direct"], "Connectivity mode")
-dbutils.widgets.dropdown("role", "source", ["source", "target"],
-                         "Role (source in airgap, target in direct)")
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"], "Connectivity mode")
 dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("source_staging_location", "", "[airgap] Source staging (/Volumes/...)")
-dbutils.widgets.text("target_staging_location", "", "[direct] Staging (/Volumes/...)")
+dbutils.widgets.text("staging_location", "", "Staging location (/Volumes/...)")
 # direct-mode source connection. Secret = scope+key (preferred) OR spn_secret_value; scope wins.
 dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
 dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
@@ -35,7 +32,6 @@ dbutils.widgets.text("run_id", "", "Run id (blank = auto YYYYMMDD_HHMMSS)")
 dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
 dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
 dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
-dbutils.widgets.dropdown("verbose", "false", ["true", "false"], "Verbose API logging")
 dbutils.widgets.dropdown("force_full", "false", ["true", "false"],
                          "Force a fresh snapshot (ignore an incomplete bundle to resume)")
 
@@ -91,8 +87,9 @@ def _add_repo_root_to_syspath() -> str:
 _REPO_ROOT = _add_repo_root_to_syspath()
 print(f"repo root on sys.path: {_REPO_ROOT}")
 
-from src.config.config_manager import Config, ROLE_SOURCE
+from src.config.config_manager import Config, STAGE_INVENTORY
 from src.auth.token_manager import build_clients
+from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.collectors.inventory_runner import InventoryRunner
 from src.utils import logger as _logger
@@ -103,16 +100,10 @@ from src.utils import logger as _logger
 
 # COMMAND ----------
 
-cfg = Config.from_dbutils(dbutils, spark)  # reads role, mode, staging, safety caps, toggles
-
-# The role guard is MODE-AWARE (master §1a). In `airgap` mode this notebook runs INSIDE the source,
-# so role must be `source`. In `direct` mode every stage runs in the TARGET workspace and reads the
-# source over REST, so `role=target` is correct here — and what must be asserted instead is that the
-# source connection widgets are populated (Config.validate() already enforces that).
-assert cfg.role == ROLE_SOURCE or cfg.is_direct, (
-    f"01_Inventory must run with role=source in `airgap` mode (got role={cfg.role!r}, "
-    f"connectivity_mode={cfg.connectivity_mode!r}). In `direct` mode use role=target: every stage "
-    f"runs in the target workspace and reads the source over REST.")
+# Role is DERIVED from the stage + mode (PLAN 7 §C): inventory reads the source, so it is
+# role=source in airgap (runs inside the source) and role=target in direct (runs in the target and
+# reads the source over REST). No `role` widget.
+cfg = Config.from_dbutils(dbutils, spark, stage=STAGE_INVENTORY)
 
 # Resume model (Plan 2 §7a): with a blank run_id widget, reuse the newest INCOMPLETE bundle's
 # run_id (a whole-job re-run then continues that attempt) rather than minting a new snapshot.
@@ -148,9 +139,9 @@ except Exception as _exc:  # noqa: BLE001
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-# Inventory gets its OWN log file — it used to share `execution_export.log` with 02_Export, so
-# the two runs' records landed in one file with no way to tell them apart.
-_logger.set_log_file(os.path.join(aw.ensure_output_path(), "execution_inventory.log"))
+# Inventory gets its OWN log file (under misc/, PLAN 7 §D) — it used to share
+# `execution_export.log` with 02_Export, so the two runs' records landed in one file.
+_logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_INVENTORY_LOG))
 
 result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
 
@@ -163,7 +154,7 @@ if result["warnings"]:
     for w in result["warnings"]:
         print("  -", w)
 print(f"\nArtifacts: {result['output_path']}")
-print("  inventory.json / inventory.html / inventory.xlsx / identity_classification.json")
+print("  reports/inventory.xlsx  ·  misc/inventory.json  ·  misc/identity_classification.json")
 
 # Push the last log records to the Volume (the log is appended locally, then mirrored — append
 # straight onto a UC Volume silently fails, which used to truncate the log to one line).

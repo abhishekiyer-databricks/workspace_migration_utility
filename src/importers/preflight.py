@@ -20,6 +20,7 @@ So the answer to "must every manual step be done first?" is not "all or nothing"
 """
 from __future__ import annotations
 
+from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso, safe_str
 from src.utils.logger import get_logger
 
@@ -173,7 +174,7 @@ class Preflight:
         still worth running. Every affected unit is listed so the operator knows the cost of
         proceeding.
         """
-        classification = self.aw.read_json("identity_classification.json") or {}
+        classification = self.aw.read_json(BP.IDENTITY_CLASSIFICATION_JSON) or {}
         identities = classification.get("identities") or []
         if not identities:
             self._add("account identities present on target", True, DEGRADING,
@@ -292,7 +293,7 @@ class Preflight:
         Probed up front so this is known BEFORE the secrets phase rather than during it, and the two
         causes are reported separately because the customer fixes them differently.
         """
-        index = self.aw.read_json("export_index.json") or {}
+        index = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
         scopes = self.aw.read_json("export/secrets/scopes.json") or {}
         akv = [u for u in (scopes.get("units") or [])
                if safe_str((u.get("payload") or {}).get("backend_type")).upper() == "AZURE_KEYVAULT"]
@@ -465,55 +466,10 @@ class Preflight:
             "cosmetic": [f"{f['check']}: {f['detail']}" for f in cosmetic],
             "findings": self.findings,
         }
-        self.aw.write_json("preflight_report.json", report)
-        try:
-            self.aw.write_bytes("preflight_report.html",
-                                _render_html(report).encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning("preflight html not written", error=str(exc)[:160])
+        # PLAN 7 §B2: preflight prints its graded verdict inline in the notebook, so the HTML twin
+        # was redundant and is gone. The machine-readable `misc/preflight_report.json` stays (small,
+        # for audit; the manifest already excludes it).
+        self.aw.write_json(BP.PREFLIGHT_REPORT_JSON, report)
         _LOG.info("preflight verdict", verdict=verdict, blocking=len(blocking),
                   degrading=len(degrading), cosmetic=len(cosmetic))
         return report
-
-
-def _render_html(report: dict) -> str:
-    def esc(v):
-        return safe_str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    verdict = safe_str(report.get("verdict"))
-    colour = {GO: "#16a34a", GO_WITH_WARNINGS: "#d97706", NO_GO: "#b91c1c"}.get(verdict, "#334155")
-
-    rows = ""
-    for f in report.get("findings", []):
-        bg = "#d1fae5" if f["ok"] else {"BLOCKING": "#fee2e2", "DEGRADING": "#fef3c7",
-                                        "COSMETIC": "#f1f5f9"}.get(f["grade"], "#fff")
-        affected = f.get("affected_units") or []
-        affected_html = ("<br>".join(esc(a) for a in affected[:25])
-                         + (f"<br>… and {len(affected) - 25} more" if len(affected) > 25 else ""))
-        rows += (f'<tr style="background:{bg}"><td>{esc(f["check"])}</td>'
-                 f'<td>{"OK" if f["ok"] else f["grade"]}</td>'
-                 f'<td>{esc(f["detail"])}</td><td>{affected_html}</td></tr>')
-
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Preflight — {esc(verdict)}</title>
-<style>body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;
- background:#f8fafc;color:#0f172a}} header{{background:#1e3a5f;color:#fff;padding:22px 28px}}
- main{{padding:20px 28px 60px}} table{{border-collapse:collapse;width:100%;font-size:12px;
- background:#fff}} th,td{{border:1px solid #e2e8f0;padding:6px 9px;text-align:left;
- vertical-align:top}} th{{background:#1e3a5f;color:#fff}}
- .verdict{{display:inline-block;background:{colour};color:#fff;padding:6px 18px;border-radius:6px;
- font-weight:700;font-size:18px}} .legend{{font-size:12px;color:#475569;margin:14px 0}}
- td:nth-child(4){{font-family:ui-monospace,Menlo,monospace;font-size:11px;max-width:380px;
- word-break:break-all}}</style></head><body>
-<header><h1 style="margin:0 0 8px;font-size:20px">Account &amp; target preflight — verify only</h1>
-<div style="opacity:.85;font-size:13px">source workspace {esc(report.get('source_workspace_id'))}
- &middot; run {esc(report.get('run_id'))} &middot; mode {esc(report.get('connectivity_mode'))}
- &middot; {'DRY RUN' if report.get('dry_run') else 'LIVE'}</div></header><main>
-<p><span class="verdict">{esc(verdict)}</span></p>
-<p class="legend"><b>BLOCKING</b> — import cannot produce a correct target; with
- preflight_enforce=true (the default) 04_Import will not run. &nbsp;
- <b>DEGRADING</b> — import proceeds, but the named units below will be incomplete. &nbsp;
- <b>COSMETIC</b> — no effect on other assets. This notebook creates NOTHING.</p>
-<table><thead><tr><th>Check</th><th>Result</th><th>Detail</th>
-<th>Units affected if unmet</th></tr></thead><tbody>{rows}</tbody></table>
-</main></body></html>"""

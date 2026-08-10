@@ -149,6 +149,36 @@ class WorkspaceImporter(BaseImporter):
                     "note": "a directory has no mutable attributes — nothing to update"}
         return self._upload_content(unit, overwrite=True)
 
+    def _sp_roster_status(self, app_id: str) -> str:
+        """Whether `app_id` appears in the SOURCE identity roster (A2). Cached per importer.
+
+        Reads `identity_classification.json` from the bundle (written at inventory time) once and
+        indexes every service-principal applicationId in it. Returns "in_roster" (the SP existed on
+        source but wasn't migrated this run), "absent" (deleted in source), or "unknown" (the
+        classification file is missing/unreadable, so we cannot tell).
+        """
+        if not hasattr(self, "_sp_roster_cache"):
+            roster: set[str] = set()
+            have_roster = False
+            try:
+                from src.exporters import bundle_paths as _BP
+                doc = self.staging.read_json(_BP.IDENTITY_CLASSIFICATION_JSON) or {}
+                identities = doc.get("identities")
+                if identities is not None:
+                    have_roster = True
+                    for ident in identities:
+                        if safe_str(ident.get("identity_type")) == "service_principal":
+                            aid = safe_str(ident.get("applicationId"))
+                            if aid:
+                                roster.add(aid)
+            except Exception:  # noqa: BLE001 — a missing/garbled file just means "unknown"
+                have_roster = False
+            self._sp_roster_cache = (roster if have_roster else None)
+        cache = self._sp_roster_cache
+        if cache is None:
+            return "unknown"
+        return "in_roster" if safe_str(app_id) in cache else "absent"
+
     def _remap_home_path(self, path: str) -> tuple[str, str]:
         """Remap a service-principal HOME path from the source appId to the target appId (IMP-6).
 
@@ -189,15 +219,28 @@ class WorkspaceImporter(BaseImporter):
             if self._get_status(path):
                 return {"target_id": path, "note": "user home directory — already provisioned"}
             owner = home_owner(path)
-            # A UUID-shaped owner NOT in the SP map is an SP that was never migrated (out of the
-            # roster) — its home cannot and should not be created. Say so plainly (IMP-6).
+            # A UUID-shaped owner NOT in the SP map is an SP that was never migrated — its home
+            # cannot and should not be created. Say WHY the appId is missing (A2): distinguish
+            # "present in the source roster but not migrated this run" (identity skipped/filtered)
+            # from "deleted in source" (absent from the roster), because the operator's next step
+            # differs — re-run the identity phase vs. confirm the SP was deliberately removed.
             if _looks_like_app_id(owner):
+                roster = self._sp_roster_status(owner)
+                if roster == "in_roster":
+                    why = ("this SP IS present in the source roster but was NOT migrated in this "
+                           "run (its identity family was skipped or filtered). Re-run the identity "
+                           "phase for this workspace pair, then re-run with retry_mode=failed_only")
+                elif roster == "absent":
+                    why = ("this appId is NOT in the source roster — the SP was deleted in source. "
+                           "Its home content is not migrated by design; confirm the SP was meant to "
+                           "be removed")
+                else:
+                    why = ("the source identity classification is unavailable, so whether this SP "
+                           "was skipped or deleted cannot be determined — check the identity phase")
                 raise PrerequisiteMissing(
-                    f"`{path}` is a SERVICE PRINCIPAL home for applicationId `{owner}`, which was "
-                    f"NOT migrated (it is not in this run's identity map), so its home cannot be "
-                    f"created — an SP home only appears when the SP is provisioned. If this SP "
-                    f"should migrate, ensure it is in the source roster and re-run the identity "
-                    f"phase; otherwise its content is not migrated by design.")
+                    f"`{path}` is a SERVICE PRINCIPAL home for applicationId `{owner}`, which is not "
+                    f"in this run's identity map, so its home cannot be created — an SP home only "
+                    f"appears when the SP is provisioned. {why}.")
             raise PrerequisiteMissing(
                 f"`{path}` is a USER HOME directory, which cannot be created — it appears only once "
                 f"`{owner}` is provisioned on this workspace. Assign that user (identity phase / "

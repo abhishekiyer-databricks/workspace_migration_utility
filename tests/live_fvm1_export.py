@@ -79,7 +79,7 @@ def main() -> int:
 
 
 def _audit(root: str) -> None:
-    index = json.load(open(f"{root}/export_index.json"))
+    index = json.load(open(f"{root}/misc/export_index.json"))
     units = index["units"]
     print(f"\n=== EXPORT INDEX: {len(units)} units ===")
     print("per-asset_type counts (status breakdown):")
@@ -87,7 +87,7 @@ def _audit(root: str) -> None:
         print(f"  {at:<22} {index['counts'][at]}")
 
     # reconcile 1:1 against inventory (unit key coverage).
-    inv = json.load(open(f"{root}/inventory.json"))
+    inv = json.load(open(f"{root}/misc/inventory.json"))
     print("\n=== RECONCILE vs inventory.json ===")
     print("  inventory coarse counts:", inv["counts"])
 
@@ -181,7 +181,7 @@ def _audit(root: str) -> None:
     print(f"\n=== FINGERPRINTS: {len(units)} units, {len(bad_fp)} malformed ===")
 
     # manifest verify.
-    mani = json.load(open(f"{root}/manifest.json"))
+    mani = json.load(open(f"{root}/misc/manifest.json"))
     print(f"\n=== MANIFEST: {len(mani['files'])} files, checksummed ===")
 
 

@@ -5,6 +5,7 @@ Run: python3 -m tests.test_export   (from the repo root; no Databricks/network n
 from __future__ import annotations
 
 from src.config.config_manager import Config
+from src.exporters import bundle_paths as BP
 from tests.fakes import FakeClient
 
 
@@ -813,7 +814,7 @@ def test_content_pass_resumes_after_a_crash():
     finally:
         er.ContentFetcher = orig
 
-    cp = json.load(open(os.path.join(tmp, "checkpoint.json")))
+    cp = json.load(open(os.path.join(tmp, "misc", "checkpoint.json")))
     batch = er.CHECKPOINT_BATCH
     assert len(cp["export:content"]) == batch, "checkpoint did not survive the crash"
     assert len(cp["export:content:results"]) == batch, "outcomes not persisted → cannot resume"
@@ -843,7 +844,7 @@ def test_content_pass_resumes_after_a_crash():
     assert len(resumed) == batch
     assert all(u["export_status"] == "success" and u["content_ref"] == "orig" for u in resumed), \
         "resumed units lost their content_ref"
-    cp2 = json.load(open(os.path.join(tmp, "checkpoint.json")))
+    cp2 = json.load(open(os.path.join(tmp, "misc", "checkpoint.json")))
     assert len(cp2["export:content"]) == len(set(cp2["export:content"])) == n
 
     # force_full_export must ignore the checkpoint entirely.
@@ -878,12 +879,12 @@ def test_checkpoint_results_roundtrip_and_backcompat():
     # Second batch merges rather than replacing.
     aw.mark_done_bulk("c", ["d"], {"d": {"export_status": "skipped_oversize"}})
     assert sorted(aw.get_results("c")) == ["a", "d"]
-    assert len(json.load(open(os.path.join(tmp, "checkpoint.json")))["c"]) == 3
+    assert len(json.load(open(os.path.join(tmp, "misc", "checkpoint.json")))["c"]) == 3
     # Re-marking an existing key must not duplicate it.
     aw.mark_done_bulk("c", ["a"], None)
-    assert json.load(open(os.path.join(tmp, "checkpoint.json")))["c"].count("a") == 1
+    assert json.load(open(os.path.join(tmp, "misc", "checkpoint.json")))["c"].count("a") == 1
     # Old-format checkpoint: keys but no ":results" → empty dict, no exception.
-    aw.write_json("checkpoint.json", {"c": ["a", "b"]})
+    aw.write_json(BP.CHECKPOINT_JSON, {"c": ["a", "b"]})
     assert aw.get_results("c") == {}
     assert aw.is_done("c", "a")
 
@@ -1108,25 +1109,29 @@ def test_bundle_state_resolution():
     bs.write_latest_pointer(cfg, "20260101_120000", {"job": 3})
     assert bs.resolve_export_run_id(cfg, "", False) == ("20260101_120000", "pointer")
 
-    # an incomplete bundle (checkpoint, no manifest) is resumed ahead of the pointer.
+    # an incomplete bundle (checkpoint, no manifest) is resumed ahead of the pointer. The
+    # bookkeeping files live under misc/ now (PLAN 7 §D), which is where bundle_state probes them.
+    from src.exporters import bundle_paths as bp
+    def _write(rundir, rel, data):
+        p = os.path.join(rundir, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(data, f)
     inc = os.path.join(root, "20260102_000000")
     os.makedirs(inc)
-    with open(os.path.join(inc, "checkpoint.json"), "w") as f:
-        json.dump({}, f)
+    _write(inc, bp.CHECKPOINT_JSON, {})
     assert bs.resolve_export_run_id(cfg, "", False) == ("20260102_000000", "resume")
     # force_full skips resume → falls back to pointer.
     assert bs.resolve_export_run_id(cfg, "", True)[1] == "pointer"
 
     # a complete bundle (manifest present) is NOT resumed.
-    with open(os.path.join(inc, "manifest.json"), "w") as f:
-        json.dump({}, f)
+    _write(inc, bp.MANIFEST_JSON, {})
     assert bs.find_latest_incomplete_run(cfg) is None
 
     # inventory resolution: blank + incomplete → resume; else fresh.
     inc2 = os.path.join(root, "20260103_000000")
     os.makedirs(inc2)
-    with open(os.path.join(inc2, "checkpoint.json"), "w") as f:
-        json.dump({}, f)
+    _write(inc2, bp.CHECKPOINT_JSON, {})
     assert bs.resolve_inventory_run_id(cfg, "", False) == ("20260103_000000", "resume")
     assert bs.resolve_inventory_run_id(cfg, "", True) == (cfg.run_id, "fresh")
     assert bs.resolve_inventory_run_id(cfg, "X", False) == ("X", "widget")

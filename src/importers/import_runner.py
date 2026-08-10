@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from src.exporters import bundle_paths as BP
 from src.importers.phases import (FAMILY_ASSET_TYPES, PHASE_ORDER, asset_types_for, ordered,
                                   validate_selection)
 from src.state.state_store import ACTION_NOT_SELECTED, StateStore
@@ -64,11 +65,11 @@ def resolve_import_run_id(config, explicit_run_id: str = "") -> tuple[str, str]:
     if not config.imports.force_full_import:
         for rid in list_run_ids(config):
             d = run_dir(config, rid)
-            started = os.path.isfile(os.path.join(d, "checkpoint.json"))
-            finished = os.path.isfile(os.path.join(d, "import_results.json"))
+            started = os.path.isfile(os.path.join(d, BP.CHECKPOINT_JSON))
+            finished = os.path.isfile(os.path.join(d, BP.IMPORT_RESULTS_JSON))
             # An import that started and never finished is resumable. Requiring a manifest too
             # keeps us from "resuming" a bundle whose EXPORT never completed.
-            if started and not finished and os.path.isfile(os.path.join(d, "manifest.json")):
+            if started and not finished and os.path.isfile(os.path.join(d, BP.MANIFEST_JSON)):
                 if _has_import_checkpoint(d):
                     return rid, "resume-incomplete-import"
 
@@ -87,7 +88,7 @@ def _has_import_checkpoint(run_dir_path: str) -> bool:
     """Whether the checkpoint carries IMPORT progress (not just export's content keys)."""
     import json
     import os
-    p = os.path.join(run_dir_path, "checkpoint.json")
+    p = os.path.join(run_dir_path, BP.CHECKPOINT_JSON)
     try:
         with open(p, encoding="utf-8") as f:
             cp = json.load(f) or {}
@@ -156,7 +157,7 @@ class ImportRunner:
         if safe_str(pointer.get("run_id")) != safe_str(self.config.run_id):
             return (f"LATEST_EXPORT.json names run {pointer.get('run_id')!r} but this run is "
                     f"{self.config.run_id!r} (normal when run_id was passed explicitly)")
-        manifest = self.aw.read_json("manifest.json") or {}
+        manifest = self.aw.read_json(BP.MANIFEST_JSON) or {}
         expected = safe_str(pointer.get("manifest_checksum"))
         actual = manifest_checksum(manifest)
         if expected and expected != actual:
@@ -179,7 +180,7 @@ class ImportRunner:
         if verdict == "NO-GO" and self.config.imports.preflight_enforce:
             blockers = self.preflight_verdict.get("blocking") or []
             raise RuntimeError(
-                "00_Account_Preflight returned NO-GO, so import will not run:\n  - "
+                "Preflight returned NO-GO, so import will not run:\n  - "
                 + "\n  - ".join(str(b) for b in blockers[:10])
                 + "\nFix the blocking prerequisites, or set preflight_enforce=false to proceed "
                   "with the gaps accepted (they will show as failures per unit).")
@@ -196,7 +197,7 @@ class ImportRunner:
                 _LOG.info("export pointer note", note=pointer_note)
             self.enforce_preflight()
 
-            index = self.aw.read_json("export_index.json") or {}
+            index = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
             units_by_type = self._units_from_bundle()
 
             # ── state: ensure + recovery replay BEFORE any decision ────────
@@ -254,7 +255,7 @@ class ImportRunner:
         reported outcome rather than vanishing — "never silently skip" (§1.7).
         """
         from src.exporters.asset_export import ARTIFACT_PATH
-        index = self.aw.read_json("export_index.json") or {}
+        index = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
         payloads: dict[tuple, dict] = {}
         for rel in sorted(set(ARTIFACT_PATH.values())):
             doc = self.aw.read_json(rel) or {}

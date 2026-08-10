@@ -1,9 +1,13 @@
 """
 ArtifactWriter — run-isolated staging bundle I/O + manifest + checkpointing.
 
-AIR-GAPPED model:
-  • source side WRITES the bundle to `source_staging_location`;
-  • target side READS the same bundle (uploaded by ops) from `target_staging_location`.
+Bundle layout lives in `bundle_paths` (PLAN 7 §D): `export/` (the exported bundle, the only thing
+the air-gap moves), `reports/` (human-facing xlsx + the import runbook), `misc/` (machine/bookkeeping
+JSON + manifest/checkpoint + execution logs). Every read/write here and in callers goes through the
+`bundle_paths` registry, so the layout is a one-line change.
+
+  • Both sides use the single `staging_location`: the source-reading side WRITES the bundle there,
+    the target READS it there (in airgap ops uploads it in between; in direct it's the same location).
   • Staging location is a UC Volume path ("/Volumes/…") — managed OR an ADLS-backed external
     volume; either way it is FUSE-mounted so plain file I/O works. (Raw abfss:// is NOT used.)
     Mind the openpyxl-on-FUSE .xlsx gotcha: render to /tmp, then byte-copy to the Volume.
@@ -16,6 +20,7 @@ import os
 import shutil
 from typing import Any, Optional
 
+from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso
 from src.utils.logger import get_logger
 
@@ -24,7 +29,8 @@ _LOG = get_logger("artifact_writer")
 
 
 def _excluded_from_manifest(name: str) -> bool:
-    """Files the manifest must NOT checksum.
+    """Files the manifest must NOT checksum, matched on the BASENAME (the subdir a file lives in is
+    irrelevant to whether it belongs to the handoff — PLAN 7 §D moved these into `misc/`/`reports/`).
 
     The rule: the manifest attests to the EXPORTED BUNDLE — the things that must survive the handoff
     intact. Anything written *after* the manifest, or written by a later stage, cannot be
@@ -42,11 +48,13 @@ def _excluded_from_manifest(name: str) -> bool:
       `manual_actions_import.md`) — produced by the TARGET after the bundle arrived, so they are not
       part of what the handoff must deliver, and they change on every run.
     """
-    if name in ("manifest.json", "checkpoint.json", "manual_actions_import.md"):
+    import os as _os
+    base = _os.path.basename(name)
+    if base in ("manifest.json", "checkpoint.json", "manual_actions_import.md"):
         return True
-    if name.startswith("execution") and name.endswith(".log"):
+    if base.startswith("execution") and base.endswith(".log"):
         return True
-    return name.startswith(("import_", "preflight_report", "acl_parity_report"))
+    return base.startswith(("import_", "preflight_report", "acl_parity_report"))
 
 
 class ArtifactWriter:
@@ -64,10 +72,14 @@ class ArtifactWriter:
         return os.path.join(self._root, rel_path)
 
     def ensure_output_path(self) -> str:
-        """Create the run-isolated bundle dir (+ standard subdirs). Return it."""
-        for sub in ("", "export", "export/identity", "export/compute",
-                    "export/workspace", "export/secrets", "export/dashboards", "export/misc"):
-            os.makedirs(self._abs(sub) if sub else self._root, exist_ok=True)
+        """Create the run-isolated bundle dir (+ standard subdirs). Return it.
+
+        The layout (PLAN 7 §D) is `export/` (the handoff), `reports/` (human-facing), `misc/`
+        (machine/bookkeeping). All names come from `bundle_paths` so the layout lives in one place.
+        """
+        os.makedirs(self._root, exist_ok=True)
+        for sub in BP.EXPORT_SUBDIRS + BP.TOP_LEVEL_SUBDIRS:
+            os.makedirs(self._abs(sub), exist_ok=True)
         _LOG.info("staging ready", path=self._root)
         return self._root
 
@@ -150,7 +162,7 @@ class ArtifactWriter:
 
     def write_manifest(self, asset_counts: dict) -> dict:
         manifest = self.build_manifest(asset_counts)
-        self.write_json("manifest.json", manifest)
+        self.write_json(BP.MANIFEST_JSON, manifest)
         _LOG.info("manifest written", files=len(manifest["files"]))
         return manifest
 
@@ -159,7 +171,7 @@ class ArtifactWriter:
 
         Returns {"ok": bool, "missing": [...], "mismatched": [...], "manifest": {...}}.
         """
-        manifest = self.read_json("manifest.json")
+        manifest = self.read_json(BP.MANIFEST_JSON)
         if manifest is None:
             return {"ok": False, "missing": ["manifest.json"], "mismatched": [], "manifest": None}
         missing, mismatched = [], []
@@ -174,10 +186,10 @@ class ArtifactWriter:
 
     # ── checkpointing ─────────────────────────────────────────────────────
     def _checkpoint_path(self) -> str:
-        return self._abs("checkpoint.json")
+        return self._abs(BP.CHECKPOINT_JSON)
 
     def _load_checkpoint(self) -> dict:
-        return self.read_json("checkpoint.json") or {}
+        return self.read_json(BP.CHECKPOINT_JSON) or {}
 
     def is_done(self, component: str, item_key: str) -> bool:
         cp = self._load_checkpoint()
@@ -188,7 +200,7 @@ class ArtifactWriter:
         cp.setdefault(component, [])
         if item_key not in cp[component]:
             cp[component].append(item_key)
-        self.write_json("checkpoint.json", cp)
+        self.write_json(BP.CHECKPOINT_JSON, cp)
 
     def mark_done_bulk(self, component: str, item_keys, results: Optional[dict] = None) -> None:
         """Record many item_keys done in ONE checkpoint write (avoids O(n²) per-item rewrites on
@@ -212,7 +224,7 @@ class ArtifactWriter:
                 seen.add(k)
         if results:
             cp.setdefault(f"{component}:results", {}).update(results)
-        self.write_json("checkpoint.json", cp)
+        self.write_json(BP.CHECKPOINT_JSON, cp)
 
     def get_results(self, component: str) -> dict:
         """item_key → recorded outcome dict for `component` (empty if none / older checkpoint)."""

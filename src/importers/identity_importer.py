@@ -517,9 +517,9 @@ class IdentityImporter(BaseImporter):
         a group renamed between regions rather than a separate lookup path.
 
         Enumeration needs account read access. In `airgap` mode with workspace-admin only we cannot
-        list the account, so `00_Account_Preflight` writes `account_principal_ids.json` into the
-        bundle and it is consulted first — which keeps the air-gap intact while still letting the
-        workspace-side PUT do the actual work.
+        list the account, so an optional `account_principal_ids.json` in the bundle (populated by
+        the caller into `context`) is consulted first — which keeps the air-gap intact while still
+        letting the workspace-side PUT do the actual work.
         """
         preresolved = (self.context.get("account_principal_ids") or {}).get("groups") or {}
         for key in (name, safe_str(unit.get("externalId"))):

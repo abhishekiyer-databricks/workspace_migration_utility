@@ -29,6 +29,7 @@ dependency, so the note says so plainly (preflight WARNs on it too).
 """
 from __future__ import annotations
 
+from src.exporters import bundle_paths as BP
 from src.importers.base_importer import BaseImporter, PrerequisiteMissing
 from src.utils.helpers import safe_str
 
@@ -147,7 +148,7 @@ class SecretsImporter(BaseImporter):
         if self._manage_cache is not None:
             return self._manage_cache
         cache: dict = {}
-        for entry in (self.staging.read_json("export/acls.json") or []):
+        for entry in (self.staging.read_json(BP.EXPORT_ACLS_JSON) or []):
             if not isinstance(entry, dict) or safe_str(entry.get("asset_type")) != "secret_scope":
                 continue
             scope = safe_str(entry.get("natural_key"))

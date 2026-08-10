@@ -5,25 +5,22 @@
 # MAGIC JSON payload per migratable unit, the actual notebook/file **bytes**, `export/acls.json`,
 # MAGIC the `export_index.json` tie-back ledger, `export_status.xlsx`, and `manifest.json` (checksums).
 # MAGIC
-# MAGIC **Runs on the `source` side** (air-gapped model — `plans/PLAN_0_master.md` §1,§3), right
-# MAGIC after `01_Inventory`. Idempotent + checkpointed + fail-soft. Reads only THIS workspace;
-# MAGIC writes only to `source_staging_location`. No target calls, no secrets.
+# MAGIC **Runs on the source-reading side** (air-gapped model — `plans/PLAN_0_master.md` §1,§3),
+# MAGIC right after `01_Inventory`. Idempotent + checkpointed + fail-soft. Reads only the source;
+# MAGIC writes only to `staging_location`. No target calls, no secrets.
 
 # COMMAND ----------
 
-# MAGIC %md ## Widgets  ( `role` MUST be **source** )
+# MAGIC %md ## Widgets
+# MAGIC The role is DERIVED from the mode (PLAN 7 §C): `direct` (default) runs this in the TARGET,
+# MAGIC reads the source over REST and writes the bundle to `staging_location`; `airgap` runs it
+# MAGIC INSIDE the source and writes to `staging_location` for ops to move. No `role` widget.
 
 # COMMAND ----------
 
-# `airgap` (default): this notebook runs INSIDE the source workspace with role=source, and writes to
-# source_staging_location for ops to move. `direct`: it runs in the TARGET with role=target, reads the
-# source over REST via OAuth M2M, and writes straight to target_staging_location (no manual hop).
-dbutils.widgets.dropdown("connectivity_mode", "airgap", ["airgap", "direct"], "Connectivity mode")
-dbutils.widgets.dropdown("role", "source", ["source", "target"],
-                         "Role (source in airgap, target in direct)")
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"], "Connectivity mode")
 dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("source_staging_location", "", "[airgap] Source staging (/Volumes/...)")
-dbutils.widgets.text("target_staging_location", "", "[direct] Staging (/Volumes/...)")
+dbutils.widgets.text("staging_location", "", "Staging location (/Volumes/...)")
 # direct-mode source connection. The secret is EITHER a scope pointer (preferred — a widget value is
 # visible on the run page and kept in run history) OR spn_secret_value; scope+key wins when both set.
 dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
@@ -39,6 +36,7 @@ dbutils.widgets.text("content_fetch_workers", "8", "Parallel content-fetch worke
 dbutils.widgets.dropdown("force_full_export", "false", ["true", "false"],
                          "Ignore checkpoint/resume — re-export everything")
 # Per-asset toggles (all default true; set false to skip a family — still recorded as 'skip').
+# These are BUNDLE scope and belong on the source side; import narrows with `import_assets` instead.
 for _t in ["identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
            "dashboards", "genie", "serving", "misc"]:
     dbutils.widgets.dropdown(f"migrate_{_t}", "true", ["true", "false"], f"Migrate {_t}")
@@ -81,8 +79,9 @@ def _add_repo_root_to_syspath() -> str:
 _REPO_ROOT = _add_repo_root_to_syspath()
 print(f"repo root on sys.path: {_REPO_ROOT}")
 
-from src.config.config_manager import Config, ROLE_SOURCE
+from src.config.config_manager import Config, STAGE_EXPORT
 from src.auth.token_manager import build_clients
+from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.bundle_state import resolve_export_run_id
 from src.exporters.export_runner import ExportRunner
@@ -94,14 +93,10 @@ from src.utils import logger as _logger
 
 # COMMAND ----------
 
-cfg = Config.from_dbutils(dbutils, spark)  # reads role, mode, staging, safety caps, toggles
-
-# Mode-aware guard (master §1a): `airgap` runs this inside the SOURCE (role=source); `direct` runs
-# every stage in the TARGET and reads the source over REST (role=target). Config.validate() already
-# enforces that the source connection widgets are populated in `direct` mode.
-assert cfg.role == ROLE_SOURCE or cfg.is_direct, (
-    f"02_Export must run with role=source in `airgap` mode (got role={cfg.role!r}, "
-    f"connectivity_mode={cfg.connectivity_mode!r}). In `direct` mode use role=target.")
+# Role is DERIVED from stage + mode (PLAN 7 §C): export reads the source, so role=source in airgap
+# (runs inside the source) and role=target in direct (runs in the target, reads the source over
+# REST). Config.validate() enforces the source connection widgets in direct mode.
+cfg = Config.from_dbutils(dbutils, spark, stage=STAGE_EXPORT)
 
 # Resolve the run_id (Plan 2 §2b): explicit widget → task-value (2-task job) → incomplete-bundle
 # resume → LATEST_INVENTORY.json pointer → fail loudly. Never invent a run_id (empty bundle).
@@ -135,7 +130,7 @@ print(f"Bundle           : {cfg.output_path}")
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-_logger.set_log_file(os.path.join(aw.ensure_output_path(), "execution_export.log"))
+_logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_EXPORT_LOG))
 
 _workers = int((dbutils.widgets.get("content_fetch_workers") or "8") or 8)
 result = ExportRunner(client, cfg, aw, dbutils=dbutils,
@@ -153,7 +148,8 @@ print("\n=== Import actions (what the TARGET side will do) ===")
 for _act, _n in sorted((result.get("action_counts") or {}).items(), key=lambda kv: -kv[1]):
     print(f"  {_act or '(none)':<20} {_n:>6}")
 print(f"\nBundle: {result['output_path']}")
-print("  export/ + export_index.json + export/acls.json + export_status.xlsx + manifest.json")
+print("  export/ + misc/export_index.json + export/acls.json + reports/export_status.xlsx + "
+      "misc/manifest.json")
 
 # Verify the manifest we just wrote checksums cleanly (handoff-integrity self-check).
 _verify = aw.verify_manifest()

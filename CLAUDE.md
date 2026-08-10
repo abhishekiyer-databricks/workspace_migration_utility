@@ -15,8 +15,8 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
   `02_Export` read the source over REST using a **source workspace-admin SP's client id +
   secret** (OAuth M2M; the secret comes from a target-workspace secret scope OR a widget — both
   supported, always redacted from artifacts/logs — see PLAN_3_import.md §2a). The
-  bundle is written straight to `target_staging_location`, so there is **no manual hop** and the
-  whole migration can run as **one end-to-end Job** (`00_Main_EndToEnd`, master §4a).
+  bundle is written straight to the single `staging_location`, so there is **no manual hop** and the
+  whole migration can run as **one end-to-end Job** (`jobs/direct_end_to_end_*.job.json`, PLAN 7 §E).
 - Both modes produce/consume the **same bundle**, so import/transform/validate are mode-agnostic;
   the mode is recorded in `manifest.json` + `config_resolved.json`. Only `01`/`02` and
   `auth/token_manager.build_clients()` are mode-aware.
@@ -28,13 +28,15 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
     reads source assets; **writes a bundle** to a **source staging location**.
   - **HANDOFF**: the **customer ops team physically moves** the bundle from the source
     location to a **target staging location** (download + upload), made readable by target.
-  - **TARGET side** (`00_Account_Preflight`, `03_Transform_Review`, `04_Import`,
-    `05_Validate`): runs **inside the target workspace**; reads the bundle; writes target.
-- The same Git folder is pulled into **both** workspaces; a `role` widget (`source`/`target`)
-  selects behaviour and guards mis-runs. **No live cross-workspace REST call, ever.**
-- **Staging (DECIDED):** two widgets — `source_staging_location` + `target_staging_location`
-  — each a **UC Volume path (`/Volumes/…`)**: managed OR an ADLS-backed external volume
-  (register ADLS as a UC external location → external volume). Always FUSE-mounted so file I/O
+  - **TARGET side** (`03_Transform_Review`, `04_Import` — preflight runs inside it): runs
+    **inside the target workspace**; reads the bundle; writes target.
+- The same Git folder is pulled into **both** workspaces; the role is DERIVED from stage + mode
+  (PLAN 7 §C — no `role` widget) and guards mis-runs. **No live cross-workspace REST call, ever.**
+- **Staging (PLAN 7 §C):** ONE widget — `staging_location` — a **UC Volume path (`/Volumes/…`)**:
+  managed OR an ADLS-backed external volume (the airgap hop is "source side sets location A,
+  target side sets location B", two separate runs each with their own single value; the old
+  `source_/target_staging_location` remain only as an upgrade fallback). Register ADLS as a UC
+  external location → external volume. Always FUSE-mounted so file I/O
   is uniform; **raw `abfss://` is not used**. Bundle is run-isolated + self-describing:
   `manifest.json` (asset list, counts, checksums, source ws id, tool version) lets the target
   verify the upload arrived complete before acting.
@@ -57,14 +59,18 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
 - A workspace **never authenticates to the other workspace** — the file bundle is the only
   thing that crosses. So the "same Databricks account?" question is irrelevant to the build.
 
-## Config / driver (decided) — widget-based, no credentials in widgets
-- Common widgets: `connectivity_mode` (airgap|direct), `role` (source|target), `run_id`,
-  `source_workspace_id`.
-- Source side: `source_staging_location`, `max_scim/max_workspace_items/max_ws_api_calls`,
-  `verbose`. Target side: `target_staging_location`, `dry_run`, `account_id`, transform options,
-  `import_assets` (which families to import this session), `state_catalog`/`state_schema`/
-  (one shared catalog+schema across all pairs, assumed to exist; table names tool-owned),
-  `preflight_enforce`, `retry_mode` (off|failed_only|skipped_only|failed_and_skipped).
+## Config / driver (decided; trimmed in PLAN 7 §C) — widget-based, no credentials in widgets
+- Common widgets: `connectivity_mode` (airgap|direct, **default direct**), `run_id`,
+  `source_workspace_id`, and ONE `staging_location`. **No `role` widget** — role is DERIVED from
+  the stage (inventory/export/import) + mode (`role_for_stage`); **no `verbose` widget** either.
+- Source side (01/02): `max_scim/max_workspace_items/max_ws_api_calls`, `content_fetch_workers`,
+  `force_full_*`, and the 11 `migrate_*` per-asset toggles (bundle scope). Target side (04):
+  `dry_run`, `account_id`, transform options, `import_assets` (which families to import this
+  session), `state_catalog`/`state_schema` (one shared catalog+schema across all pairs, assumed to
+  exist; table names tool-owned), `preflight_enforce`, `library_force_start_clusters`,
+  `pause_job_schedules`, `allow_deletes`, `retry_mode` (off|failed_only|skipped_only|failed_and_skipped).
+  (`skip_manifest_verify` and the `migrate_*` toggles were REMOVED from the import notebook — the
+  toggles are source-side bundle scope, and `import_assets` is the target-side selector.)
 - `direct` mode only: `source_workspace_url`, `source_sp_client_id`, and the secret **either** as
   `source_sp_secret_scope`+`source_sp_secret_key` (pointer, preferred when both set) **or**
   `spn_secret_value` (widget fallback). Always redacted from artifacts + logs.
@@ -100,10 +106,11 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
 - Migration is done **one workspace at a time**, but there may be **one-time account-level
   prerequisites** (only relevant if region-2 is a SEPARATE Databricks account): Entra→SCIM
   provisioning, account groups, UMI/Entra SPs must exist in the target account first.
-- Ship a `00_Account_Preflight` notebook (TARGET side) that **verifies** (does NOT perform)
-  these: reads the exported bundle's identity classification, lists the account identities
-  referenced, and reports which are present/absent/assigned in the target account → **go/no-go
-  gate**. Actual Entra/SCIM setup stays a **customer IT one-time task** (needs Entra admin).
+- The preflight gate **verifies** (does NOT perform) these: reads the exported bundle's identity
+  classification, lists the account identities referenced, and reports which are
+  present/absent/assigned in the target account → **go/no-go gate**. Actual Entra/SCIM setup stays a
+  **customer IT one-time task** (needs Entra admin). PLAN 7 §B1 removed the standalone
+  `00_Account_Preflight` notebook — the gate now runs INSIDE `04_Import` (`src/importers/preflight.py`).
 - Account model (same vs new account) is **still unknown**; preflight detects & handles both.
 
 ## Why it exists (context that isn't in the code)
@@ -140,28 +147,40 @@ The deployment model is not fixed, so the utility supports both. See PLAN_0_mast
   conventions so this utility is consistent with the customer's other tool. Cloned locally
   at `/tmp/uc-inventory-migration_ref` during design.
 
-## Repo layout & storage (decided — mirror the UC tool)
+## Repo layout & storage (decided — mirror the UC tool; notebooks slimmed in PLAN 7)
 Thin notebooks + importable `src/` package. Same deploy pattern the customer already knows.
-Deployed twice — same Git folder pulled into BOTH workspaces; a `role` widget selects side.
+Deployed twice — same Git folder pulled into BOTH workspaces; the role is DERIVED from
+`connectivity_mode` + which stage (PLAN 7 §C — no `role` widget any more).
 ```
-notebooks/   00_Main_Source, 00_Main_Target, 00_Account_Preflight, 01_Inventory (source),
-             02_Export (source), 03_Transform_Review (target), 04_Import (target),
-             05_Validate (target)   (thin; widgets + %run/orchestrate)
+notebooks/   01_Inventory, 02_Export, 03_Transform_Review, 04_Import   (thin; widgets)
+             00_Install_Jobs (idempotent Jobs-API installer; deploys jobs/*.job.json)
+jobs/        *.job.json  (checked-in Jobs API 2.2 definitions; installed by 00_Install_Jobs)
 src/         config/  auth/(context-token client for THIS ws)  collectors/(read this ws)
              importers/(write this ws)  identity/  state/(target Delta upsert state)
-             transform/  reports/  exporters/  utils/
+             transform/  reports/  exporters/(incl. bundle_paths.py — the layout registry)  utils/
 requirements.txt
 ```
 Config is **widget-based** — no config files; the same widget values double as job params.
+PLAN 7 removed the standalone orchestrator/validate/preflight notebooks (`00_Main_*`,
+`05_Validate`, `00_Account_Preflight`): preflight runs INSIDE `04_Import`, and stitching lives in
+the packaged multi-task Jobs (`jobs/`, installed by `00_Install_Jobs`).
+
+### Staging bundle layout (PLAN 7 §D — via `src/exporters/bundle_paths.py`)
+Under `<staging_location>/wsmig/<source_workspace_id>/<run_id>/`: `export/` (the exported bundle,
+the only thing the air-gap moves), `reports/` (human-facing xlsx + the import runbook), `misc/`
+(machine/bookkeeping JSON — inventory.json, export_index.json, config_resolved.json, manifest.json,
+checkpoint.json, import_results.json, preflight_report.json — + the execution logs). Every read/write
+goes through the `bundle_paths` registry so the layout lives in ONE place. The pair-level pointers
+`LATEST_INVENTORY.json` / `LATEST_EXPORT.json` sit ABOVE the run dir at the wsmig root.
 
 Planning docs live in `plans/`: `plans/PLAN_0_master.md` is the MASTER plan;
 `plans/PLAN_<n>_*.md` are the per-feature sub-plans (each is the review gate before that
 feature's code). Plan 1 = setup + inventory (source side).
 
 Conventions carried over from the UC tool:
-- **`Config` dataclass** built via `from_dbutils()`/`from_dict()`; holds `role`, staging
-  locations, per-asset toggles, transform options. Auth = this workspace's run-as SP context
-  token (no creds in config).
+- **`Config` dataclass** built via `from_dbutils(..., stage=)`/`from_dict()`; holds the derived
+  `role`, the single `staging_location`, per-asset toggles, transform options. Auth = this
+  workspace's run-as SP context token (no creds in config).
 - **Bootstrap**: the repo is a Git folder in each workspace; each notebook prepends the repo
   root to `sys.path` — no zip/init-script. Optionally wrap the source-side notebooks and the
   target-side notebooks as two multi-task Databricks **Jobs** (run-as workspace-admin SP).
@@ -191,19 +210,25 @@ Cloned locally at `/tmp/WorkspaceMigration_ref` during design (re-clone from the
 - **Secret values caveat (still applies)**: secret scope *values* are never exported by
   the API — only scope names + ACLs migrate; values must be re-populated on target.
 
-## Notebooks (scaffolded as stubs; see plans/PLAN_0_master.md §4)
+## Notebooks (PLAN 7 §B1 slimmed the set to four + the job installer)
 `airgap` mode: `01_Inventory`/`02_Export` run in the SOURCE; the rest run in the TARGET.
-`direct` mode: ALL of them run in the TARGET (01/02 read the source over REST).
-- `00_Account_Preflight` — VERIFY-only account prereqs (run once before workspace #1)
+`direct` mode (default): ALL of them run in the TARGET (01/02 read the source over REST).
+Role is DERIVED from stage + mode (no `role` widget).
 - `01_Inventory` — read-only enumeration + identity classification → report (Plan 1)
-- `02_Export` (source) — dump enabled assets → source staging **bundle** (JSON + notebook SOURCE/DBC) + manifest/checksums. Checkpointed.
-- `03_Transform_Review` (target) — verify manifest; apply mappings/excludes → pre/post diff for sign-off
-- `04_Import` (target) — create on target in dependency order; idempotent + checkpointed + dry-run
-- `05_Validate` (target) — target vs export-manifest reconciliation report
-- `00_Main_Source` / `00_Main_Target` — optional per-side orchestrators (`airgap`)
-- `00_Main_EndToEnd` — single Job running inventory→export→preflight→transform→import→validate
-  (**`direct` mode only**; the manual hop makes this impossible in `airgap`)
-Reusable logic lives in the importable `src/` package (Git folder); notebooks stay thin.
+- `02_Export` — dump enabled assets → staging **bundle** (JSON + notebook SOURCE/DBC) + manifest/checksums. Checkpointed.
+- `03_Transform_Review` — verify manifest; apply mappings/excludes → pre/post diff for sign-off (still a stub, Plan 4)
+- `04_Import` — create on target in dependency order; idempotent + checkpointed + dry-run. **Preflight runs INSIDE it** (verify-only gate).
+- `00_Install_Jobs` — idempotent Jobs-API installer: fills every config value ONCE and deploys the selected `jobs/*.job.json` (PLAN 7 §E).
+DELETED in PLAN 7 §B1: `00_Account_Preflight` (preflight is inside `04_Import`), `05_Validate`
+(deferred Plan 4), `00_Main_Source`/`00_Main_Target`/`00_Main_EndToEnd` (stitching moved into the
+packaged multi-task Jobs). Reusable logic lives in the importable `src/` package; notebooks stay thin.
+
+### Packaged jobs (PLAN 7 §E — `jobs/*.job.json`, non-DAB, Git-folder friendly)
+Checked-in Jobs API 2.2 definitions, installed by `00_Install_Jobs` (which projects the ONE-time
+config into each job's `base_parameters`, prefers the secret-scope pointer, and creates-or-resets by
+name). Shipped: `direct_end_to_end_dry_run` + `direct_end_to_end_live` (01→02→04, differing only in
+the import task's baked `dry_run`), single-task `inventory`/`export`/`import`, and `airgap_source`
+(01→02 for the source side). The installer's `deploy_jobs` multiselect picks which to create.
 
 ### Asset dependency order (non-UC; Hive metastore + UC OUT of scope)
 Identity (users → SPs → groups incl. nested + entitlements) → Compute (pools → policies →
@@ -274,6 +299,22 @@ account-admin / customer IT.
 - **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested**. The whole pipeline runs:
   inventory → export → preflight → import (all 12 phases) → reports.
 
+### PLAN 7 (cleanup + packaging) IMPLEMENTED 2026-08-09
+- **A** behavioural: dry-run report is `reports/import_status_dry_run.xlsx` (never clobbers the live
+  one); the orphan-SP-home message distinguishes "in source roster but not migrated this run" from
+  "deleted in source" via `identity_classification.json`.
+- **B** slimming: deleted 5 notebooks (`00_Main_*`, `05_Validate`, `00_Account_Preflight`); removed
+  `import_results.html`, `preflight_report.html`, standalone `acl_parity_report.{json,html}` and
+  gated `inventory.html` off (generator kept behind `WRITE_INVENTORY_HTML`). ACL parity is now the
+  **"ACL Parity" sheet** of `import_status.xlsx` (fed via the runner's shared context).
+- **C** widgets: one `staging_location` (old two kept only as an upgrade fallback in `from_dbutils`);
+  `role` DERIVED from stage+mode; `verbose`/`skip_manifest_verify`/`migrate_*` dropped from import.
+  `connectivity_mode` defaults to `direct`.
+- **D** layout: `src/exporters/bundle_paths.py` is the single path registry; the bundle is now
+  `export/` + `reports/` + `misc/`, with `manifest.json`/`checkpoint.json`/all bookkeeping in `misc/`.
+- **E** jobs: `jobs/*.job.json` (Jobs API 2.2) + `notebooks/00_Install_Jobs.py` +
+  `src/utils/job_templates.py`; installer projects config into each job and creates-or-resets by name.
+
 ### Review-driven fixes 2026-08-08 (9 items, all live-verified on target_ws_3; 280 offline tests)
 Found by the first customer-style run (source_ws → target_ws_3, direct mode). Each has a regression test.
 1. **INV-1 jobs `run_as`** — `jobs/list` OMITS run-as; only `jobs/get` returns it, top-level as
@@ -325,8 +366,7 @@ Found by the first customer-style run (source_ws → target_ws_3, direct mode). 
 - **Plan 3 (import) is complete**: `src/state/state_store.py` + `sql_backend.py`, all 12 importers
   in `src/importers/` (identity, compute, workspace, secrets, jobs, sql, dlt, dashboards, genie,
   serving, misc, acls) + `base_importer` / `phases` / `import_runner` / `preflight`,
-  `src/reports/import_report.py`, and the notebooks `00_Account_Preflight`, `04_Import`,
-  `00_Main_EndToEnd`. `01`/`02` now have mode-aware role guards.
+  `src/reports/import_report.py`, and the notebook `04_Import` (preflight runs inside it).
 - **Test suite**: 243 offline tests (`python3 -m pytest`), plus live harnesses:
   `live_direct_mode.py` (OAuth M2M, 13/13), `live_state_store.py` (real Delta MERGE, 24/24),
   `live_e2e_migration.py` (the full migration + idempotency + update + adopt + retry + ACL parity).
@@ -356,6 +396,7 @@ Found by the first customer-style run (source_ws → target_ws_3, direct mode). 
   could never fire. Fixed by stamping alerts from the bundle state file
   (`InventoryRunner._DAB_STAMP_TARGETS` + `_SQL_TYPE_FOR`, which also keeps the mixed `sql` bucket
   from letting a warehouse inherit an alert's claim on the same id).
-- **Deferred to Plan 4** (unchanged): `03_Transform_Review` and `05_Validate` are still stubs — the
-  cross-stage inventoried→exported→imported reconciliation. `import_results.json` is already written
-  in the shape Plan 4 joins on.
+- **Deferred to Plan 4**: `03_Transform_Review` is still a stub — the cross-stage
+  inventoried→exported→imported reconciliation. `misc/import_results.json` is already written in the
+  shape Plan 4 joins on. (`05_Validate` was deleted in PLAN 7 §B1; Plan 4 will re-add reconciliation
+  into `03_Transform_Review` or a successor rather than a separate validate notebook.)

@@ -312,7 +312,40 @@ def test_an_unmigrated_sp_home_is_a_clear_prerequisite_not_a_bare_failure():
     assert res.failed == 1
     row = st.row("directory", f"/Users/{_OLD_APP}")
     assert row["failure_category"] == "prerequisite_missing"
-    assert "SERVICE PRINCIPAL home" in row["last_error"] and "not migrated" in row["last_error"]
+    assert "SERVICE PRINCIPAL home" in row["last_error"]
+
+
+def _write_classification(aw, sp_app_ids):
+    from src.exporters import bundle_paths as BP
+    aw.write_json(BP.IDENTITY_CLASSIFICATION_JSON, {"identities": [
+        {"identity_type": "service_principal", "applicationId": a} for a in sp_app_ids]})
+
+
+def test_orphan_sp_home_message_distinguishes_not_migrated_from_deleted():
+    """A2: the orphan-SP-home message must say WHY the appId is missing. If the appId IS in the
+    source roster it was skipped/filtered this run; if it is ABSENT it was deleted in source — the
+    operator's next step differs, so the two must read differently."""
+    # (a) appId present in the source roster but NOT in sp_mapping → "present in source but not
+    #     migrated this run".
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client,
+        identity_map={"sp_mapping": {}})
+    _write_classification(imp.staging, [_OLD_APP])
+    imp.run()
+    row = st.row("directory", f"/Users/{_OLD_APP}")
+    assert "present in the source roster" in row["last_error"]
+    assert "deleted in source" not in row["last_error"]
+
+    # (b) appId ABSENT from the roster → "deleted in source".
+    client2 = RecordingClient()
+    imp2, st2 = _make(WorkspaceImporter, [
+        _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client2,
+        identity_map={"sp_mapping": {}})
+    _write_classification(imp2.staging, ["some-other-appid-1234-5678-9abc-def012345678"])
+    imp2.run()
+    row2 = st2.row("directory", f"/Users/{_OLD_APP}")
+    assert "deleted in source" in row2["last_error"]
 
 
 def test_workspace_roots_are_skipped_not_created():

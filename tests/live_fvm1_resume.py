@@ -36,7 +36,7 @@ def run(tag):
     client=ApiClient(host,tp); aw=ArtifactWriter(cfg)
     InventoryRunner(client,cfg,aw).run()
     res=ExportRunner(client,cfg,aw,content_fetch_workers=8).run()
-    idx=json.load(open(f"{aw.root}/export_index.json"))
+    idx=json.load(open(f"{aw.root}/misc/export_index.json"))
     fps={(u["asset_type"],u["natural_key"]):u.get("fingerprint") for u in idx["units"]}
     print(f"[{tag}] total={res['total']} success={res['success']} failure={res['failure']}")
     return aw.root,fps,res

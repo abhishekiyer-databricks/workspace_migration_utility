@@ -605,7 +605,7 @@ def test_the_parity_report_proves_a_match_and_detects_a_broken_grant():
                                     [_grant("data-eng", "CAN_MANAGE")])],
                          context={"cluster_target_ids": {"etl": "TGT-CLU"}})
     imp.run()
-    report = aw.read_json("acl_parity_report.json")
+    report = imp.context.get("acl_parity") or {}
     assert report["counts"]["match"] == 1
     assert report["objects"][0]["verdict"] == "match"
 
@@ -617,7 +617,7 @@ def test_the_parity_report_proves_a_match_and_detects_a_broken_grant():
                                        [_grant("data-eng", "CAN_MANAGE")])],
                             context={"cluster_target_ids": {"etl": "TGT-CLU"}})
     imp2.run()
-    report2 = aw2.read_json("acl_parity_report.json")
+    report2 = imp2.context.get("acl_parity") or {}
     assert report2["counts"]["missing_on_target"] == 1
     assert report2["objects"][0]["missing_on_target"] == [["data-eng", "CAN_MANAGE"]]
 
@@ -667,7 +667,7 @@ def test_the_parity_report_still_verifies_on_a_run_where_every_acl_SKIPPED():
     imp2.config.imports.force_full_import = True
     res2 = imp2.run()
     assert res2.skipped == 1, "the ACL should have skipped"
-    report = imp2.staging.read_json("acl_parity_report.json")
+    report = imp2.context.get("acl_parity") or {}
     assert report["objects_checked"] == 1, \
         "the parity report must still verify an ACL applied by an EARLIER run"
     assert report["counts"]["match"] == 1
@@ -689,7 +689,7 @@ def test_secret_scope_acls_use_their_own_api_and_are_excluded_from_the_diff():
     assert len(puts) == 1, "one call per principal, and users:MANAGE is set at scope-create"
     assert puts[0][2] == {"scope": "app-secrets", "principal": "data-eng", "permission": "READ"}
     assert res.created == 1
-    report = aw.read_json("acl_parity_report.json") or {}
+    report = imp.context.get("acl_parity") or {} or {}
     assert report.get("objects_checked") == 0, \
         "an additive scope ACL must not be diffed as if it were declarative"
 
@@ -708,7 +708,7 @@ def test_parity_drops_inherited_on_BOTH_sides_so_like_compares_with_like():
                                     [_grant("data-eng", "CAN_MANAGE")])],
                          context={"cluster_target_ids": {"etl": "TGT-CLU"}})
     imp.run()
-    report = aw.read_json("acl_parity_report.json")
+    report = imp.context.get("acl_parity") or {}
     assert report["counts"]["match"] == 1, \
         "an inherited grant on the target must not count as `extra_on_target`"
 

@@ -247,6 +247,13 @@ write to:                                                           read from:
 
 ## 4. Notebook responsibilities (thin) — split by side
 
+> **SUPERSEDED IN PART by PLAN 7 (2026-08-09).** The notebook SET was slimmed: `00_Main_Source`,
+> `00_Main_Target`, `00_Main_EndToEnd`, `00_Account_Preflight` and `05_Validate` were DELETED.
+> Preflight now runs inside `04_Import`; the end-to-end stitching moved into packaged multi-task
+> Jobs (`jobs/*.job.json`, installed by `00_Install_Jobs`). The `role` widget is gone (role is
+> derived from stage + mode), and the two staging widgets collapsed to one `staging_location`.
+> The responsibilities described below still hold; only the packaging/entry-points changed.
+
 "Side" below = the **workspace the notebook runs in**, for `airgap` mode. In `direct` mode every
 row runs in the **target** workspace; the two source-reading rows just reach the source over REST
 and the handoff row disappears.

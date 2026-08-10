@@ -207,11 +207,14 @@ def _import(cfg, target_client, aw, *, count_mutations=False, run_preflight=Fals
 
     runner = ImportRunner(client, cfg, aw, state=state, preflight_verdict=verdict)
     summary = runner.run()
+    # PLAN 7 §B2/D-1: ACL parity is no longer a standalone file — it lives in the runner's shared
+    # context (and is folded into import_status.xlsx). Surface it on the summary for the harness.
+    summary["_acl_parity"] = runner.context.get("acl_parity") or {}
     return summary, (client.mutations if count_mutations else []), state
 
 
 def _units_by_status(aw) -> dict:
-    doc = aw.read_json("import_results.json") or {}
+    doc = aw.read_json("misc/import_results.json") or {}
     out: dict = {}
     for u in doc.get("units", []):
         out.setdefault(u.get("import_status"), []).append(u)
@@ -400,7 +403,7 @@ def main(keep: bool = False) -> int:
                    bool(pointer) and pointer.get("run_id") == run_id, str(pointer)[:120])
 
         # the fixture notebook's content hash must be in the bundle (GAP 1 fix, live)
-        index = aw.read_json("export_index.json") or {}
+        index = aw.read_json("misc/export_index.json") or {}
         nb_unit = next((u for u in index.get("units", [])
                         if u.get("natural_key") == fixture.get("notebook_path")), None)
         CHECKS.add("A", "the fixture notebook was exported with a content hash",
@@ -422,8 +425,9 @@ def main(keep: bool = False) -> int:
         CHECKS.add("B", "dry run still decided every unit",
                    summary_b["totals"].get("total", 0) > 0,
                    f"total={summary_b['totals'].get('total')}")
-        CHECKS.add("B", "dry run wrote its report set",
-                   os.path.isfile(os.path.join(aw_b.root, "import_status.xlsx")))
+        CHECKS.add("B", "dry run wrote its report set (own filename, A1)",
+                   os.path.isfile(os.path.join(aw_b.root, "reports/import_status_dry_run.xlsx"))
+                   and not os.path.isfile(os.path.join(aw_b.root, "reports/import_status.xlsx")))
         dry_state = StateStore(StatementApiBackend(target_client, warehouse), cfg_b)
         dry_state.load(force=True)
         CHECKS.add("B", "dry run wrote to the _dryrun state table only",
@@ -583,7 +587,7 @@ def main(keep: bool = False) -> int:
         InventoryRunner(source_client, cfg_e_exp, aw_e).run()
         ExportRunner(source_client, cfg_e_exp, aw_e, content_fetch_workers=4).run()
 
-        index2 = aw_e.read_json("export_index.json") or {}
+        index2 = aw_e.read_json("misc/export_index.json") or {}
         nb_unit2 = next((u for u in index2.get("units", [])
                          if u.get("natural_key") == fixture["notebook_path"]), None)
         policy_unit2 = next((u for u in index2.get("units", [])
@@ -644,8 +648,8 @@ def main(keep: bool = False) -> int:
                      import_assets="compute")
         aw_f = ArtifactWriter(cfg_f)
         aw_f.ensure_output_path()
-        aw_f.write_json("manifest.json", {"files": [], "tool_version": "0.1.0"})
-        aw_f.write_json("export_index.json", {"units": [{
+        aw_f.write_json("misc/manifest.json", {"files": [], "tool_version": "0.1.0"})
+        aw_f.write_json("misc/export_index.json", {"units": [{
             "asset_type": "instance_pool", "natural_key": hand_name, "source_id": "SRC-HAND",
             "fingerprint": "sha256:hand", "import_action": "create", "export_status": "success"}]})
         aw_f.write_json("export/compute/instance_pools.json", {"units": [{
@@ -673,7 +677,7 @@ def main(keep: bool = False) -> int:
         aw_g = ArtifactWriter(cfg_g)
         summary_g, _m, state_g = _import(cfg_g, target_client, aw_g)
         outstanding = state_g.retry_keys("failed_only") or set()
-        attempted = [u for u in (aw_g.read_json("import_results.json") or {}).get("units", [])
+        attempted = [u for u in (aw_g.read_json("misc/import_results.json") or {}).get("units", [])
                      if "not outstanding" not in safe(u.get("note"))]
         CHECKS.add("G", "retry_mode=failed_only attempted only outstanding units",
                    len(attempted) <= max(len(outstanding), 1),
@@ -691,7 +695,8 @@ def main(keep: bool = False) -> int:
 
         # ── PHASE H: ACL parity + reports ──────────────────────────────────
         print("\n== PHASE H: ACL parity + the report set ==")
-        parity = aw_e2.read_json("acl_parity_report.json") or {}
+        # Parity is folded into the workbook now; the harness reads it off the run summary.
+        parity = summary_g2.get("_acl_parity") or summary_e.get("_acl_parity") or {}
         counts = parity.get("counts", {})
         CHECKS.add("H", "an ACL parity report was produced", bool(parity),
                    f"checked={parity.get('objects_checked')} counts={counts}")
@@ -707,13 +712,57 @@ def main(keep: bool = False) -> int:
                        counts.get("match", 0) > 0 and mismatched == 0,
                        f"match={counts.get('match')} missing={counts.get('missing_on_target')} "
                        f"extra={counts.get('extra_on_target')} both={counts.get('both')}")
-        for name in ("import_results.json", "import_results.html", "import_status.xlsx",
-                     "manual_actions_import.md", "preflight_report.json"):
+        # PLAN 7 §B2: import_results.html is gone; paths moved to misc/ and reports/. The live
+        # (non-dry) run writes the plain import_status.xlsx.
+        for name in ("misc/import_results.json", "reports/import_status.xlsx",
+                     "reports/manual_actions_import.md", "misc/preflight_report.json"):
             CHECKS.add("H", f"{name} written",
                        os.path.isfile(os.path.join(aw_e2.root, name)))
+        CHECKS.add("H", "removed outputs are NOT written",
+                   not os.path.isfile(os.path.join(aw_e2.root, "import_results.html"))
+                   and not os.path.isfile(os.path.join(aw_e2.root, "acl_parity_report.json")))
+
+        # ── A4: a WS-LOCAL SP recreated with a NEW appId, holding a grant, must land on target
+        #        under the NEW appId (its old appId must appear in NO target ACL) ──────────────
+        # The fixtures create wsmig_test_db_sp / _db_sp2 (workspace-local, so recreated with fresh
+        # applicationIds) and grant them across every object type in phase_acls. This proves the
+        # SP-remap reaches the ACL layer end to end, not just the identity phase.
+        try:
+            idmap = state_e.load_identity_map() if state_e is not None else {}
+            sp_mapping = idmap.get("sp_mapping") or {}   # old appId -> new appId
+            if sp_mapping:
+                # Re-read every object the parity pass verified and collect the principals actually
+                # on target now.
+                on_target_principals = set()
+                for obj in parity.get("objects", []):
+                    ptype = obj.get("perm_object_type")
+                    tid = obj.get("target_id")
+                    if not (ptype and tid):
+                        continue
+                    try:
+                        doc = target_client.get(f"api/2.0/permissions/{ptype}/{tid}") or {}
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for ace in doc.get("access_control_list") or []:
+                        if ace.get("service_principal_name"):
+                            on_target_principals.add(ace["service_principal_name"])
+                old_ids = {o for o in sp_mapping if o != sp_mapping[o]}
+                new_ids = {sp_mapping[o] for o in old_ids}
+                leaked_old = old_ids & on_target_principals
+                landed_new = new_ids & on_target_principals
+                CHECKS.add("H", "a recreated ws-local SP's grant names the NEW appId on target",
+                           bool(landed_new),
+                           f"sp_mapping={sp_mapping} on_target_sps={sorted(on_target_principals)[:6]}")
+                CHECKS.add("H", "no recreated SP's OLD appId leaked into a target ACL",
+                           not leaked_old, f"leaked old appIds: {sorted(leaked_old)}")
+            else:
+                CHECKS.add("H", "sp_mapping available for the A4 remap-parity check",
+                           False, "identity map had no sp_mapping — was identity imported?")
+        except Exception as exc:  # noqa: BLE001
+            CHECKS.add("H", "A4 SP-ACL remap check ran", False, str(exc)[:200])
 
         # the report must be joinable on (asset_type, natural_key) — all Plan 4 needs
-        results = aw_e2.read_json("import_results.json") or {}
+        results = aw_e2.read_json("misc/import_results.json") or {}
         joinable = all(u.get("asset_type") and u.get("natural_key")
                        for u in results.get("units", []))
         CHECKS.add("H", "every report row is joinable on (asset_type, natural_key)", joinable,

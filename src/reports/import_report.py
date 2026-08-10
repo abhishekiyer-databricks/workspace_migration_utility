@@ -1,18 +1,27 @@
 """
-import_report — everything `04_Import` outputs (Plan 3 §1a, D16).
+import_report — everything `04_Import` outputs (Plan 3 §1a, D16; slimmed in PLAN 7 §B2).
 
 Import owns its OWN complete, customer-readable output set — it is not "test now, report later".
 What Plan 4 adds is only the cross-stage inventoried→exported→imported join, which needs nothing
 new from here because `import_results.json` is deliberately written in the shape Plan 4 joins on:
 one row per unit, keyed `(asset_type, natural_key)`.
 
-  • `import_results.json`  — machine-readable per-unit outcome (the join surface)
-  • `import_results.html`  — the same, browsable, failures first
-  • `import_status.xlsx`   — the operator's artifact: Summary + a sheet per family, with
-                             Import Status / Action Taken / Target Id / Note columns
-  • `manual_actions.md`    — everything a human must still do, with reasons (APPENDED to export's,
-                             not overwritten — the export-side runbook rows still apply)
-  • `acl_parity_report.*`  — written by the ACL phase itself (§6b), not here
+The output set was slimmed (PLAN 7 §B2) to the reporting chain that actually matters — inventory
+(the complete list) → export_status (per-asset export status) → import_status (per-asset import
+status) — plus the machine-readable join surface. So:
+
+  • `misc/import_results.json`   — machine-readable per-unit outcome (the join surface Plan 4 reads)
+  • `reports/import_status.xlsx` — the operator's artifact: Summary + a sheet per asset type +
+                                   an "ACL Parity" sheet (folded in from the ACL phase, D-1), with
+                                   Import Status / Action Taken / Target Id / Note columns.
+                                   On a DRY RUN it is written as `import_status_dry_run.xlsx` (A1) so
+                                   a live run's report never overwrites the rehearsal's.
+  • `reports/manual_actions_import.md` — everything a human must still do, with reasons (a SEPARATE
+                                   file from export's runbook, which still applies)
+
+REMOVED in PLAN 7 §B2: `import_results.html` (the xlsx carries every unit + status) and the
+standalone `acl_parity_report.{json,html}` (folded into the workbook). `html_generator` stays in
+the tree but is no longer called from here.
 
 The .xlsx is rendered to /tmp then byte-copied to the Volume: openpyxl needs seeks, and writing
 straight to a FUSE `/Volumes` path corrupts the file (memory `uc-volume-file-io-limits`).
@@ -21,6 +30,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso, safe_str
 from src.utils.logger import get_logger
 
@@ -107,31 +117,29 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
         "units": rows,
     }
     try:
-        aw.write_json("import_results.json", payload)
-        written["json"] = "import_results.json"
+        aw.write_json(BP.IMPORT_RESULTS_JSON, payload)
+        written["json"] = BP.IMPORT_RESULTS_JSON
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("import_results.json not written", error=str(exc))
 
-    try:
-        aw.write_bytes("import_results.html",
-                       _render_html(config, summary, rows).encode("utf-8"))
-        written["html"] = "import_results.html"
-    except Exception as exc:  # noqa: BLE001
-        _LOG.warning("import_results.html not written", error=str(exc))
-
+    # A1: a rehearsal writes a SEPARATE filename so a later live run never overwrites the dry-run's
+    # report — the two are meant to be read side by side ("this is what a live run WILL do" vs "this
+    # is what it DID"). D-1: the ACL parity result is folded in as a sheet, sourced from context.
+    xlsx_rel = BP.IMPORT_STATUS_DRYRUN_XLSX if summary.get("dry_run") else BP.IMPORT_STATUS_XLSX
+    parity = context.get("acl_parity") or {}
     try:
         path = aw.write_text_local_then_copy(
-            "import_status.xlsx",
-            lambda local: _render_xlsx(local, config, summary, rows))
+            xlsx_rel,
+            lambda local: _render_xlsx(local, config, summary, rows, parity))
         if path:
-            written["xlsx"] = "import_status.xlsx"
+            written["xlsx"] = xlsx_rel
     except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
-        _LOG.warning("import_status.xlsx not written", error=str(exc))
+        _LOG.warning("import status xlsx not written", rel=xlsx_rel, error=str(exc))
 
     try:
-        aw.write_bytes("manual_actions_import.md",
+        aw.write_bytes(BP.MANUAL_ACTIONS_IMPORT_MD,
                        _render_manual_actions(summary, rows).encode("utf-8"))
-        written["manual_actions"] = "manual_actions_import.md"
+        written["manual_actions"] = BP.MANUAL_ACTIONS_IMPORT_MD
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("manual_actions_import.md not written", error=str(exc))
 
@@ -158,107 +166,13 @@ def _counts_by_asset_type(rows: list[dict]) -> dict:
     return out
 
 
-# ── HTML ────────────────────────────────────────────────────────────────────
-
-def _esc(v) -> str:
-    return (safe_str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
-
-def _render_html(config, summary: dict, rows: list[dict]) -> str:
-    by_status = _counts_by_status(rows)
-    by_type = _counts_by_asset_type(rows)
-    failures = [r for r in rows if safe_str(r.get("import_status")) == "failed"]
-    warned = [r for r in rows if safe_str(r.get("import_status")) == "created_with_warning"]
-    manual = [r for r in rows if safe_str(r.get("import_status")) == "manual"]
-
-    mode_banner = ""
-    if summary.get("dry_run"):
-        mode_banner = ('<div class="banner dry">DRY RUN — decisions are real, but NOTHING was '
-                       'written to the target workspace.</div>')
-    if safe_str(summary.get("run_status")) == "aborted":
-        mode_banner += ('<div class="banner abort">RUN ABORTED — this report is PARTIAL. '
-                        f'Reason: {_esc(summary.get("abort_reason"))}</div>')
-
-    def cards() -> str:
-        out = []
-        for status in _SUMMARY_ORDER:
-            label, colour = _STATUS_STYLE.get(status, (status, "FFFFFF"))
-            out.append(f'<div class="card" style="background:#{colour}">'
-                       f'<div class="n">{by_status.get(status, 0)}</div>'
-                       f'<div class="l">{_esc(label)}</div></div>')
-        return "".join(out)
-
-    def table(items, cols, title, cls=""):
-        if not items:
-            return ""
-        head = "".join(f"<th>{_esc(c[0])}</th>" for c in cols)
-        body = ""
-        for r in items:
-            tds = "".join(f"<td>{_esc(r.get(c[1]))}</td>" for c in cols)
-            body += f"<tr>{tds}</tr>"
-        return (f'<h2>{_esc(title)} ({len(items)})</h2>'
-                f'<table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>')
-
-    type_rows = ""
-    for at in sorted(by_type):
-        b = by_type[at]
-        cells = "".join(f"<td>{b.get(s, 0) or ''}</td>" for s in _SUMMARY_ORDER)
-        type_rows += f"<tr><td>{_esc(at)}</td><td><b>{b['total']}</b></td>{cells}</tr>"
-    type_head = "".join(f"<th>{_STATUS_STYLE[s][0]}</th>" for s in _SUMMARY_ORDER)
-
-    unit_cols = [("Asset Type", "asset_type"), ("Natural Key", "natural_key"),
-                 ("Import Status", "import_status"), ("Action Taken", "action_taken"),
-                 ("Target Id", "target_id"), ("Note", "note")]
-    # Failures additionally show the COMPLETE server error verbatim (never hidden behind the note).
-    fail_cols = unit_cols + [("Actual server error", "error_raw")]
-
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Import Results — run {_esc(summary.get('run_id'))}</title>
-<style>
- body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;
-      background:#f8fafc;color:#0f172a}}
- header{{background:#1e3a5f;color:#fff;padding:22px 28px}}
- header h1{{margin:0 0 6px;font-size:20px}} header .meta{{opacity:.85;font-size:13px}}
- main{{padding:20px 28px 60px}}
- .banner{{padding:10px 14px;border-radius:6px;margin:0 0 16px;font-weight:600}}
- .banner.dry{{background:#dbeafe;color:#1e40af}} .banner.abort{{background:#fee2e2;color:#991b1b}}
- .cards{{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 22px}}
- .card{{border:1px solid #cbd5e1;border-radius:8px;padding:10px 16px;min-width:104px}}
- .card .n{{font-size:22px;font-weight:700}} .card .l{{font-size:11px;color:#334155}}
- h2{{font-size:15px;margin:26px 0 8px}}
- table{{border-collapse:collapse;background:#fff;width:100%;font-size:12px;
-        box-shadow:0 1px 2px rgba(0,0,0,.06)}}
- th,td{{border:1px solid #e2e8f0;padding:5px 8px;text-align:left;vertical-align:top}}
- th{{background:#1e3a5f;color:#fff;position:sticky;top:0}}
- table.fail td{{background:#fee2e2}} table.warn td{{background:#fef9c3}}
- table.manual td{{background:#fef3c7}}
- td:nth-child(2){{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:520px;
-                  word-break:break-all}}
-</style></head><body>
-<header>
- <h1>Import Results — {_esc(summary.get('source_workspace_id'))} → this workspace</h1>
- <div class="meta">run <b>{_esc(summary.get('run_id'))}</b> &middot;
-  mode {_esc(summary.get('connectivity_mode'))} &middot;
-  {'DRY RUN' if summary.get('dry_run') else 'LIVE'} &middot;
-  status {_esc(summary.get('run_status'))} &middot;
-  {_esc(summary.get('elapsed_sec'))}s &middot; generated {_esc(summary.get('generated_utc'))}</div>
-</header><main>
-{mode_banner}
-<div class="cards">{cards()}</div>
-{table(failures, fail_cols, "Failures — fix these, then re-run with retry_mode=failed_only", "fail")}
-{table(warned, unit_cols, "Created with warnings — exist on target but degraded", "warn")}
-{table(manual, unit_cols, "Manual steps required on target", "manual")}
-<h2>Per asset type</h2>
-<table><thead><tr><th>Asset Type</th><th>Total</th>{type_head}</tr></thead>
-<tbody>{type_rows}</tbody></table>
-{table(rows, unit_cols, "Every unit")}
-</main></body></html>"""
-
 
 # ── Excel ───────────────────────────────────────────────────────────────────
 
-def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict]) -> str:
-    """Import Summary sheet + one sheet per family. Rendered locally (openpyxl needs seeks)."""
+def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
+                 parity: dict = None) -> str:
+    """Import Summary sheet + one sheet per asset type + an ACL Parity sheet (D-1). Rendered
+    locally (openpyxl needs seeks)."""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -433,6 +347,59 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict]) -> st
                     cc.fill = fill(colour)
                     cc.value = _label
         sheet.freeze_panes = "A2"
+
+    # ── ACL Parity sheet (PLAN 7 §B2 / D-1) ──────────────────────────────────
+    # Folded in from the ACL phase's post-apply diff — this is INDEPENDENT proof (every touched
+    # target object was re-read and diffed against source), not the same thing as import status.
+    # Only written when the acls family actually ran this session (parity is non-empty).
+    if parity and parity.get("objects") is not None:
+        psheet = wb.create_sheet("ACL Parity")
+        psheet.sheet_view.showGridLines = False
+        counts = parity.get("counts", {})
+        psheet.merge_cells("A1:F1")
+        c = psheet["A1"]
+        c.value = (f"ACL parity — {parity.get('objects_checked', 0)} objects re-read and diffed "
+                   f"against source   |   " + "   ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        c.font = font(bold=True, color="FFFFFF", size=11)
+        c.fill = fill("1E3A5F")
+        c.alignment = left_wrap
+        psheet.row_dimensions[1].height = 26
+        pcols = [("Object Type", "perm_object_type", 22), ("Object", "object", 60),
+                 ("Verdict", "verdict", 20), ("Missing on target", "_missing", 44),
+                 ("Extra on target", "_extra", 44), ("Detail", "detail", 50)]
+        for col, (h, _k, w) in enumerate(pcols, 1):
+            cc = psheet.cell(row=2, column=col, value=h)
+            cc.font = font(bold=True, color="FFFFFF", size=10)
+            cc.fill = fill("1E3A5F")
+            cc.border = box
+            cc.alignment = centre
+            psheet.column_dimensions[get_column_letter(col)].width = w
+        _verdict_colour = {"match": "D1FAE5", "missing_on_target": "FEE2E2",
+                           "extra_on_target": "FDE68A", "both": "FECACA", "unverified": "E5E7EB"}
+        objs = sorted(parity.get("objects", []),
+                      key=lambda o: (safe_str(o.get("verdict")) == "match",
+                                     safe_str(o.get("object"))))
+        for i, o in enumerate(objs, start=3):
+            verdict = safe_str(o.get("verdict"))
+            missing = ", ".join(f"{m[0]}={m[1]}" for m in (o.get("missing_on_target") or []))
+            extra = ", ".join(f"{e[0]}={e[1]}" for e in (o.get("extra_on_target") or []))
+            values = {"perm_object_type": o.get("perm_object_type"), "object": o.get("object"),
+                      "verdict": verdict, "_missing": missing, "_extra": extra,
+                      "detail": o.get("detail", "")}
+            for col, (_h, key, _w) in enumerate(pcols, 1):
+                cc = psheet.cell(row=i, column=col, value=safe_str(values.get(key)))
+                cc.border = box
+                cc.font = font(size=9)
+                cc.alignment = left_wrap
+                if key == "verdict":
+                    cc.fill = fill(_verdict_colour.get(verdict, "FFFFFF"))
+        if parity.get("known_limitation"):
+            note_row = len(objs) + 4
+            psheet.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=6)
+            nc = psheet.cell(row=note_row, column=1, value=safe_str(parity.get("known_limitation")))
+            nc.font = font(italic=True, color="475569", size=9)
+            nc.alignment = left_wrap
+        psheet.freeze_panes = "A3"
 
     wb.save(local_path)
     return local_path

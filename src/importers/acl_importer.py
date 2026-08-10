@@ -36,6 +36,7 @@ single grant, which the API cannot do). Without these rows a skipped grant would
 """
 from __future__ import annotations
 
+from src.exporters import bundle_paths as BP
 from src.importers.base_importer import BaseImporter, SkippedNoObject
 from src.state.state_store import (CAT_DAB_REDEPLOY, CAT_FAMILY_NOT_SELECTED,
                                    CAT_LEGACY_DASHBOARD, CAT_NOT_SUPPORTED, CAT_OVERSIZE,
@@ -120,7 +121,7 @@ class AclImporter(BaseImporter):
         object. The unit's fingerprint is the hash of its NORMALISED GRANT SET, so an ACL changed on
         source moves it and a re-run replays only genuinely-changed ACLs.
         """
-        self._source_acls = self.staging.read_json("export/acls.json") or []
+        self._source_acls = self.staging.read_json(BP.EXPORT_ACLS_JSON) or []
         units: list[dict] = []
         for entry in self._source_acls:
             if not isinstance(entry, dict):
@@ -467,12 +468,11 @@ class AclImporter(BaseImporter):
                 "`missing_on_target` — it is a platform limitation, not a tool failure."),
             "objects": objects,
         }
-        self.staging.write_json("acl_parity_report.json", report)
-        try:
-            self.staging.write_bytes("acl_parity_report.html",
-                                     _render_parity_html(report).encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("parity html not written", error=str(exc)[:160])
+        # PLAN 7 §B2 / D-1: parity is NO LONGER a standalone acl_parity_report.{json,html}. It is
+        # handed to the import report via the shared cross-phase context and rendered as the
+        # "ACL Parity" sheet of import_status.xlsx — one lightweight workbook, still independent
+        # proof (this re-reads every touched target object and diffs it against source).
+        self.context["acl_parity"] = report
         self.log.info("acl parity report", **counts)
         return report
 
@@ -510,49 +510,3 @@ class AclImporter(BaseImporter):
                 if level:
                     out.add((principal, level))
         return sorted(out)
-
-
-def _render_parity_html(report: dict) -> str:
-    def esc(v):
-        return safe_str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    counts = report.get("counts", {})
-    rows = ""
-    for obj in sorted(report.get("objects", []),
-                      key=lambda o: (o.get("verdict") == "match", o.get("object", ""))):
-        verdict = safe_str(obj.get("verdict"))
-        colour = {"match": "#d1fae5", "missing_on_target": "#fee2e2",
-                  "extra_on_target": "#fde68a", "both": "#fecaca",
-                  "unverified": "#e5e7eb"}.get(verdict, "#fff")
-        missing = ", ".join(f"{m[0]}={m[1]}" for m in obj.get("missing_on_target") or [])
-        extra = ", ".join(f"{e[0]}={e[1]}" for e in obj.get("extra_on_target") or [])
-        rows += (f'<tr style="background:{colour}"><td>{esc(obj.get("perm_object_type"))}</td>'
-                 f'<td>{esc(obj.get("object"))}</td><td>{esc(verdict)}</td>'
-                 f'<td>{esc(missing)}</td><td>{esc(extra)}</td>'
-                 f'<td>{esc(obj.get("detail", ""))}</td></tr>')
-
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>ACL parity — run {esc(report.get('run_id'))}</title>
-<style>body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;
- background:#f8fafc;color:#0f172a}} header{{background:#1e3a5f;color:#fff;padding:20px 26px}}
- main{{padding:18px 26px 50px}} table{{border-collapse:collapse;width:100%;font-size:12px;
- background:#fff}} th,td{{border:1px solid #e2e8f0;padding:5px 8px;text-align:left}}
- th{{background:#1e3a5f;color:#fff}} .cards{{display:flex;gap:10px;margin:0 0 18px}}
- .card{{border:1px solid #cbd5e1;border-radius:8px;padding:10px 16px;background:#fff}}
- .card .n{{font-size:22px;font-weight:700}} .note{{font-size:12px;color:#475569;margin:14px 0}}
-</style></head><body>
-<header><h1 style="margin:0;font-size:19px">ACL parity — source vs target</h1>
-<div style="opacity:.85;font-size:13px">run {esc(report.get('run_id'))} &middot;
- {report.get('objects_checked', 0)} objects re-read and diffed</div></header><main>
-<div class="cards">
- <div class="card"><div class="n">{counts.get('match', 0)}</div><div>match</div></div>
- <div class="card"><div class="n">{counts.get('missing_on_target', 0)}</div>
-  <div>missing on target</div></div>
- <div class="card"><div class="n">{counts.get('extra_on_target', 0)}</div>
-  <div>extra on target</div></div>
- <div class="card"><div class="n">{counts.get('both', 0)}</div><div>both</div></div>
-</div>
-<p class="note">{esc(report.get('known_limitation'))}</p>
-<table><thead><tr><th>Type</th><th>Object</th><th>Verdict</th><th>Missing on target</th>
-<th>Extra on target</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
-</main></body></html>"""

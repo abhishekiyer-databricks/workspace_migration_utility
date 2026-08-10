@@ -75,24 +75,22 @@ def test_inventory_end_to_end():
     result = InventoryRunner(_client(), cfg, aw).run()
     root = result["output_path"]
 
-    # JSON artifacts exist + parse
-    inv = json.load(open(f"{root}/inventory.json"))
+    # JSON artifacts exist + parse (now under misc/, PLAN 7 §D)
+    inv = json.load(open(f"{root}/misc/inventory.json"))
     assert inv["counts"]["identity"] == 4 and inv["counts"]["compute"] == 3
-    idc = json.load(open(f"{root}/identity_classification.json"))
+    idc = json.load(open(f"{root}/misc/identity_classification.json"))
     assert idc["summary"].get("account") == 3 and idc["summary"].get("workspace_local") == 1
     assert [a["displayName"] for a in idc["needs_account_action"]] == ["acct-grp"]
 
     # config_resolved.json must NOT contain the token
-    cr = json.load(open(f"{root}/config_resolved.json"))
+    cr = json.load(open(f"{root}/misc/config_resolved.json"))
     assert "SECRET-TOKEN" not in json.dumps(cr)
 
-    # HTML exists and is the clickable reference-style app (sidebar + tabs + classification)
-    html = open(f"{root}/inventory.html").read()
-    assert "Workspace Inventory" in html and "Identity classification" in html and len(html) > 1000
-    assert 'class="sidebar"' in html and "function showTab" in html  # reference app shell
+    # inventory.html generation is gated OFF by default (PLAN 7 §B2) — the xlsx carries it now.
+    assert not os.path.isfile(f"{root}/reports/inventory.html")
 
     # Excel exists, non-zero, and opens (valid zip/xlsx) with the fine-grained sheets
-    xlsx = f"{root}/inventory.xlsx"
+    xlsx = f"{root}/reports/inventory.xlsx"
     assert os.path.getsize(xlsx) > 0
     from openpyxl import load_workbook
     wb = load_workbook(xlsx)

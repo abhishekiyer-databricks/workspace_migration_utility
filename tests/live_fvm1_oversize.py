@@ -29,7 +29,7 @@ client=ApiClient(host,tp); aw=ArtifactWriter(cfg)
 InventoryRunner(client,cfg,aw).run()
 res=ExportRunner(client,cfg,aw,content_fetch_workers=8).run()
 print("\nsummary:",{k:res.get(k) for k in ("total","success","failure","skipped_oversize","manual","dab")})
-idx=json.load(open(f"{aw.root}/export_index.json"))
+idx=json.load(open(f"{aw.root}/misc/export_index.json"))
 print("\n=== OVERSIZE units in the ledger ===")
 for u in idx["units"]:
     if u["export_status"]=="skipped_oversize":

@@ -20,6 +20,7 @@ import tempfile
 
 import pytest
 
+from src.exporters import bundle_paths as BP
 from src.config.config_manager import Config
 from src.exporters.artifact_writer import ArtifactWriter
 from src.importers.base_importer import BaseImporter
@@ -349,12 +350,12 @@ def _bundle(tmp, run_id, *, manifest=True, import_cp=False, results=False):
     aw = ArtifactWriter(cfg)
     aw.ensure_output_path()
     if manifest:
-        aw.write_json("manifest.json", {"files": [], "tool_version": "0.1.0"})
+        aw.write_json(BP.MANIFEST_JSON, {"files": [], "tool_version": "0.1.0"})
     if import_cp:
-        aw.write_json("checkpoint.json", {"import:compute": ["a"],
+        aw.write_json(BP.CHECKPOINT_JSON, {"import:compute": ["a"],
                                           "import:compute:results": {"a": {}}})
     if results:
-        aw.write_json("import_results.json", {"units": []})
+        aw.write_json(BP.IMPORT_RESULTS_JSON, {"units": []})
     return cfg, aw
 
 
@@ -394,7 +395,7 @@ def test_an_export_checkpoint_alone_is_not_a_resumable_IMPORT():
     """An export checkpoint must not be mistaken for import progress."""
     with tempfile.TemporaryDirectory() as tmp:
         cfg, aw = _bundle(tmp, "20260101_000000")
-        aw.write_json("checkpoint.json", {"export:content": ["/n"]})
+        aw.write_json(BP.CHECKPOINT_JSON, {"export:content": ["/n"]})
         from src.exporters.bundle_state import write_latest_export_pointer
         write_latest_export_pointer(cfg, "20260101_000000", {"tool_version": "0.1.0"}, {})
         _run, how = resolve_import_run_id(cfg, "")
@@ -407,7 +408,7 @@ def test_a_bad_manifest_aborts_before_any_unit_is_attempted():
     """A partial upload must never present as a partial migration (D7)."""
     with tempfile.TemporaryDirectory() as tmp:
         cfg, aw = _bundle(tmp, "r1", manifest=False)
-        aw.write_json("manifest.json",
+        aw.write_json(BP.MANIFEST_JSON,
                       {"files": [{"path": "export/gone.json", "bytes": 5, "sha256": "deadbeef"}],
                        "tool_version": "0.1.0"})
         runner = ImportRunner(object(), cfg, aw, state=None)
@@ -425,19 +426,19 @@ def test_the_manifest_survives_an_import_writing_its_own_files():
     """
     with tempfile.TemporaryDirectory() as tmp:
         cfg, aw = _bundle(tmp, "r1", manifest=False)
-        aw.write_json("export_index.json", {"units": []})
+        aw.write_json(BP.EXPORT_INDEX_JSON, {"units": []})
         aw.write_manifest({})
         assert aw.verify_manifest()["ok"], "a freshly exported bundle must verify"
 
         # Simulate what an import run writes into the same directory.
-        aw.write_json("checkpoint.json", {"import:compute": ["a"],
+        aw.write_json(BP.CHECKPOINT_JSON, {"import:compute": ["a"],
                                           "import:compute:results": {"a": {"status": "created"}}})
-        aw.write_json("import_results.json", {"units": []})
-        aw.write_bytes("import_results.html", b"<html></html>")
-        aw.write_json("preflight_report.json", {"verdict": "GO"})
-        aw.write_json("acl_parity_report.json", {"counts": {}})
-        aw.write_bytes("manual_actions_import.md", b"# manual actions\n")
-        aw.write_bytes("execution_import.log", b'{"msg": "hello"}\n')
+        aw.write_json(BP.IMPORT_RESULTS_JSON, {"units": []})
+        aw.write_bytes("reports/import_results.html", b"<html></html>")
+        aw.write_json(BP.PREFLIGHT_REPORT_JSON, {"verdict": "GO"})
+        aw.write_json(BP.ACL_PARITY_REPORT_JSON, {"counts": {}})
+        aw.write_bytes(BP.MANUAL_ACTIONS_IMPORT_MD, b"# manual actions\n")
+        aw.write_bytes(BP.EXECUTION_IMPORT_LOG, b'{"msg": "hello"}\n')
 
         verify = aw.verify_manifest()
         assert verify["ok"], (
@@ -445,7 +446,7 @@ def test_the_manifest_survives_an_import_writing_its_own_files():
             f"would be refused. mismatched={verify['mismatched']} missing={verify['missing']}")
 
         # But a genuinely corrupted EXPORT artifact must still be caught.
-        with open(os.path.join(aw.root, "export_index.json"), "w") as f:
+        with open(os.path.join(aw.root, BP.EXPORT_INDEX_JSON), "w") as f:
             f.write('{"units": ["tampered"]}')
         assert not aw.verify_manifest()["ok"], \
             "a real bundle corruption must still fail the gate"
@@ -488,7 +489,7 @@ def test_a_preflight_no_go_blocks_the_run_when_enforced():
 def test_selecting_a_family_without_prerequisites_aborts_the_runner():
     with tempfile.TemporaryDirectory() as tmp:
         cfg, aw = _bundle(tmp, "r1")
-        aw.write_json("export_index.json", {"units": []})
+        aw.write_json(BP.EXPORT_INDEX_JSON, {"units": []})
         cfg.imports.import_assets = ["jobs"]
         runner = ImportRunner(object(), cfg, aw, state=None)
         with pytest.raises(PrerequisiteError, match="missing prerequisites"):

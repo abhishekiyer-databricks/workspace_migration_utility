@@ -101,8 +101,8 @@ def test_direct_mode_rejects_role_source():
 def test_live_import_requires_the_state_catalog_and_schema():
     """dry_run=false with no state table is a correctness hazard (no durable source→target id map
     ⇒ the next run cannot tell CREATE from UPDATE and may duplicate), so it must fail fast."""
-    w = {"role": "target", "source_workspace_id": "1",
-         "target_staging_location": "/Volumes/a/b/c", "dry_run": "false"}
+    w = {"role": "target", "connectivity_mode": "airgap", "source_workspace_id": "1",
+         "staging_location": "/Volumes/a/b/c", "dry_run": "false"}
     with pytest.raises(ValueError, match="state_catalog"):
         Config.from_dbutils(FakeDbutils(w), spark=None)
     # with them supplied it validates, and the FQNs resolve to the tool-owned table names
@@ -116,14 +116,15 @@ def test_dry_run_uses_a_separate_state_table():
     """A rehearsal must never pollute the real source→target map — hence a separate table rather
     than a dry_run column (and `DROP TABLE` is then a one-liner)."""
     cfg = Config.from_dbutils(FakeDbutils({
-        "role": "target", "source_workspace_id": "1", "target_staging_location": "/Volumes/a/b/c",
+        "role": "target", "connectivity_mode": "airgap", "source_workspace_id": "1",
+        "staging_location": "/Volumes/a/b/c",
         "dry_run": "true", "state_catalog": "cat", "state_schema": "sch"}), spark=None)
     assert cfg.state_table_fqn == "cat.sch.wsmig_migration_state_dryrun"
 
 
 def test_bad_retry_mode_and_bad_family_are_rejected():
-    base = {"role": "target", "source_workspace_id": "1",
-            "target_staging_location": "/Volumes/a/b/c"}
+    base = {"role": "target", "connectivity_mode": "airgap", "source_workspace_id": "1",
+            "staging_location": "/Volumes/a/b/c"}
     with pytest.raises(ValueError, match="retry_mode"):
         Config.from_dbutils(FakeDbutils({**base, "retry_mode": "sometimes"}), spark=None)
     with pytest.raises(ValueError, match="import_assets"):
@@ -134,8 +135,8 @@ def test_bad_retry_mode_and_bad_family_are_rejected():
 def test_no_state_needed_for_a_first_look_dry_run():
     """A first-look rehearsal must need no UC setup at all."""
     cfg = Config.from_dbutils(FakeDbutils({
-        "role": "target", "source_workspace_id": "1",
-        "target_staging_location": "/Volumes/a/b/c", "dry_run": "true"}), spark=None)
+        "role": "target", "connectivity_mode": "airgap", "source_workspace_id": "1",
+        "staging_location": "/Volumes/a/b/c", "dry_run": "true"}), spark=None)
     assert cfg.state_enabled is False
 
 

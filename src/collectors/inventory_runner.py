@@ -20,12 +20,17 @@ from src.collectors.secrets_collector import SecretsCollector
 from src.collectors.serving_collector import ServingCollector
 from src.collectors.sql_collector import SqlCollector
 from src.collectors.workspace_collector import WorkspaceCollector
+from src.exporters import bundle_paths as BP
 from src.identity.classifier import (classify_all, classification_summary,
                                      needs_account_action)
 from src.utils.helpers import now_iso
 from src.utils.logger import get_logger
 
 _LOG = get_logger("inventory")
+
+# inventory.html is redundant with inventory.xlsx (PLAN 7 §B2). The generator code stays; only its
+# invocation is gated behind this one switch, so re-enabling for a customer who asks is a one-liner.
+WRITE_INVENTORY_HTML = False
 
 # All in-scope collectors (inventory is always full-scope; toggles apply from Export on).
 _COLLECTORS = [
@@ -72,7 +77,7 @@ class InventoryRunner:
         warnings = [e for s in stats for e in s.get("errors", [])]
 
         # ── artifacts ─────────────────────────────────────────────────────
-        self.aw.write_json("inventory.json", {
+        self.aw.write_json(BP.INVENTORY_JSON, {
             "generated_utc": now_iso(),
             "source_workspace_id": self.config.source_workspace_id,
             "counts": counts,
@@ -83,7 +88,7 @@ class InventoryRunner:
         # (users/SPs are assigned automatically by the workspace SCIM POST). Emitted at INVENTORY
         # time so the gap is known before export/import rather than surfacing as an import failure.
         account_actions = needs_account_action(identities)
-        self.aw.write_json("identity_classification.json", {
+        self.aw.write_json(BP.IDENTITY_CLASSIFICATION_JSON, {
             "summary": id_summary,
             "needs_account_action": account_actions,
             "identities": [{k: v for k, v in o.items() if k != "_raw"} for o in identities],
@@ -92,9 +97,12 @@ class InventoryRunner:
             _LOG.info("account groups requiring provisioning in the TARGET account",
                       count=len(account_actions),
                       groups=[a["displayName"] for a in account_actions][:10])
-        self.aw.write_json("config_resolved.json", self.config.redacted())
+        self.aw.write_json(BP.CONFIG_RESOLVED_JSON, self.config.redacted())
 
-        self._write_html(objects_by_type, counts, stats, id_summary, warnings)
+        # inventory.html generation is gated OFF by default (PLAN 7 §B2): inventory.xlsx carries the
+        # same content, so the HTML is redundant. Flip WRITE_INVENTORY_HTML to re-enable in one line.
+        if WRITE_INVENTORY_HTML:
+            self._write_html(objects_by_type, counts, stats, id_summary, warnings)
         self._write_excel(objects_by_type, counts)
 
         # Drop the LATEST_INVENTORY.json pointer at the wsmig root so 02_Export — even when run
@@ -165,13 +173,13 @@ class InventoryRunner:
             workspace_url=self.config.ctx.workspace_url, generated_at=now_iso(),
         )
         # HTML is plain text — safe to write directly to the Volume.
-        self.aw.write_bytes("inventory.html", html_doc.encode("utf-8"))
+        self.aw.write_bytes(BP.INVENTORY_HTML, html_doc.encode("utf-8"))
 
     def _write_excel(self, objects_by_type, counts) -> None:
         try:
             from src.exporters.excel_generator import generate_excel
             self.aw.write_text_local_then_copy(
-                "inventory.xlsx",
+                BP.INVENTORY_XLSX,
                 lambda local: generate_excel(objects_by_type, counts, local, self.config),
             )
         except Exception as exc:  # noqa: BLE001 — Excel is optional; never fail the run

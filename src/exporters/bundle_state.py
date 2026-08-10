@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso
 
 
@@ -136,11 +137,11 @@ def manifest_checksum(manifest: dict) -> str:
 
 def bundle_is_complete(config, run_id: str) -> bool:
     """A bundle is complete once `manifest.json` exists (written last)."""
-    return os.path.isfile(os.path.join(run_dir(config, run_id), "manifest.json"))
+    return os.path.isfile(os.path.join(run_dir(config, run_id), BP.MANIFEST_JSON))
 
 
 def bundle_has_checkpoint(config, run_id: str) -> bool:
-    return os.path.isfile(os.path.join(run_dir(config, run_id), "checkpoint.json"))
+    return os.path.isfile(os.path.join(run_dir(config, run_id), BP.CHECKPOINT_JSON))
 
 
 def list_run_ids(config) -> list[str]:
@@ -167,7 +168,7 @@ def find_latest_incomplete_run(config) -> Optional[str]:
 
 def has_inventory(config, run_id: str) -> bool:
     """Whether `inventory.json` exists for this run (Export's required input)."""
-    return os.path.isfile(os.path.join(run_dir(config, run_id), "inventory.json"))
+    return os.path.isfile(os.path.join(run_dir(config, run_id), BP.INVENTORY_JSON))
 
 
 # ── the resolvers (§2b, §7a) ────────────────────────────────────────────────

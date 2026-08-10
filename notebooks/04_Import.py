@@ -21,16 +21,15 @@
 # COMMAND ----------
 
 # MAGIC %md ## Widgets
-# MAGIC `role` MUST be **target**. In `direct` mode every stage runs here, so `role=target` is
-# MAGIC correct for inventory/export too.
+# MAGIC The role is DERIVED (import always runs in the target) — there is no `role` widget. In
+# MAGIC `direct` mode (default) inventory/export also ran here; `airgap` expects an uploaded bundle.
 
 # COMMAND ----------
 
-dbutils.widgets.dropdown("connectivity_mode", "airgap", ["airgap", "direct"],
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
                          "Connectivity mode")
-dbutils.widgets.dropdown("role", "target", ["source", "target"], "Role (must be target)")
 dbutils.widgets.text("source_workspace_id", "", "Source workspace id (identifies the bundle)")
-dbutils.widgets.text("target_staging_location", "", "Target staging (UC Volume /Volumes/...)")
+dbutils.widgets.text("staging_location", "", "Staging location (UC Volume /Volumes/...)")
 dbutils.widgets.text("run_id", "", "Run id (blank = resume, else LATEST_EXPORT.json)")
 
 # Dry run FIRST. Flip to false only once the rehearsal reads clean.
@@ -42,9 +41,8 @@ dbutils.widgets.dropdown("dry_run", "true", ["true", "false"],
 dbutils.widgets.text("state_catalog", "", "State catalog (shared, must exist)")
 dbutils.widgets.text("state_schema", "", "State schema (shared, must exist)")
 
-# This session's work list. Separate from the migrate_* toggles (which are BUNDLE scope): the
-# selector narrows what to import NOW, over what the bundle already contains. `acls` is
-# independently selectable because ACL replay is the pass most likely to need a second attempt.
+# This session's work list over what the bundle contains. `acls` is independently selectable
+# because ACL replay is the pass most likely to need a second attempt.
 dbutils.widgets.multiselect("import_assets", "all",
                             ["all", "identity", "compute", "workspace", "secrets", "jobs", "sql",
                              "dlt", "dashboards", "genie", "serving", "misc", "acls"],
@@ -58,8 +56,6 @@ dbutils.widgets.dropdown("retry_mode", "off",
 
 dbutils.widgets.dropdown("preflight_enforce", "true", ["true", "false"],
                          "Fail the run on a preflight NO-GO")
-dbutils.widgets.dropdown("skip_manifest_verify", "false", ["true", "false"],
-                         "Skip bundle verification (only for a deliberately pruned bundle)")
 dbutils.widgets.dropdown("force_full_import", "false", ["true", "false"],
                          "Ignore the checkpoint and re-evaluate every unit")
 dbutils.widgets.dropdown("allow_deletes", "false", ["true", "false"],
@@ -81,16 +77,12 @@ dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no sco
 # SPN cannot provide from a private, notebook-only workspace (IMP-4, proven live). AKV-backed scopes
 # are therefore always reported as a clean manual step; Databricks-backed scopes migrate normally.
 
-# Transform options
+# Transform options. NOTE: the per-asset `migrate_*` toggles are NOT on import — they are bundle
+# scope, set on the SOURCE side (01/02). Here `import_assets` is the work-list selector instead.
 dbutils.widgets.dropdown("pause_job_schedules", "true", ["true", "false"],
                          "Pause imported job schedules AND continuous triggers")
 dbutils.widgets.text("user_domain_mapping", "", "old.com=new.com,...")
 dbutils.widgets.text("user_id_mapping", "", "old@a.com=new@b.com,...")
-
-# Per-asset toggles — BUNDLE scope, set identically on both sides.
-for _t in ["identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
-           "dashboards", "genie", "serving", "misc"]:
-    dbutils.widgets.dropdown(f"migrate_{_t}", "true", ["true", "false"], f"Migrate {_t}")
 
 # COMMAND ----------
 
@@ -131,7 +123,8 @@ _REPO_ROOT = _add_repo_root_to_syspath()
 print(f"repo root on sys.path: {_REPO_ROOT}")
 
 from src.auth.token_manager import build_clients
-from src.config.config_manager import ROLE_TARGET, Config
+from src.config.config_manager import ROLE_TARGET, STAGE_IMPORT, Config
+from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.importers.import_runner import ImportRunner, resolve_import_run_id
 from src.state.sql_backend import build_sql_backend
@@ -147,7 +140,7 @@ from src.utils import logger as _logger
 
 # COMMAND ----------
 
-cfg = Config.from_dbutils(dbutils, spark)
+cfg = Config.from_dbutils(dbutils, spark, stage=STAGE_IMPORT)
 assert cfg.role == ROLE_TARGET, f"04_Import must run with role=target (got {cfg.role!r})"
 
 # In a multi-task Job, `01_Inventory` publishes the run_id so every later task acts on one bundle.
@@ -182,10 +175,11 @@ print(f"Retry mode       : {cfg.imports.retry_mode}")
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-_logger.set_log_file(os.path.join(aw.root, "execution_import.log"))
+aw.ensure_output_path()
+_logger.set_log_file(os.path.join(aw.root, BP.EXECUTION_IMPORT_LOG))
 
-_index = aw.read_json("export_index.json") or {}
-_bundle_cfg = aw.read_json("config_resolved.json") or {}
+_index = aw.read_json(BP.EXPORT_INDEX_JSON) or {}
+_bundle_cfg = aw.read_json(BP.CONFIG_RESOLVED_JSON) or {}
 print(f"Bundle produced in `{_bundle_cfg.get('connectivity_mode', '?')}` mode, "
       f"tool version {_index.get('tool_version', '?')}, at {_index.get('generated_utc', '?')}")
 print(f"{len(_index.get('units', []))} units in the bundle:")
@@ -233,7 +227,7 @@ for _grade, _key in (("BLOCKING", "blocking"), ("DEGRADING", "degrading"),
                      ("COSMETIC", "cosmetic")):
     for _item in _pf.get(_key) or []:
         print(f"  [{_grade}] {_item}")
-print(f"\npreflight_report.html written to the bundle. "
+print(f"\nGraded verdict printed above; misc/preflight_report.json written to the bundle. "
       f"{'Import will NOT run.' if _pf['verdict'] == 'NO-GO' and cfg.imports.preflight_enforce else ''}")
 
 # COMMAND ----------
@@ -267,7 +261,7 @@ for _phase in result.get("per_phase", []):
 
 # COMMAND ----------
 
-_results = aw.read_json("import_results.json") or {}
+_results = aw.read_json(BP.IMPORT_RESULTS_JSON) or {}
 _units = _results.get("units", [])
 
 _failed = [u for u in _units if u.get("import_status") == "failed"]
@@ -296,11 +290,13 @@ for _u in _no_obj[:15]:
 
 # MAGIC %md ## ACL parity — the report to read after an import
 # MAGIC Source-vs-target permission diff, proven by re-reading every object we touched rather than
-# MAGIC assumed. `inherited` grants are dropped on BOTH sides so like is compared with like.
+# MAGIC assumed. `inherited` grants are dropped on BOTH sides so like is compared with like. The
+# MAGIC full table is folded into the **ACL Parity** sheet of the import workbook (PLAN 7 §B2/D-1);
+# MAGIC this is the inline summary.
 
 # COMMAND ----------
 
-_parity = aw.read_json("acl_parity_report.json") or {}
+_parity = runner.context.get("acl_parity") or {}
 if _parity:
     print(f"objects re-read and diffed: {_parity.get('objects_checked', 0)}")
     for _verdict, _n in sorted((_parity.get("counts") or {}).items(), key=lambda kv: -kv[1]):
@@ -310,8 +306,9 @@ if _parity:
         print(f"  {_o.get('verdict')}: {_o.get('perm_object_type')}/{_o.get('object')} "
               f"missing={_o.get('missing_on_target')} extra={_o.get('extra_on_target')}")
     print(f"\nNOTE: {_parity.get('known_limitation', '')}")
+    print("Full parity table: the 'ACL Parity' sheet of import_status.xlsx.")
 else:
-    print("no ACL parity report (the acls family was not selected this run)")
+    print("no ACL parity (the acls family was not selected this run)")
 
 # COMMAND ----------
 
@@ -319,20 +316,20 @@ else:
 
 # COMMAND ----------
 
+_status_xlsx = BP.IMPORT_STATUS_DRYRUN_XLSX if cfg.dry_run else BP.IMPORT_STATUS_XLSX
 print(f"Bundle: {aw.root}\n")
-for _name in ("import_results.json", "import_results.html", "import_status.xlsx",
-              "manual_actions_import.md", "acl_parity_report.json", "acl_parity_report.html",
-              "preflight_report.json", "preflight_report.html", "execution_import.log"):
+for _name in (BP.IMPORT_RESULTS_JSON, _status_xlsx, BP.MANUAL_ACTIONS_IMPORT_MD,
+              BP.PREFLIGHT_REPORT_JSON, BP.EXECUTION_IMPORT_LOG):
     _p = os.path.join(aw.root, _name)
     print(f"  {'✓' if os.path.exists(_p) else '·'} {_name}")
 
 print("\nNext steps:")
 if cfg.dry_run:
-    print("  1. Read import_status.xlsx — every unit's intended action, failures first.")
-    print("  2. Fix anything BLOCKING in preflight_report.html.")
+    print(f"  1. Read {_status_xlsx} — every unit's intended action, failures first.")
+    print("  2. Fix anything BLOCKING in the preflight verdict above.")
     print("  3. Re-run with dry_run=false (state_catalog + state_schema are then required).")
 else:
-    print("  1. Read acl_parity_report.html — the source-vs-target permission diff.")
+    print(f"  1. Read {_status_xlsx} — the 'ACL Parity' sheet is the source-vs-target diff.")
     print("  2. Work through manual_actions_import.md (secret values, Git repos, legacy dashboards).")
     print("  3. Re-run with retry_mode=failed_only once prerequisites are fixed.")
     print("  4. Re-run with import_assets=acls + retry_mode=skipped_only after a DAB redeploy.")

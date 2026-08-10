@@ -10,13 +10,13 @@
 # COMMAND ----------
 
 # MAGIC %md ## Widgets
-# MAGIC `role` MUST be **target** for this notebook. See PLAN_0_master §5 for the full widget list.
+# MAGIC This is the TARGET-side review stage (role is derived, not a widget — PLAN 7 §C).
 
 # COMMAND ----------
 
-# TODO: declare widgets. Common: role, run_id, source_workspace_id.
-# target side: target_staging_location, dry_run, account_id, transform options, per-asset toggles
-# dbutils.widgets.dropdown("role", "target", ["source", "target"], "Role")
+# TODO: declare widgets. Common: connectivity_mode, run_id, source_workspace_id, staging_location.
+# target side: dry_run, account_id, transform options. Build via
+# Config.from_dbutils(dbutils, spark, stage=STAGE_IMPORT).
 
 # COMMAND ----------
 
@@ -35,5 +35,5 @@
 
 # COMMAND ----------
 
-# TODO: cfg = Config.from_dbutils(dbutils, spark); assert cfg.role == "target"; wire this stage.
-raise NotImplementedError("03 — Transform & Review (TARGET side): stub — implement after PLAN_1 approval")
+# TODO: cfg = Config.from_dbutils(dbutils, spark, stage=STAGE_IMPORT); wire this stage.
+raise NotImplementedError("03 — Transform & Review (TARGET side): stub — implement in Plan 4")

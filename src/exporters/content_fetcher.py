@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.auth.token_manager import DownloadHTTPError, OversizeError
+from src.exporters import bundle_paths as BP
 from src.utils.helpers import safe_str
 from src.utils.logger import get_logger
 
@@ -141,7 +142,7 @@ class ContentFetcher:
             return FetchResult(status="failure", content_kind=kind, note=f"content fetch: {exc}")
 
         rel_name = self._reserve_name(path, kind, language)
-        rel = f"export/workspace/content/{rel_name}"
+        rel = f"{BP.EXPORT_CONTENT_DIR}/{rel_name}"
         try:
             self.aw.write_bytes(rel, data)
         except Exception as exc:  # noqa: BLE001
