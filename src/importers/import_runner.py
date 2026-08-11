@@ -427,4 +427,7 @@ class ImportRunner:
 
     def _write_reports(self, summary: dict) -> None:
         from src.reports.import_report import write_import_reports
-        write_import_reports(self.aw, self.config, summary, self.results, self.context)
+        # Record the ACTUAL report paths written (they vary: dry_run / retry_<ts> / canonical) so
+        # the notebook reads back the files this run produced rather than a stale canonical name.
+        summary["reports"] = write_import_reports(
+            self.aw, self.config, summary, self.results, self.context)

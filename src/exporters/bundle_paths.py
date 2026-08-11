@@ -58,3 +58,18 @@ EXPORT_CONTENT_DIR = "export/workspace/content"
 TOP_LEVEL_SUBDIRS = ("reports", "misc")
 EXPORT_SUBDIRS = ("export", "export/identity", "export/compute", "export/workspace",
                   "export/secrets", "export/dashboards", "export/misc")
+
+
+def with_variant(rel_path: str, variant: str) -> str:
+    """Insert a `_<variant>` tag before the file extension. Blank variant → path unchanged.
+
+    Used so a re-run against the SAME run dir can preserve the prior report instead of clobbering it
+    (PLAN 7 A1 = the `dry_run` variant; a `retry_<timestamp>` variant keeps each retry's report set):
+      with_variant("reports/import_status.xlsx", "retry_20260811_101530")
+        -> "reports/import_status_retry_20260811_101530.xlsx"
+    """
+    if not variant:
+        return rel_path
+    import os as _os
+    root, ext = _os.path.splitext(rel_path)
+    return f"{root}_{variant}{ext}"

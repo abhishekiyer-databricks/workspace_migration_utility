@@ -261,7 +261,10 @@ for _phase in result.get("per_phase", []):
 
 # COMMAND ----------
 
-_results = aw.read_json(BP.IMPORT_RESULTS_JSON) or {}
+# Read back the results file THIS run wrote — a live retry tags it `_retry_<ts>`, a dry run keeps
+# the canonical name; the runner records the actual path under summary["reports"].
+_results_rel = (result.get("reports") or {}).get("json") or BP.IMPORT_RESULTS_JSON
+_results = aw.read_json(_results_rel) or {}
 _units = _results.get("units", [])
 
 _failed = [u for u in _units if u.get("import_status") == "failed"]
@@ -316,9 +319,13 @@ else:
 
 # COMMAND ----------
 
-_status_xlsx = BP.IMPORT_STATUS_DRYRUN_XLSX if cfg.dry_run else BP.IMPORT_STATUS_XLSX
+# List the files THIS run actually wrote (dry → *_dry_run; live retry → *_retry_<ts>; else canonical).
+_reports = result.get("reports") or {}
+_status_xlsx = _reports.get("xlsx") or (BP.IMPORT_STATUS_DRYRUN_XLSX if cfg.dry_run
+                                        else BP.IMPORT_STATUS_XLSX)
 print(f"Bundle: {aw.root}\n")
-for _name in (BP.IMPORT_RESULTS_JSON, _status_xlsx, BP.MANUAL_ACTIONS_IMPORT_MD,
+for _name in (_reports.get("json") or BP.IMPORT_RESULTS_JSON, _status_xlsx,
+              _reports.get("manual_actions") or BP.MANUAL_ACTIONS_IMPORT_MD,
               BP.PREFLIGHT_REPORT_JSON, BP.EXECUTION_IMPORT_LOG):
     _p = os.path.join(aw.root, _name)
     print(f"  {'✓' if os.path.exists(_p) else '·'} {_name}")

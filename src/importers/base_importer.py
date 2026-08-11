@@ -445,9 +445,11 @@ class BaseImporter(ABC):
         key = self.natural_key(unit)
         asset_type = safe_str(unit.get("asset_type"))
 
-        # 0. retry_mode narrowed the work list and this unit isn't in it. Recorded as skipped so
-        #    the report still accounts for every unit (a narrowed run must not look like a run in
-        #    which these units didn't exist), but nothing is attempted and no state row changes.
+        # 0. retry_mode narrowed the work list and this unit isn't in it. Recorded (in-memory) so
+        #    the run's result still ACCOUNTS for every unit, but flagged `retry_out_of_scope` so the
+        #    retry REPORT can leave it out — repeating the whole inventory (mostly "not outstanding"
+        #    rows) in every retry file is noise, and the full-run report already has the whole
+        #    picture. Nothing is attempted and no state row changes.
         if not self.in_work_list(unit):
             self.result.add({
                 "asset_type": asset_type, "natural_key": key, "family": self.component,
@@ -457,7 +459,8 @@ class BaseImporter(ABC):
                 "fingerprint": safe_str(unit.get("fingerprint")),
                 "note": f"retry_mode={self.config.imports.retry_mode} narrowed this run to "
                         f"outstanding units; this one was not outstanding",
-                "failure_category": "", "dry_run": self.dry_run})
+                "failure_category": "", "dry_run": self.dry_run,
+                "retry_out_of_scope": True})
             return
 
         # 1. Units the bundle already marked as human work (repos, legacy dashboards, secret
@@ -488,7 +491,15 @@ class BaseImporter(ABC):
         # 3. Resume: this attempt already did it. The recorded OUTCOME is restored (not just a
         #    done-flag), because import_results.json is written only at the end and so never
         #    exists after a crash — the checkpoint is the only resumable record.
-        if not self.config.imports.force_full_import:
+        #    BUT a unit the operator explicitly asked to retry (retry_mode != off, so retry_keys is
+        #    a set and step 0 already kept only the targeted units) must NOT be short-circuited here:
+        #    the checkpoint records the PRIOR failed/skipped outcome, so replaying it would make
+        #    `retry_mode=failed_only` a no-op after a prerequisite is fixed. Re-attempting is safe —
+        #    step 4's upsert is idempotent (live existence check + fingerprint + adopt), and it is
+        #    the STATE TABLE (reloaded into retry_keys), not the checkpoint, that decides what is
+        #    still outstanding, so a crashed retry re-run naturally drops the units that succeeded.
+        retry_active = self.retry_keys is not None
+        if not self.config.imports.force_full_import and not retry_active:
             prior = self.staging.get_results(self._cp_component()).get(key)
             if prior and self.staging.is_done(self._cp_component(), key):
                 self._record(unit, safe_str(prior.get("import_status")) or ACTION_SKIPPED,

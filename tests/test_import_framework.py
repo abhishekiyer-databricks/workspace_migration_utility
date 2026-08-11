@@ -238,6 +238,49 @@ def test_force_full_import_ignores_the_checkpoint():
     assert imp2.created == ["a"], "force_full_import must re-evaluate every unit"
 
 
+def test_retry_mode_reattempts_a_failed_unit_despite_the_checkpoint():
+    """REGRESSION: a failed unit is written to the checkpoint, so a plain re-run replays 'failed'.
+    But when the operator fixes the prerequisite and re-runs with `retry_mode=failed_only`, the
+    unit MUST be re-attempted — retry_mode has to bypass the checkpoint resume, or the documented
+    "fix the cause, re-run with retry_mode=failed_only" workflow is a silent no-op (found live: DLT
+    pipelines that failed on a missing catalog grant would never retry without force_full_import).
+    """
+    imp, aw, st, cfg = _setup([_unit("a")])
+    imp.fail_on = {"a"}
+    imp.run(); st.flush()
+    assert imp.result.failed == 1
+    assert st.row("cluster", "a")["last_action"] == "failed"
+
+    # Prerequisite fixed; retry_mode=failed_only, force_full_import stays FALSE.
+    st.load(force=True)
+    imp2 = ToyImporter(object(), cfg, aw, state=st, units_by_type={"cluster": [_unit("a")]})
+    imp2.fail_on = set()
+    imp2.retry_keys = st.retry_keys("failed_only")
+    assert imp2.retry_keys == {("cluster", "a")}
+    res2 = imp2.run(); st.flush()
+    assert imp2.created == ["a"], "the failed unit must be re-created on retry, not replayed as failed"
+    assert res2.failed == 0
+    assert st.row("cluster", "a")["last_action"] == "created"
+
+
+def test_retry_mode_does_not_reattempt_units_outside_the_bucket():
+    """The narrowing still holds: a unit NOT in the retry bucket is recorded skipped, not touched —
+    even though bypassing the checkpoint for the targeted ones."""
+    imp, aw, st, cfg = _setup([_unit("a"), _unit("b")])
+    imp.fail_on = {"a"}
+    imp.run(); st.flush()          # a -> failed, b -> created (both checkpointed)
+
+    st.load(force=True)
+    imp2 = ToyImporter(object(), cfg, aw, state=st,
+                       units_by_type={"cluster": [_unit("a"), _unit("b")]})
+    imp2.fail_on = set()
+    imp2.retry_keys = st.retry_keys("failed_only")   # only ("cluster","a")
+    res2 = imp2.run()
+    assert imp2.created == ["a"], "only the failed unit is re-attempted"
+    b_row = next(r for r in res2.units if r["natural_key"] == "b")
+    assert b_row["import_status"] == "skipped" and "not outstanding" in b_row["note"]
+
+
 # ── dry run (§11 dry-run purity) ───────────────────────────────────────────
 
 def test_dry_run_makes_real_decisions_and_zero_writes():

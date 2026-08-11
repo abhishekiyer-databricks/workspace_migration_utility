@@ -93,12 +93,37 @@ def _all_rows(results: list) -> list[dict]:
 
 
 def write_import_reports(aw, config, summary: dict, results: list, context: dict) -> dict:
-    """Write every import artifact. Never raises — a reporting failure must not fail the run."""
+    """Write every import artifact. Never raises — a reporting failure must not fail the run.
+
+    Report FILENAMES vary so a re-run against the SAME run dir never silently clobbers the prior
+    report (each import re-uses the same bundle/run_id):
+      • dry run           → `import_status_dry_run.xlsx` (A1); results json + runbook stay canonical.
+      • live + retry_mode  → the WHOLE set is tagged `_retry_<timestamp>` and the canonical full-run
+        (≠ off)             files (`import_status.xlsx`, `import_results.json`,
+                            `manual_actions_import.md`) are LEFT UNTOUCHED — the last full run's
+                            report survives, and every retry keeps its own timestamped set.
+      • live + retry off  → the canonical names (the full-run report).
+    The returned dict carries the ACTUAL paths written, so the notebook reads back the right files.
+    """
     rows = _all_rows(results)
     written: dict[str, str] = {}
     # The deleted-in-source finding is discovered by the runner into `context`; fold it into the
     # summary so every renderer below sees one object rather than needing both.
     summary = {**summary, "deleted_in_source": context.get("deleted_in_source", {})}
+
+    # A live retry run tags its whole report set with a shared timestamp; dry + full-live keep their
+    # existing names (dry only re-points the xlsx, see A1).
+    _retry_active = (not summary.get("dry_run")
+                     and safe_str(getattr(config.imports, "retry_mode", "off")) not in ("", "off"))
+    _variant = f"retry_{datetime.now().strftime('%Y%m%d_%H%M%S')}" if _retry_active else ""
+
+    # A retry report is SCOPED to the units the retry actually attempted: the units outside the
+    # retry work list are flagged `retry_out_of_scope` and dropped here, so the retry file isn't the
+    # whole inventory re-printed as "not outstanding" (the preserved full-run report already has
+    # that). Totals/counts below then derive from the scoped rows, so the roll-up matches.
+    if _retry_active:
+        rows = [r for r in rows if not r.get("retry_out_of_scope")]
+    totals = _rollup_totals(rows) if _retry_active else summary.get("totals", {})
 
     payload = {
         "run_id": summary.get("run_id"),
@@ -108,7 +133,9 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
         "run_status": summary.get("run_status"),
         "generated_utc": summary.get("generated_utc") or now_iso(),
         "elapsed_sec": summary.get("elapsed_sec"),
-        "totals": summary.get("totals", {}),
+        "retry_mode": safe_str(getattr(config.imports, "retry_mode", "off")),
+        "scoped_to_retry": _retry_active,
+        "totals": totals,
         "per_phase": summary.get("per_phase", []),
         "counts_by_status": _counts_by_status(rows),
         "counts_by_asset_type": _counts_by_asset_type(rows),
@@ -116,16 +143,20 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
         # The join surface Plan 4 reads: one row per unit, keyed (asset_type, natural_key).
         "units": rows,
     }
+    # On a live retry the results json is tagged too, so the canonical (last full-run) join surface
+    # is preserved; dry + full-live write the canonical name.
+    json_rel = BP.with_variant(BP.IMPORT_RESULTS_JSON, _variant)
     try:
-        aw.write_json(BP.IMPORT_RESULTS_JSON, payload)
-        written["json"] = BP.IMPORT_RESULTS_JSON
+        aw.write_json(json_rel, payload)
+        written["json"] = json_rel
     except Exception as exc:  # noqa: BLE001
-        _LOG.warning("import_results.json not written", error=str(exc))
+        _LOG.warning("import results json not written", rel=json_rel, error=str(exc))
 
     # A1: a rehearsal writes a SEPARATE filename so a later live run never overwrites the dry-run's
-    # report — the two are meant to be read side by side ("this is what a live run WILL do" vs "this
-    # is what it DID"). D-1: the ACL parity result is folded in as a sheet, sourced from context.
-    xlsx_rel = BP.IMPORT_STATUS_DRYRUN_XLSX if summary.get("dry_run") else BP.IMPORT_STATUS_XLSX
+    # report; a live retry writes `import_status_retry_<ts>.xlsx`. D-1: the ACL parity result is
+    # folded in as a sheet, sourced from context.
+    xlsx_rel = (BP.IMPORT_STATUS_DRYRUN_XLSX if summary.get("dry_run")
+                else BP.with_variant(BP.IMPORT_STATUS_XLSX, _variant))
     parity = context.get("acl_parity") or {}
     try:
         path = aw.write_text_local_then_copy(
@@ -136,12 +167,12 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
         _LOG.warning("import status xlsx not written", rel=xlsx_rel, error=str(exc))
 
+    md_rel = BP.with_variant(BP.MANUAL_ACTIONS_IMPORT_MD, _variant)
     try:
-        aw.write_bytes(BP.MANUAL_ACTIONS_IMPORT_MD,
-                       _render_manual_actions(summary, rows).encode("utf-8"))
-        written["manual_actions"] = BP.MANUAL_ACTIONS_IMPORT_MD
+        aw.write_bytes(md_rel, _render_manual_actions(summary, rows).encode("utf-8"))
+        written["manual_actions"] = md_rel
     except Exception as exc:  # noqa: BLE001
-        _LOG.warning("manual_actions_import.md not written", error=str(exc))
+        _LOG.warning("manual_actions_import.md not written", rel=md_rel, error=str(exc))
 
     _LOG.info("import reports written", **written)
     return written
@@ -152,6 +183,26 @@ def _counts_by_status(rows: list[dict]) -> dict:
     for r in rows:
         s = safe_str(r.get("import_status"))
         out[s] = out.get(s, 0) + 1
+    return out
+
+
+# import_status → the ImportResult counter name, so a scoped retry report's `totals` matches the
+# rows it actually shows (rather than the runner's whole-run counters).
+_STATUS_TO_TOTAL = {
+    "created": "created", "updated": "updated", "adopted": "adopted", "skipped": "skipped",
+    "failed": "failed", "manual": "manual", "not_selected": "not_selected",
+    "skipped_no_object": "skipped_no_object", "created_with_warning": "created_with_warning",
+}
+
+
+def _rollup_totals(rows: list[dict]) -> dict:
+    """A totals dict (same shape as the runner's) computed from exactly the rows being reported —
+    used for a retry report so its roll-up counts the scoped units, not the whole run."""
+    out: dict = {"total": len(rows)}
+    for r in rows:
+        counter = _STATUS_TO_TOTAL.get(safe_str(r.get("import_status")))
+        if counter:
+            out[counter] = out.get(counter, 0) + 1
     return out
 
 

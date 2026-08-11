@@ -677,12 +677,16 @@ def main(keep: bool = False) -> int:
         aw_g = ArtifactWriter(cfg_g)
         summary_g, _m, state_g = _import(cfg_g, target_client, aw_g)
         outstanding = state_g.retry_keys("failed_only") or set()
-        attempted = [u for u in (aw_g.read_json("misc/import_results.json") or {}).get("units", [])
-                     if "not outstanding" not in safe(u.get("note"))]
-        CHECKS.add("G", "retry_mode=failed_only attempted only outstanding units",
-                   len(attempted) <= max(len(outstanding), 1),
-                   f"{len(outstanding)} outstanding, {len(attempted)} attempted")
-        CHECKS.add("G", "a narrowed run still ACCOUNTS for every unit",
+        # A live retry writes a scoped, timestamped report — read the file the run actually wrote,
+        # which now contains ONLY the units the retry attempted (no "not outstanding" filler).
+        _retry_json = (summary_g.get("reports") or {}).get("json") or "misc/import_results.json"
+        attempted = (aw_g.read_json(_retry_json) or {}).get("units", [])
+        CHECKS.add("G", "the retry report is scoped to only the outstanding units it attempted",
+                   len(attempted) <= max(len(outstanding), 1)
+                   and not any("not outstanding" in safe(u.get("note")) for u in attempted),
+                   f"{len(outstanding)} outstanding, {len(attempted)} in the scoped retry report")
+        # the runner's in-memory result still ACCOUNTS for every unit (only the REPORT is scoped)
+        CHECKS.add("G", "a narrowed run still accounts for every unit in its summary",
                    summary_g["totals"].get("total", 0) > 0,
                    f"total={summary_g['totals'].get('total')}")
 

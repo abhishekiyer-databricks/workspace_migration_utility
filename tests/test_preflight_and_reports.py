@@ -438,6 +438,82 @@ def test_a_live_run_does_not_overwrite_the_dry_run_report():
     assert os.path.isfile(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
 
 
+def test_a_live_retry_run_writes_a_timestamped_set_and_preserves_the_full_run_report():
+    """A live retry_mode!=off run must NOT clobber the full-run report — it writes its whole set
+    tagged `_retry_<ts>` and leaves import_status.xlsx / import_results.json /
+    manual_actions_import.md (the last full run) untouched."""
+    cfg, aw = _bundle(dry_run=False)
+    # a full live run first (canonical names)
+    written_full = write_import_reports(
+        aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                  "run_status": "completed", "totals": {}, "per_phase": []},
+        [_result_with_rows([_row("cluster", "etl", "created")])], {})
+    assert written_full["xlsx"] == BP.IMPORT_STATUS_XLSX
+    assert written_full["json"] == BP.IMPORT_RESULTS_JSON
+
+    # now a live RETRY run
+    cfg.imports.retry_mode = "failed_only"
+    written_retry = write_import_reports(
+        aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                  "run_status": "completed", "totals": {}, "per_phase": []},
+        [_result_with_rows([_row("dlt_pipeline", "bronze", "created")])], {})
+    # the whole set is tagged, under the right dirs, and distinct from the canonical names
+    assert written_retry["xlsx"].startswith("reports/import_status_retry_") \
+        and written_retry["xlsx"].endswith(".xlsx")
+    assert written_retry["json"].startswith("misc/import_results_retry_")
+    assert written_retry["manual_actions"].startswith("reports/manual_actions_import_retry_")
+    # the full-run files still exist AND the retry files exist alongside them
+    for rel in (BP.IMPORT_STATUS_XLSX, BP.IMPORT_RESULTS_JSON, BP.MANUAL_ACTIONS_IMPORT_MD,
+                written_retry["xlsx"], written_retry["json"], written_retry["manual_actions"]):
+        assert os.path.isfile(os.path.join(aw.root, rel)), f"{rel} missing"
+    # the preserved full-run json still shows the ORIGINAL outcome, not the retry's
+    assert aw.read_json(BP.IMPORT_RESULTS_JSON)["units"][0]["asset_type"] == "cluster"
+    assert aw.read_json(written_retry["json"])["units"][0]["asset_type"] == "dlt_pipeline"
+
+
+def test_a_retry_report_is_scoped_to_the_units_it_attempted():
+    """The retry file must NOT re-print the whole inventory as 'not outstanding' — only the units
+    the retry actually attempted appear, and the roll-up counts match."""
+    cfg, aw = _bundle(dry_run=False)
+    cfg.imports.retry_mode = "failed_only"
+    rows = [
+        _row("dlt_pipeline", "bronze", "created"),                       # attempted → shown
+        _row("cluster", "etl", "skipped", retry_out_of_scope=True,       # not in bucket → hidden
+             action_taken="Not in this retry's work list", note="not outstanding"),
+    ]
+    written = write_import_reports(
+        aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                  "run_status": "completed", "totals": {"total": 2, "skipped": 1, "created": 1},
+                  "per_phase": []},
+        [_result_with_rows(rows)], {})
+    payload = aw.read_json(written["json"])
+    keys = {(u["asset_type"], u["natural_key"]) for u in payload["units"]}
+    assert keys == {("dlt_pipeline", "bronze")}, "the retry report must show ONLY attempted units"
+    assert payload["totals"]["total"] == 1 and payload["totals"]["created"] == 1
+    assert payload["scoped_to_retry"] is True
+    # the workbook likewise has no out-of-scope cluster row
+    from openpyxl import load_workbook
+    wb = load_workbook(os.path.join(aw.root, written["xlsx"]))
+    seen = set()
+    for name in wb.sheetnames:
+        for r in wb[name].iter_rows(min_row=2, values_only=True):
+            if r and r[0]:
+                seen.add(str(r[0]))
+    assert "cluster" not in seen, "an out-of-scope unit leaked into the retry workbook"
+
+
+def test_a_dry_run_is_not_treated_as_a_retry_even_with_retry_mode_set():
+    """retry tagging is for LIVE runs; a dry rehearsal keeps its own _dry_run name regardless."""
+    cfg, aw = _bundle(dry_run=True)
+    cfg.imports.retry_mode = "failed_only"
+    written = write_import_reports(
+        aw, cfg, {"run_id": "r1", "dry_run": True, "run_status": "completed",
+                  "totals": {}, "per_phase": []},
+        [_result_with_rows([_row("cluster", "etl", "created", dry_run=True)])], {})
+    assert written["xlsx"] == BP.IMPORT_STATUS_DRYRUN_XLSX
+    assert "retry_" not in written["json"] and "retry_" not in written["xlsx"]
+
+
 def test_an_aborted_run_is_visibly_partial():
     """An abort must never look clean — the results json is marked aborted."""
     cfg, aw = _bundle()
