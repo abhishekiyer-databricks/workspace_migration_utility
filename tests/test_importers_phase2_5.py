@@ -197,6 +197,36 @@ def test_pool_and_policy_are_remapped_by_name_to_target_ids():
     assert body["policy_id"] == "pol-2", "the policy id was not remapped to the target id"
 
 
+def test_cluster_policy_definition_pool_id_is_remapped():
+    """PLAN 8 Bug 9: a policy that FIXES instance_pool_id to a SOURCE pool id rejects every cluster
+    under it, so the ids INSIDE the definition must be remapped through the pool map too — not just
+    the ids in the cluster spec."""
+    client = RecordingClient()
+    definition = json.dumps({"instance_pool_id": {"type": "fixed", "value": "SRC-POOL"},
+                             "spark_version": {"type": "fixed", "value": "13.3.x"}})
+    imp, _st = _make(ComputeImporter, [
+        _unit("instance_pool", "shared-pool", {"instance_pool_name": "shared-pool"},
+              source_id="SRC-POOL"),
+        _unit("cluster_policy", "std", {"name": "std", "definition": definition}, source_id="SRC-POL"),
+    ], client)
+    res = imp.run()
+    assert res.created == 2
+    got = json.loads(client.bodies_to("policies/clusters/create")[0]["definition"])
+    assert got["instance_pool_id"]["value"] == "pool-1", "the PINNED pool id must be remapped"
+    assert got["spark_version"]["value"] == "13.3.x", "non-id fields are untouched"
+
+
+def test_cluster_policy_with_an_unresolvable_pinned_pool_warns():
+    """A policy pinning a pool with no target equivalent is reported degraded, not silently wrong."""
+    client = RecordingClient()
+    definition = json.dumps({"driver_instance_pool_id": {"type": "fixed", "value": "GONE"}})
+    imp, _st = _make(ComputeImporter, [
+        _unit("cluster_policy", "std", {"name": "std", "definition": definition})], client)
+    res = imp.run()
+    assert res.warned == 1
+    assert "no target pool" in res.units[0]["note"]
+
+
 def test_node_types_are_stripped_when_a_pool_is_set():
     """`node_type_id` alongside `instance_pool_id` is rejected — the pool dictates the node type."""
     client = RecordingClient()
@@ -313,6 +343,24 @@ def test_an_unmigrated_sp_home_is_a_clear_prerequisite_not_a_bare_failure():
     row = st.row("directory", f"/Users/{_OLD_APP}")
     assert row["failure_category"] == "prerequisite_missing"
     assert "SERVICE PRINCIPAL home" in row["last_error"]
+
+
+def test_content_under_an_absent_user_home_is_a_clean_prerequisite_not_a_raw_error():
+    """PLAN 8 Bug 8/14: a subdir/notebook under a user home whose owner is ABSENT on target must be
+    ONE clean prerequisite_missing per unit — not the raw DIRECTORY_PROTECTED / parent-missing
+    api_error per descendant that swamped the RIL failure list (≈264 of 297 failures)."""
+    client = RecordingClient()   # get-status raises RESOURCE_DOES_NOT_EXIST → home reads as absent
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", "/Users/ghost@x.com/proj", {"path": "/Users/ghost@x.com/proj"}),
+        _unit("notebook", "/Users/ghost@x.com/proj/nb",
+              {"path": "/Users/ghost@x.com/proj/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    res = imp.run()
+    assert res.failed == 2
+    assert client.posts_to("workspace/mkdirs") == [], "must NOT attempt mkdirs under an absent home"
+    for row in res.units:
+        assert row["failure_category"] == "prerequisite_missing"
+        assert "owner is not present on target" in row["note"]
 
 
 def _write_classification(aw, sp_app_ids):

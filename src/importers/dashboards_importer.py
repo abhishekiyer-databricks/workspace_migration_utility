@@ -34,7 +34,18 @@ class DashboardsImporter(BaseImporter):
 
     def create_one(self, unit: dict) -> dict:
         body, note = self._body(unit)
-        created = self.client.post("api/2.0/lakeview/dashboards", body)
+        # PLAN 8 Bug 7 (Lakeview sibling): recreate the dashboard's `.lvdash.json` in its SOURCE
+        # folder (a user-created dashboard belongs back in the user's directory), not the API
+        # default. Only on CREATE — an update doesn't move an existing dashboard.
+        parent = safe_str((unit.get("payload") or {}).get("parent_path"))
+        if parent:
+            body["parent_path"] = parent
+            self.remap_parent_path(body)
+        try:
+            created = self.client.post("api/2.0/lakeview/dashboards", body)
+        except Exception as exc:  # noqa: BLE001
+            self.missing_parent_prerequisite(exc, body.get("parent_path"), self.natural_key(unit))
+            raise
         did = safe_str(created.get("dashboard_id"))
         self.context.setdefault("lakeview_dashboard_target_ids", {})[self.natural_key(unit)] = did
         return {"target_id": did, "note": note}

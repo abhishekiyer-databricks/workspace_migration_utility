@@ -55,6 +55,15 @@ _STATUS_STYLE = {
 _SUMMARY_ORDER = ("created", "updated", "adopted", "skipped", "created_with_warning", "manual",
                   "not_selected", "skipped_no_object", "failed")
 
+# Bug 6 — one-time static disclaimer (xlsx summary footer + runbook). Account-level access-control
+# is invisible to a workspace-scoped tool, so a change to it reads as `unchanged` here; this stops
+# that being mistaken for a defect. See PLAN 8 "Scope clarification / Bug 6".
+_ACCOUNT_ACL_DISCLAIMER = (
+    "Account-level access-control — group Manager, service-principal Can use / Can manage "
+    "(account rule-sets) — is managed at the account and is NOT tracked by this workspace-scoped "
+    "tool. Changes to it appear here as 'unchanged'. In the same account it is already in effect on "
+    "the target; across accounts it is provisioned during account setup / Entra→SCIM.")
+
 # Fine-grained importer `asset_type` → the inventory/export CARD KEY it belongs to, so the import
 # workbook lays out ONE SHEET PER ASSET TYPE exactly like inventory.xlsx / export_status.xlsx
 # (IMP-1: the three stages must be structurally identical, not one-sheet-per-family here and
@@ -62,6 +71,8 @@ _SUMMARY_ORDER = ("created", "updated", "adopted", "skipped", "created_with_warn
 # a newly-added importer type is never silently dropped.
 _ASSET_TYPE_TO_CARD = {
     "user": "users", "service_principal": "service_principals",
+    # PLAN 8 Bug 3: the standing OAuth-secret manual task sits beside its SP in the SPs tab.
+    "service_principal_secret": "service_principals",
     "group": "groups", "group_membership": "groups",
     "notebook": "notebooks", "workspace_file": "workspace_files",
     "directory": "notebooks", "repo": "repos",
@@ -158,10 +169,14 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     xlsx_rel = (BP.IMPORT_STATUS_DRYRUN_XLSX if summary.get("dry_run")
                 else BP.with_variant(BP.IMPORT_STATUS_XLSX, _variant))
     parity = context.get("acl_parity") or {}
+    # Bug 15: the ACL phase expands acls.json to one row per object×principal×permission; when
+    # present, the workbook renders a dedicated "Object Permissions (ACLs)" sheet mirroring inventory
+    # instead of collapsing each object to one `acl` row + a count.
+    acl_grants = context.get("acl_grants")
     try:
         path = aw.write_text_local_then_copy(
             xlsx_rel,
-            lambda local: _render_xlsx(local, config, summary, rows, parity))
+            lambda local: _render_xlsx(local, config, summary, rows, parity, acl_grants))
         if path:
             written["xlsx"] = xlsx_rel
     except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
@@ -221,9 +236,9 @@ def _counts_by_asset_type(rows: list[dict]) -> dict:
 # ── Excel ───────────────────────────────────────────────────────────────────
 
 def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
-                 parity: dict = None) -> str:
-    """Import Summary sheet + one sheet per asset type + an ACL Parity sheet (D-1). Rendered
-    locally (openpyxl needs seeks)."""
+                 parity: dict = None, acl_grants: list = None) -> str:
+    """Import Summary sheet + one sheet per asset type + an "Object Permissions (ACLs)" sheet
+    (per-grant, Bug 15) + an ACL Parity sheet (D-1). Rendered locally (openpyxl needs seeks)."""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -279,6 +294,21 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         v.font = font(bold=True, size=12)
         v.border = box
         v.alignment = centre
+    # Bug 4: a deletion is not an import_status on any PROCESSED unit, so it never appears in
+    # `by_status` — give it its own roll-up cell so a deletion is visible at a glance rather than
+    # only in the runbook.
+    deleted = summary.get("deleted_in_source") or {}
+    deleted_count = sum(len(v) for v in deleted.values())
+    dcol = len(_SUMMARY_ORDER) + 1
+    dh = ws.cell(row=r, column=dcol, value="Deleted in source")
+    dh.font = font(bold=True, size=9)
+    dh.fill = fill(_STATUS_STYLE["deleted_in_source"][1])
+    dh.border = box
+    dh.alignment = centre
+    dv = ws.cell(row=r + 1, column=dcol, value=deleted_count)
+    dv.font = font(bold=True, size=12)
+    dv.border = box
+    dv.alignment = centre
     r += 3
 
     # FAILURES FIRST — the whole point of the summary sheet is that nobody has to hunt for them.
@@ -327,6 +357,31 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             cc.alignment = left_wrap
     r += 2
 
+    # Deleted-in-source table (Bug 4) — on target but no longer in the source bundle. NOT deleted;
+    # deletion requires allow_deletes=true. Mirrors the runbook section so the xlsx is self-contained.
+    if deleted:
+        ws.cell(row=r, column=1,
+                value=f"Deleted in source — review ({deleted_count})").font = font(
+                    bold=True, color="9F1239", size=12)
+        r += 1
+        for col, h in enumerate(["Asset Type", "Natural Key", "Note"], 1):
+            cc = ws.cell(row=r, column=col, value=h)
+            cc.font = font(bold=True, color="FFFFFF")
+            cc.fill = fill("9F1239")
+            cc.border = box
+        _del_note = ("on target but no longer in the source bundle — NOT deleted (set "
+                     "allow_deletes=true to opt into deletion); confirm it was deliberately removed")
+        for at in sorted(deleted):
+            for key in sorted(deleted[at]):
+                r += 1
+                for col, v in enumerate([at, key, _del_note], 1):
+                    cc = ws.cell(row=r, column=col, value=safe_str(v))
+                    cc.fill = fill(_STATUS_STYLE["deleted_in_source"][1])
+                    cc.border = box
+                    cc.font = font(size=9)
+                    cc.alignment = left_wrap
+        r += 2
+
     # Per-asset-type counts
     ws.cell(row=r, column=1, value="Per asset type").font = font(bold=True, size=12,
                                                                  color="1E3A5F")
@@ -348,6 +403,16 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             cc.border = box
             cc.font = font(size=9, bold=(col == 2))
             cc.alignment = centre if col > 1 else left_wrap
+
+    # Bug 6: a purely account-level access-control change (group Manager, SP Can use / Can manage)
+    # is invisible to this workspace-scoped tool, so such a row shows `Skipped (unchanged)` with no
+    # targeted message possible. A one-time static disclaimer stops that being mistaken for a defect.
+    r += 2
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=10)
+    dc = ws.cell(row=r, column=1, value=_ACCOUNT_ACL_DISCLAIMER)
+    dc.font = font(italic=True, color="475569", size=9)
+    dc.alignment = left_wrap
+    ws.row_dimensions[r].height = 56
 
     for i, w in enumerate([26, 52, 20, 70, 14, 14, 14, 14, 14, 14], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -372,6 +437,10 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
     # cards not in the canonical list (defensive — a new importer type still gets a tab).
     ordered_cards = [k for k in _SUMMARY_CARD_KEYS if k in by_card]
     ordered_cards += [k for k in sorted(by_card) if k not in _SUMMARY_CARD_KEYS]
+    # Bug 15: when per-grant ACL detail exists, the dedicated "Object Permissions (ACLs)" sheet
+    # below replaces the collapsed one-row-per-object `object_permissions` tab — don't render both.
+    if acl_grants is not None:
+        ordered_cards = [k for k in ordered_cards if k != "object_permissions"]
 
     import re as _re
     for card in ordered_cards:
@@ -399,6 +468,49 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
                     cc.value = _label
         sheet.freeze_panes = "A2"
 
+    # ── Object Permissions (ACLs) — one row per object×principal×permission (Bug 15) ──
+    # MIRRORS the inventory ACL sheet (Object Type · Object · Principal · Permission · Inherited) so
+    # the three stages line up, and adds a per-grant Import Status + source/target id so an operator
+    # can confirm a specific principal's grant on a specific object reached target WITHOUT hitting
+    # the permissions API — the exact question the old collapsed "N grants applied" row could not
+    # answer.
+    if acl_grants is not None:
+        aname = _re.sub(r"[\\/?*\[\]:]", "-",
+                        _LABELS.get("object_permissions", "Object Permissions (ACLs)"))[:31]
+        asheet = wb.create_sheet(aname)
+        asheet.sheet_view.showGridLines = False
+        acols = [("Object Type", "perm_object_type", 22), ("Object", "object", 52),
+                 ("Principal", "principal", 40), ("Permission", "permission", 22),
+                 ("Inherited", "inherited", 11), ("Import Status", "import_status", 30),
+                 ("Source Id", "source_id", 22), ("Target Id", "target_id", 22)]
+        for col, (h, _k, w) in enumerate(acols, 1):
+            cc = asheet.cell(row=1, column=col, value=h)
+            cc.font = font(bold=True, color="FFFFFF", size=10)
+            cc.fill = fill("1E3A5F")
+            cc.border = box
+            cc.alignment = centre
+            asheet.column_dimensions[get_column_letter(col)].width = w
+        _grant_colour = {"applied": "D1FAE5", "failed": "FEE2E2",
+                         "dropped — principal not on target": "FDE68A",
+                         "skipped — no target object": "EDE9FE",
+                         "skipped — inherited/built-in": "E5E7EB"}
+        # Non-applied grants first (that is what needs an operator's eye), then by object + principal.
+        ordered = sorted(acl_grants, key=lambda g: (
+            safe_str(g.get("import_status")) == "applied",
+            safe_str(g.get("perm_object_type")), safe_str(g.get("object")),
+            safe_str(g.get("principal")), safe_str(g.get("permission"))))
+        for i, g in enumerate(ordered, start=2):
+            status = safe_str(g.get("import_status"))
+            for col, (_h, key, _w) in enumerate(acols, 1):
+                val = ("Yes" if g.get("inherited") else "No") if key == "inherited" else g.get(key)
+                cc = asheet.cell(row=i, column=col, value=safe_str(val))
+                cc.border = box
+                cc.font = font(size=9)
+                cc.alignment = left_wrap
+                if key == "import_status":
+                    cc.fill = fill(_grant_colour.get(status, "FFFFFF"))
+        asheet.freeze_panes = "A2"
+
     # ── ACL Parity sheet (PLAN 7 §B2 / D-1) ──────────────────────────────────
     # Folded in from the ACL phase's post-apply diff — this is INDEPENDENT proof (every touched
     # target object was re-read and diffed against source), not the same thing as import status.
@@ -407,7 +519,7 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         psheet = wb.create_sheet("ACL Parity")
         psheet.sheet_view.showGridLines = False
         counts = parity.get("counts", {})
-        psheet.merge_cells("A1:F1")
+        psheet.merge_cells("A1:G1")
         c = psheet["A1"]
         c.value = (f"ACL parity — {parity.get('objects_checked', 0)} objects re-read and diffed "
                    f"against source   |   " + "   ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -415,9 +527,12 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         c.fill = fill("1E3A5F")
         c.alignment = left_wrap
         psheet.row_dimensions[1].height = 26
-        pcols = [("Object Type", "perm_object_type", 22), ("Object", "object", 60),
-                 ("Verdict", "verdict", 20), ("Missing on target", "_missing", 44),
-                 ("Extra on target", "_extra", 44), ("Detail", "detail", 50)]
+        # Bug 15: a `match` row now NAMES the principals verified present, not just diffs — so an
+        # operator can confirm exactly which grants landed, on match rows too.
+        pcols = [("Object Type", "perm_object_type", 22), ("Object", "object", 52),
+                 ("Verdict", "verdict", 18), ("Verified present", "_present", 44),
+                 ("Missing on target", "_missing", 40), ("Extra on target", "_extra", 40),
+                 ("Detail", "detail", 46)]
         for col, (h, _k, w) in enumerate(pcols, 1):
             cc = psheet.cell(row=2, column=col, value=h)
             cc.font = font(bold=True, color="FFFFFF", size=10)
@@ -434,8 +549,9 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             verdict = safe_str(o.get("verdict"))
             missing = ", ".join(f"{m[0]}={m[1]}" for m in (o.get("missing_on_target") or []))
             extra = ", ".join(f"{e[0]}={e[1]}" for e in (o.get("extra_on_target") or []))
+            present = ", ".join(f"{p[0]}={p[1]}" for p in (o.get("present") or []))
             values = {"perm_object_type": o.get("perm_object_type"), "object": o.get("object"),
-                      "verdict": verdict, "_missing": missing, "_extra": extra,
+                      "verdict": verdict, "_present": present, "_missing": missing, "_extra": extra,
                       "detail": o.get("detail", "")}
             for col, (_h, key, _w) in enumerate(pcols, 1):
                 cc = psheet.cell(row=i, column=col, value=safe_str(values.get(key)))
@@ -446,7 +562,7 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
                     cc.fill = fill(_verdict_colour.get(verdict, "FFFFFF"))
         if parity.get("known_limitation"):
             note_row = len(objs) + 4
-            psheet.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=6)
+            psheet.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=7)
             nc = psheet.cell(row=note_row, column=1, value=safe_str(parity.get("known_limitation")))
             nc.font = font(italic=True, color="475569", size=9)
             nc.alignment = left_wrap
@@ -532,4 +648,9 @@ def _render_manual_actions(summary: dict, rows: list[dict]) -> str:
 
     if len(out) <= 7:
         out.append("Nothing outstanding — no manual actions were recorded for this run.")
+
+    # Bug 6: one-time static disclaimer so account-level access-control showing as `unchanged` is
+    # not mistaken for a defect (a per-row note is impossible — the tool can't see the change).
+    out += ["", "---", "## Note — account-level access-control (not tracked by this tool)", "",
+            _ACCOUNT_ACL_DISCLAIMER]
     return "\n".join(out) + "\n"

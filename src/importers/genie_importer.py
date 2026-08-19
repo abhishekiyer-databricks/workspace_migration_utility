@@ -36,7 +36,18 @@ class GenieImporter(BaseImporter):
 
     def create_one(self, unit: dict) -> dict:
         body, note = self._body(unit)
-        created = self.client.post("api/2.0/genie/spaces", body)
+        # PLAN 8 Bug 7 (Genie sibling): recreate the space in its SOURCE folder, not the caller's
+        # home. Verified live that Genie create HONORS parent_path. Only on CREATE — an update
+        # doesn't move an existing space.
+        parent = safe_str((unit.get("payload") or {}).get("parent_path"))
+        if parent:
+            body["parent_path"] = parent
+            self.remap_parent_path(body)
+        try:
+            created = self.client.post("api/2.0/genie/spaces", body)
+        except Exception as exc:  # noqa: BLE001
+            self.missing_parent_prerequisite(exc, body.get("parent_path"), self.natural_key(unit))
+            raise
         sid = safe_str(created.get("space_id"))
         self.context.setdefault("genie_space_target_ids", {})[self.natural_key(unit)] = sid
         return {"target_id": sid, "note": note}

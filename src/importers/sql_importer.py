@@ -133,16 +133,23 @@ class SqlImporter(BaseImporter):
 
     # ── legacy queries ────────────────────────────────────────────────────
     def _create_query(self, unit: dict) -> dict:
-        created = self.client.post("api/2.0/sql/queries",
-                                   {"query": self._query_body(unit.get("payload") or {})})
+        body = self._query_body(unit.get("payload") or {})
+        try:
+            created = self.client.post("api/2.0/sql/queries", {"query": body})
+        except Exception as exc:  # noqa: BLE001
+            self.missing_parent_prerequisite(exc, body.get("parent_path"), self.natural_key(unit))
+            raise
         qid = safe_str(created.get("id"))
         self.context.setdefault("legacy_query_target_ids", {})[self.natural_key(unit)] = qid
-        return {"target_id": qid}
+        parent = safe_str(body.get("parent_path"))
+        return {"target_id": qid, "note": f"created in {parent}" if parent else ""}
 
     def _query_body(self, payload: dict) -> dict:
         body = dict(payload)
-        # A source workspace path that need not exist on target, and is not required by create.
-        body.pop("parent_path", None)
+        # PLAN 8 Bug 7: PRESERVE + remap `parent_path` so the query lands in its SOURCE folder. It
+        # used to be popped, which dropped every query at the workspace root (the object was
+        # `Created` but never appeared in the user's/target directory tree).
+        self.remap_parent_path(body)
         self._remap_warehouse(body)
         return body
 
@@ -192,15 +199,22 @@ class SqlImporter(BaseImporter):
     def _create_alert_v2(self, unit: dict) -> dict:
         # Verified against the SDK's `create_alert`: /api/2.0/alerts takes the AlertV2 body FLAT,
         # NOT wrapped in {"alert": ...} the way legacy queries are.
-        created = self.client.post("api/2.0/alerts",
-                                   self._alert_v2_body(unit.get("payload") or {}))
+        body = self._alert_v2_body(unit.get("payload") or {})
+        try:
+            created = self.client.post("api/2.0/alerts", body)
+        except Exception as exc:  # noqa: BLE001
+            self.missing_parent_prerequisite(exc, body.get("parent_path"), self.natural_key(unit))
+            raise
         aid = safe_str(created.get("id"))
         self.context.setdefault("alert_v2_target_ids", {})[self.natural_key(unit)] = aid
         return {"target_id": aid}
 
     def _alert_v2_body(self, payload: dict) -> dict:
         body = dict(payload)
-        body.pop("parent_path", None)
+        # PLAN 8 Bug 7: keep + remap `parent_path` (was popped) so the alert lands in its folder.
+        # PLAN 8 Bug 10: `evaluation` + `schedule` (both REQUIRED by create) now travel because the
+        # collector enriches the shallow LIST via GET-by-id — nothing to add here beyond remaps.
+        self.remap_parent_path(body)
         self._remap_warehouse(body)
         return body
 

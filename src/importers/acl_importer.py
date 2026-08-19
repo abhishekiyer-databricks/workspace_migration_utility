@@ -38,9 +38,10 @@ from __future__ import annotations
 
 from src.exporters import bundle_paths as BP
 from src.importers.base_importer import BaseImporter, SkippedNoObject
-from src.state.state_store import (CAT_DAB_REDEPLOY, CAT_FAMILY_NOT_SELECTED,
-                                   CAT_LEGACY_DASHBOARD, CAT_NOT_SUPPORTED, CAT_OVERSIZE,
-                                   CAT_REPO_OUT_OF_SCOPE, CAT_UC_BACKED, CAT_UNIT_FAILED_EARLIER)
+from src.state.state_store import (ACTION_FAILED, ACTION_SKIPPED_NO_OBJECT, CAT_DAB_REDEPLOY,
+                                   CAT_FAMILY_NOT_SELECTED, CAT_LEGACY_DASHBOARD, CAT_NOT_SUPPORTED,
+                                   CAT_OVERSIZE, CAT_REPO_OUT_OF_SCOPE, CAT_UC_BACKED,
+                                   CAT_UNIT_FAILED_EARLIER)
 from src.transform.transforms import fingerprint
 from src.utils.helpers import safe_str
 
@@ -375,7 +376,80 @@ class AclImporter(BaseImporter):
         except Exception as exc:  # noqa: BLE001 — verification must not fail the run
             self.log.warning("acl parity report failed", error=str(exc)[:200])
             result.warnings.append(f"could not produce the ACL parity report: {exc}")
+        try:
+            self.context["acl_grants"] = self._build_grant_detail()
+        except Exception as exc:  # noqa: BLE001 — report enrichment must not fail the run
+            self.log.warning("acl grant detail failed", error=str(exc)[:200])
         return result
+
+    # ── per-grant report detail (Bug 15) ──────────────────────────────────
+    def _build_grant_detail(self) -> list[dict]:
+        """Expand `acls.json` back to ONE ROW PER object×principal×permission, each stamped with the
+        precise import outcome — so the import report can MIRROR the inventory "Object Permissions
+        (ACLs)" sheet (Object Type · Object · Principal · Permission · Inherited) plus a per-grant
+        Import Status, instead of collapsing each object to one `acl` row + a count (Bug 15).
+
+        The object-level outcome is read from the ACL UNIT rows (keyed `<perm_type>:<object_nk>`);
+        the per-grant applied/dropped/skipped decision reuses the SAME predicates the PUT body is
+        built from (`_acl_body`), so the report can never disagree with what was actually sent. The
+        base is `acls.json` (every grant, inherited ones included) so the sheet has the same row
+        fidelity as inventory.
+        """
+        unit_by_key = {safe_str(u.get("natural_key")): u for u in self.result.units}
+        rows: list[dict] = []
+        for entry in self._source_acls:
+            if not isinstance(entry, dict):
+                continue
+            perm_type = safe_str(entry.get("perm_object_type"))
+            object_nk = safe_str(entry.get("natural_key"))
+            source_id = safe_str(entry.get("source_id"))
+            unit = unit_by_key.get(f"{perm_type}:{object_nk}") or {}
+            unit_status = safe_str(unit.get("import_status"))
+            target_id = safe_str(unit.get("target_id"))
+            for grant in entry.get("grants") or []:
+                if not isinstance(grant, dict):
+                    continue
+                principal = safe_str(grant.get("principal"))
+                level = safe_str(grant.get("permission_level"))
+                if not principal or not level:
+                    continue
+                rows.append({
+                    "perm_object_type": perm_type, "object": object_nk,
+                    "source_id": source_id, "target_id": target_id,
+                    "principal": principal, "principal_type": safe_str(grant.get("principal_type")),
+                    "permission": level, "inherited": bool(grant.get("inherited")),
+                    "import_status": self._grant_status(perm_type, unit_status, grant),
+                })
+        return rows
+
+    def _grant_status(self, perm_type: str, unit_status: str, grant: dict) -> str:
+        """The per-grant Import Status shown in the report, derived from the object outcome + the
+        exact skip/drop rules `_acl_body` applies. See the module docstring for why each grant is or
+        isn't sent."""
+        if unit_status == ACTION_FAILED:
+            return "failed"
+        if unit_status == ACTION_SKIPPED_NO_OBJECT or not unit_status:
+            return "skipped — no target object"
+        principal = safe_str(grant.get("principal"))
+        ptype = safe_str(grant.get("principal_type"))
+        level = safe_str(grant.get("permission_level"))
+        if grant.get("inherited"):
+            return "skipped — inherited/built-in"
+        if ptype == "group" and principal == _BUILTIN_ADMINS:
+            return "skipped — inherited/built-in"
+        if perm_type == "secret-scope" and principal == "users" and level.upper() == "MANAGE":
+            return "skipped — inherited/built-in"    # set at scope-create; cannot be patched
+        if not self._principal_resolvable(principal, ptype):
+            return "dropped — principal not on target"
+        return "applied"
+
+    def _principal_resolvable(self, principal: str, ptype: str) -> bool:
+        """Whether `_remap_principal` would yield a target principal (a pure check — no warning side
+        effect, unlike `_remap_principal`)."""
+        sp_map = self.identity_map.get("sp_mapping") or {}
+        if ptype == "service_principal" or principal in sp_map:
+            return bool(sp_map.get(principal))
+        return True     # users map to themselves; groups keep their displayName / are built-in
 
     # ── the parity report (§6b) ───────────────────────────────────────────
     def _objects_to_verify(self) -> list[dict]:
@@ -441,6 +515,7 @@ class AclImporter(BaseImporter):
             expected_set, actual_set = set(expected), set(actual)
             missing = sorted(expected_set - actual_set)
             extra = sorted(actual_set - expected_set)
+            present = sorted(expected_set & actual_set)   # verified on target (Bug 15)
             if not missing and not extra:
                 verdict = "match"
             elif missing and extra:
@@ -455,6 +530,7 @@ class AclImporter(BaseImporter):
                 "object": applied["object_natural_key"], "verdict": verdict,
                 "missing_on_target": [list(m) for m in missing],
                 "extra_on_target": [list(e) for e in extra],
+                "present": [list(p) for p in present],
             })
 
         report = {

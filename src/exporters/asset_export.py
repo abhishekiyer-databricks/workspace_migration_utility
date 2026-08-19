@@ -726,8 +726,11 @@ def _lakeview_units(records: list[dict]) -> list[dict]:
             out.append(_make_unit("lakeview_dashboard", name, did, None, mode="dab",
                                   migratable=False, note="handled by DAB redeploy"))
         else:
+            # PLAN 8 Bug 7 (Lakeview sibling): carry `parent_path` so a user-created dashboard's
+            # `.lvdash.json` is recreated in the SAME user folder on target, not at the API default.
             payload = {"display_name": name, "warehouse_id": safe_str(r.get("warehouse_id")),
-                       "serialized_dashboard": r.get("serialized_dashboard")}
+                       "serialized_dashboard": r.get("serialized_dashboard"),
+                       "parent_path": safe_str(r.get("parent_path"))}
             out.append(_make_unit("lakeview_dashboard", name, did, payload, mode="auto"))
     return out
 
@@ -750,9 +753,12 @@ def _genie_units(records: list[dict]) -> list[dict]:
                     "genie_space", name, sid, None, mode="dab", migratable=False,
                     note="handled by DAB redeploy (bundle `genie_spaces` resource)"))
                 continue
+            # PLAN 8 Bug 7 (Genie sibling): carry `parent_path` so the space is recreated in its
+            # SOURCE folder (verified live: Genie create HONORS parent_path), not the default home.
             payload = {"title": name, "description": safe_str(r.get("description")),
                        "warehouse_id": safe_str(r.get("warehouse_id")),
-                       "serialized_space": serialized}
+                       "serialized_space": serialized,
+                       "parent_path": safe_str(r.get("parent_path"))}
             out.append(_make_unit(
                 "genie_space", name, sid, payload, mode="auto",
                 note="recreate via Genie create_space/update_space; remap warehouse_id; "

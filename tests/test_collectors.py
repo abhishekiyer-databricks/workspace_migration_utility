@@ -236,6 +236,34 @@ def test_sql_legacy_names():
     assert q["acl"] and q["acl"][0]["user_name"] == "a@x.com"
 
 
+def test_query_and_alert_v2_are_enriched_via_get_by_id():
+    """PLAN 8 Bug 7/10: the LIST is shallow — a query omits `parent_path`, an Alert V2 omits
+    `evaluation`/`schedule`. The collector must enrich each via GET-by-id so the exported payload is
+    create-ready (query lands in its source folder; the alert carries its required fields)."""
+    from src.collectors.sql_collector import SqlCollector
+    gt = {"api/2.0/sql/warehouses": {"warehouses": []},
+          "api/2.0/permissions/queries/q1": {"access_control_list": []},
+          "api/2.0/permissions/alertsv2/av1": {"access_control_list": []},
+          # GET-by-id detail — exactly what each LIST omits:
+          "api/2.0/sql/queries/q1": {"id": "q1", "display_name": "q",
+                                     "parent_path": "/Workspace/Users/alice@x.com"},
+          "api/2.0/alerts/av1": {"id": "av1", "display_name": "a2", "query_text": "select 1",
+                                 "warehouse_id": "w1",
+                                 "evaluation": {"source": {"name": "c"},
+                                                "comparison_operator": "GREATER_THAN"},
+                                 "schedule": {"quartz_cron_schedule": "0 0 9 * * ?"}}}
+    pag = {"api/2.0/sql/queries": [{"id": "q1", "display_name": "q"}],   # shallow: no parent_path
+           "api/2.0/sql/alerts": [], "api/2.0/sql/dashboards": [],
+           "api/2.0/alerts": [{"id": "av1", "display_name": "a2"}]}      # shallow: no evaluation
+    objs = _run_ok(SqlCollector(FakeClient(get_table=gt, paginated_table=pag), _cfg()))
+    q = next(o for o in objs if o["sql_type"] == "legacy_query")
+    assert q["_raw"].get("parent_path") == "/Workspace/Users/alice@x.com", "query parent_path enriched"
+    a = next(o for o in objs if o["sql_type"] == "alert")
+    assert a["_raw"].get("evaluation", {}).get("source", {}).get("name") == "c", \
+        "alert evaluation.source.name enriched (required by create)"
+    assert a["_raw"].get("schedule"), "alert schedule enriched (required by create)"
+
+
 def test_dlt_dashboards_genie_serving():
     from src.collectors.dlt_collector import DltCollector
     from src.collectors.dashboards_collector import DashboardsCollector

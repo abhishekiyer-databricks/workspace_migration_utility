@@ -69,6 +69,11 @@ class SqlCollector(BaseCollector):
             # natural_key and the ACL-tab Object column are never blank.
             name = safe_str(o.get("display_name") or o.get("name") or o.get("title"))
             oid = safe_str(o.get("id"))
+            if kind == "queries":
+                # PLAN 8 Bug 7: the LIST omits `parent_path` (verified live 2026-08-18) — enrich via
+                # GET-by-id so the query can be recreated in its SOURCE workspace folder rather than
+                # silently at the workspace root.
+                self._enrich_query_parent_path(o, oid)
             item = {
                 "sql_type": sql_type,   # legacy_query / legacy_alert / legacy_dashboard
                 "id": oid,
@@ -89,6 +94,19 @@ class SqlCollector(BaseCollector):
             items.append(item)
         return items
 
+    def _enrich_query_parent_path(self, raw: dict, oid: str) -> None:
+        """Best-effort: merge `parent_path` from GET-by-id into the (shallower) LIST object. The
+        query still exports if this fails — it just lands at the root on import (Bug 7)."""
+        if not oid:
+            return
+        try:
+            full = self.client.get(f"api/2.0/sql/queries/{oid}") or {}
+        except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
+            self.log.warning("query parent_path enrichment failed", id=oid, error=str(exc)[:160])
+            return
+        if full.get("parent_path") is not None:
+            raw["parent_path"] = full.get("parent_path")
+
     def _alerts_v2(self) -> list[dict]:
         """Alerts V2 (/api/2.0/alerts) — the current alert surface (legacy-alert creation
         is disabled). Distinct from legacy alerts; permissions object type is `alertsv2`."""
@@ -107,20 +125,36 @@ class SqlCollector(BaseCollector):
             return []
         items = []
         for o in raw:
-            name = safe_str(o.get("display_name") or o.get("name"))
             oid = safe_str(o.get("id"))
+            # PLAN 8 Bug 10: the LIST is SHALLOW — it omits `evaluation` (with `source.name`) and
+            # `schedule`, both REQUIRED by the create API (verified live 2026-08-18). Enrich via
+            # GET-by-id so the exported payload can actually be recreated. Fall back to the list
+            # object if the detail read fails.
+            full = self._alert_v2_full(oid) or o
+            name = safe_str(full.get("display_name") or o.get("display_name") or o.get("name"))
             # Alerts V2 IS a DAB resource type; a bundle-deployed one sits under `.bundle/`
             # (exposed via `parent_path`). Hand-made alerts return no parent_path → Manual.
-            dab = dab_path_info(o.get("parent_path"))
+            dab = dab_path_info(full.get("parent_path") or o.get("parent_path"))
             items.append({
                 "sql_type": "alert",   # Alerts V2 (vs legacy_alert)
                 "id": oid,
                 "name": name,
                 "_natural_key": name or oid,
-                "parent_path": safe_str(o.get("parent_path")),
+                "parent_path": safe_str(full.get("parent_path") or o.get("parent_path")),
                 "deployed_by_dab": dab["deployed_by_dab"],
                 "dab_scope": dab["dab_scope"],
                 "acl": self.fetch_acl("alertsv2", oid),
-                "_raw": o,
+                "_raw": full,
             })
         return items
+
+    def _alert_v2_full(self, oid: str) -> dict:
+        """The full Alert V2 (evaluation + schedule + query_text + warehouse_id) via GET-by-id —
+        the create-ready shape the LIST does not return (Bug 10). Best-effort."""
+        if not oid:
+            return {}
+        try:
+            return self.client.get(f"api/2.0/alerts/{oid}") or {}
+        except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
+            self.log.warning("alert_v2 enrichment failed", id=oid, error=str(exc)[:160])
+            return {}

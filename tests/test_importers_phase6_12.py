@@ -157,6 +157,101 @@ def test_alert_v2_is_posted_flat_not_wrapped():
     assert "alert" not in body and body["display_name"] == "a2"
 
 
+def test_query_is_created_in_its_source_folder_with_parent_path_normalised():
+    """PLAN 8 Bug 7: the query must keep its SOURCE folder (parent_path) — with the read API's
+    `/Workspace` prefix normalised — not be dropped at the workspace ROOT (which is what popping
+    parent_path did: the object was `Created` but never appeared in the user's directory tree)."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(SqlImporter, [
+        _unit("legacy_query", "q1", {"display_name": "q1", "query_text": "select 1",
+                                     "parent_path": "/Workspace/Users/alice@x.com"})], client)
+    imp.run()
+    body = client.bodies_to("sql/queries")[0]["query"]
+    assert body["parent_path"] == "/Users/alice@x.com", "the query must land in its source folder"
+
+
+def test_query_parent_path_remaps_a_recreated_sp_home():
+    """PLAN 8 Bug 7: a recreated SP's home segment is remapped the same way workspace content is."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(SqlImporter, [
+        _unit("legacy_query", "q1", {"display_name": "q1",
+                                     "parent_path": "/Users/old-app/reports"})], client)
+    imp.identity_map = {"sp_mapping": {"old-app": "new-app"}}
+    imp.run()
+    body = client.bodies_to("sql/queries")[0]["query"]
+    assert body["parent_path"] == "/Users/new-app/reports"
+
+
+def test_a_query_under_a_missing_folder_is_a_clean_prerequisite_not_a_raw_error():
+    """PLAN 8 Bug 7: a missing parent folder becomes a clean prerequisite (the path is NOT silently
+    dropped), not an opaque API error."""
+    class MissingParentClient(RecordingClient):
+        def post(self, path, body):
+            self.calls.append(("POST", path, body))
+            if "sql/queries" in path:
+                raise RuntimeError("Tree node with path /Users/ghost@x.com does not exist")
+            return {"id": "x"}
+    client = MissingParentClient()
+    imp, st, _aw = _make(SqlImporter, [
+        _unit("legacy_query", "q1", {"display_name": "q1",
+                                     "parent_path": "/Users/ghost@x.com"})], client)
+    res = imp.run()
+    assert res.failed == 1
+    row = st.row("legacy_query", "q1")
+    assert row["failure_category"] == "prerequisite_missing"
+    assert "does not exist on target" in row["last_error"] \
+        and "retry_mode=failed_only" in row["last_error"]
+
+
+def test_alert_v2_create_body_carries_evaluation_and_schedule():
+    """PLAN 8 Bug 10: the create body MUST include evaluation + schedule (both required by the API).
+    They flow from the collector's GET-by-id enrichment (the LIST omits them) through to the payload;
+    the importer must not drop them."""
+    client = RecordingClient()
+    evaluation = {"source": {"name": "c", "aggregation": "COUNT"},
+                  "comparison_operator": "GREATER_THAN", "threshold": {"value": {"double_value": 5}}}
+    schedule = {"quartz_cron_schedule": "0 0 9 * * ?", "timezone_id": "UTC"}
+    imp, _st, _aw = _make(SqlImporter, [
+        _unit("alert_v2", "a2", {"display_name": "a2", "query_text": "select count(*) c from t",
+                                 "warehouse_id": "SRC-WH", "evaluation": evaluation,
+                                 "schedule": schedule})], client)
+    imp.run()
+    body = client.bodies_to("alerts")[0]
+    assert body["evaluation"]["source"]["name"] == "c", "evaluation.source.name is REQUIRED by create"
+    assert body["schedule"]["quartz_cron_schedule"] == "0 0 9 * * ?", "schedule is REQUIRED by create"
+
+
+def test_serving_create_sends_only_served_entities_not_both():
+    """PLAN 8 Bug 11: the serving API rejects a config carrying BOTH served_models (deprecated) and
+    served_entities. The create must send ONLY served_entities."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(ServingImporter, [
+        _unit("serving_endpoint", "ext-ep", {
+            "served_entities": [{"name": "e", "external_model": {
+                "provider": "openai", "name": "gpt-4",
+                "openai_config": {"openai_api_key": "{{secrets/s/k}}"}}}],
+            "served_models": [{"name": "m", "model_name": "old"}]})], client)
+    imp.run()
+    body = client.bodies_to("serving-endpoints")[0]["config"]
+    assert "served_models" not in body, "both cannot be provided — served_models must be dropped"
+    assert body["served_entities"], "served_entities must survive"
+
+
+def test_serving_promotes_served_models_to_served_entities_when_only_models():
+    """When only the deprecated served_models exists, it is promoted (model_name → entity_name)."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(ServingImporter, [
+        _unit("serving_endpoint", "ep2", {
+            "served_models": [{"name": "m", "model_name": "old", "model_version": "3",
+                               "external_model": {"provider": "openai", "name": "gpt",
+                                                  "openai_config": {"openai_api_key": "x"}}}]})], client)
+    imp.run()
+    body = client.bodies_to("serving-endpoints")[0]["config"]
+    assert "served_models" not in body
+    entity = body["served_entities"][0]
+    assert entity["entity_name"] == "old" and entity["entity_version"] == "3"
+
+
 def test_legacy_dashboards_are_never_attempted():
     """The create endpoint is gone on modern workspaces; attempting it would be permanent red."""
     client = RecordingClient()
@@ -265,6 +360,48 @@ def test_genie_space_is_auto_migratable_with_serialized_space():
     assert body["warehouse_id"] == "TGT-WH"
     assert res.created == 1
     assert "Unity Catalog" in res.units[0]["note"]
+
+
+def test_lakeview_dashboard_is_created_in_its_source_folder():
+    """PLAN 8 Bug 7 (Lakeview sibling): a user-created dashboard's .lvdash.json must be recreated in
+    its SOURCE folder (parent_path, /Workspace prefix normalised), not at the API default."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(DashboardsImporter, [
+        _unit("lakeview_dashboard", "sales", {"display_name": "sales", "serialized_dashboard": "{}",
+                                              "parent_path": "/Workspace/Users/alice@x.com"})], client)
+    imp.run()
+    body = client.bodies_to("lakeview/dashboards")[0]
+    assert body["parent_path"] == "/Users/alice@x.com", "the dashboard must land in its source folder"
+
+
+def test_lakeview_dashboard_under_a_missing_folder_is_a_clean_prerequisite():
+    class MissingParent(RecordingClient):
+        def post(self, path, body):
+            self.calls.append(("POST", path, body))
+            if "lakeview/dashboards" in path:
+                raise RuntimeError("Tree node with path /Users/ghost@x.com does not exist")
+            return {"dashboard_id": "d"}
+    client = MissingParent()
+    imp, st, _aw = _make(DashboardsImporter, [
+        _unit("lakeview_dashboard", "sales", {"display_name": "sales", "serialized_dashboard": "{}",
+                                              "parent_path": "/Users/ghost@x.com"})], client)
+    res = imp.run()
+    assert res.failed == 1
+    row = st.row("lakeview_dashboard", "sales")
+    assert row["failure_category"] == "prerequisite_missing"
+    assert "does not exist on target" in row["last_error"]
+
+
+def test_genie_space_is_created_in_its_source_folder():
+    """PLAN 8 Bug 7 (Genie sibling): a Genie space is recreated in its SOURCE folder (Genie create
+    HONORS parent_path — verified live), not the caller's home."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(GenieImporter, [
+        _unit("genie_space", "analytics", {"title": "analytics", "serialized_space": "{}",
+                                           "parent_path": "/Workspace/Users/bob@x.com"})], client)
+    imp.run()
+    body = client.bodies_to("genie/spaces")[0]
+    assert body["parent_path"] == "/Users/bob@x.com", "the space must land in its source folder"
 
 
 # ═══════════════════════════════ SERVING ════════════════════════════════════
@@ -408,6 +545,84 @@ def test_force_start_does_not_stop_a_cluster_the_customer_already_had_running():
     assert client.posts_to("libraries/install"), "must install on the already-running cluster"
     assert client.posts_to("clusters/start") == [], "must not start an already-running cluster"
     assert client.posts_to("clusters/delete") == [], "must not stop a cluster it did not start"
+
+
+def test_multiple_libraries_on_one_cluster_start_it_once_and_stop_it_once():
+    """PLAN 8 Bug 1: two libraries on the SAME cluster must not race each other's start/stop. The
+    cluster is force-started ONCE, BOTH libraries install, and it is stopped ONCE at the END — not
+    start/install/stop per library (which put the cluster into Terminating while the next library's
+    start was still trying, so only the FIRST library on a shared cluster installed)."""
+    client = RecordingClient(get_table={"api/2.0/clusters/get": {"state": "TERMINATED"}})
+    imp, _st, _aw = _make(MiscImporter, [
+        _unit("cluster_library", "SRC-CLU:requests",
+              {"cluster_id": "SRC-CLU", "library": {"pypi": {"package": "requests"}}}),
+        _unit("cluster_library", "SRC-CLU:gson",
+              {"cluster_id": "SRC-CLU",
+               "library": {"maven": {"coordinates": "com.google.code.gson:gson:2.10.1"}}}),
+    ], client, context={"cluster_target_ids": {"etl": "TGT-CLU"}},
+        config_over={"imports": {"library_force_start_clusters": True}})
+    imp.units_by_type["cluster"] = [_unit("cluster", "etl", source_id="SRC-CLU")]
+    res = imp.run()
+    assert res.created == 2, "both libraries must install"
+    assert len(client.posts_to("clusters/start")) == 1, "the shared cluster is started exactly ONCE"
+    assert len(client.posts_to("libraries/install")) == 2, "BOTH libraries install"
+    assert len(client.posts_to("clusters/delete")) == 1, "the cluster is stopped exactly ONCE, at the end"
+
+
+def test_a_failed_install_still_stops_the_force_started_cluster():
+    """PLAN 8 Bug 1: install failures are per-unit and must NOT skip the final stop — no idle DBUs."""
+    client = RecordingClient(get_table={"api/2.0/clusters/get": {"state": "TERMINATED"}},
+                             fail_paths={"api/2.0/libraries/install"})
+    imp, _st, _aw = _make(MiscImporter, [
+        _unit("cluster_library", "SRC-CLU:requests",
+              {"cluster_id": "SRC-CLU", "library": {"pypi": {"package": "requests"}}})], client,
+        context={"cluster_target_ids": {"etl": "TGT-CLU"}},
+        config_over={"imports": {"library_force_start_clusters": True}})
+    imp.units_by_type["cluster"] = [_unit("cluster", "etl", source_id="SRC-CLU")]
+    res = imp.run()
+    assert res.failed == 1
+    assert len(client.posts_to("clusters/start")) == 1
+    assert len(client.posts_to("clusters/delete")) == 1, \
+        "the cluster we started must be stopped even after a failed install"
+
+
+def test_a_library_on_a_non_migrated_cluster_is_skipped_no_object_not_failed():
+    """PLAN 8 Bug 13 (LOCKED): a library whose source cluster is ephemeral/deleted (no target
+    equivalent) is DOWNGRADED from FAILED to skipped_no_object — still VISIBLE, but not a red
+    failure, since there is simply no target cluster to install onto."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(MiscImporter, [
+        _unit("cluster_library", "GHOST-CLU:requests",
+              {"cluster_id": "GHOST-CLU", "library": {"pypi": {"package": "requests"}}})], client,
+        context={"cluster_target_ids": {}})     # no target cluster for GHOST-CLU
+    res = imp.run()
+    assert res.failed == 0
+    assert client.posts_to("libraries/install") == []
+    row = next(r for r in res.units if r["asset_type"] == "cluster_library")
+    assert row["import_status"] == "skipped_no_object"
+    assert "not in the migrated cluster set" in row["note"]
+
+
+def test_an_already_installed_library_skips_without_starting_the_cluster():
+    """PLAN 8 Bug 16: a library already registered on the target cluster is SKIPPED/ADOPTED — not
+    re-attempted (which needs the cluster RUNNING) — so a normal run from a TERMINATED cluster does
+    not spuriously FAIL it and does not force-start the cluster."""
+    client = RecordingClient(get_table={
+        "api/2.0/clusters/get": {"state": "TERMINATED"},
+        "api/2.0/libraries/cluster-status": {"library_statuses": [
+            {"library": {"pypi": {"package": "requests"}}, "status": "INSTALLED"}]},
+    })
+    imp, _st, _aw = _make(MiscImporter, [
+        _unit("cluster_library", "SRC-CLU:requests",
+              {"cluster_id": "SRC-CLU", "library": {"pypi": {"package": "requests"}}})], client,
+        context={"cluster_target_ids": {"etl": "TGT-CLU"}})
+    imp.units_by_type["cluster"] = [_unit("cluster", "etl", source_id="SRC-CLU")]
+    res = imp.run()
+    assert res.failed == 0, "an already-installed library must not spuriously FAIL"
+    assert client.posts_to("libraries/install") == [], "already installed — must not re-install"
+    assert client.posts_to("clusters/start") == [], "must not force-start for an already-installed lib"
+    row = next(r for r in res.units if r["asset_type"] == "cluster_library")
+    assert row["import_status"] in ("skipped", "adopted")
 
 
 def test_an_unknown_workspace_conf_key_is_refused_not_blanket_written():
@@ -723,6 +938,66 @@ def test_an_object_with_only_inherited_grants_needs_no_put():
     assert [c for c in client.calls if c[0] == "PUT"] == []
     assert res.created == 1
     assert "already matches by construction" in res.units[0]["note"]
+
+
+def test_grant_detail_expands_to_one_row_per_principal_with_import_status():
+    """Bug 15: the ACL phase must expose per-grant detail (one row per object×principal×permission)
+    stamped with a precise Import Status, so the report can mirror the inventory ACL sheet instead
+    of a collapsed 'N grants applied' row."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(AclImporter, [], client,
+                          acls=[_acl("cluster", "etl", "clusters",
+                                     [_grant("data-eng", "CAN_MANAGE"),
+                                      _grant("a@b.com", "CAN_ATTACH_TO", "user"),
+                                      _grant("old-app", "CAN_RESTART", "service_principal"),
+                                      _grant("ghost-app", "CAN_MANAGE", "service_principal"),
+                                      _grant("admins", "CAN_MANAGE"),
+                                      _grant("anc", "CAN_VIEW", inherited=True)])],
+                          context={"cluster_target_ids": {"etl": "TGT-CLU"}})
+    imp.identity_map = {"sp_mapping": {"old-app": "new-app"}, "user_map": {}}
+    imp.run()
+    grants = imp.context.get("acl_grants") or []
+    by_principal = {g["principal"]: g for g in grants}
+    assert by_principal["data-eng"]["import_status"] == "applied"
+    assert by_principal["a@b.com"]["import_status"] == "applied"
+    assert by_principal["old-app"]["import_status"] == "applied"        # SP resolves via the map
+    assert by_principal["ghost-app"]["import_status"] == "dropped — principal not on target"
+    assert by_principal["admins"]["import_status"] == "skipped — inherited/built-in"
+    assert by_principal["anc"]["import_status"] == "skipped — inherited/built-in"
+    for g in grants:                    # every row carries the columns the report renders
+        for col in ("perm_object_type", "object", "principal", "permission", "inherited",
+                    "import_status", "source_id", "target_id"):
+            assert col in g, f"{col} missing from grant detail row"
+    assert by_principal["data-eng"]["target_id"] == "TGT-CLU"
+
+
+def test_grant_detail_marks_all_grants_no_object_when_the_object_is_absent():
+    """When the object never landed on target, every grant reads 'skipped — no target object' —
+    never a false 'applied'."""
+    client = RecordingClient()
+    imp, _st, _aw = _make(AclImporter, [], client,
+                          acls=[_acl("cluster", "etl", "clusters",
+                                     [_grant("data-eng", "CAN_MANAGE")])],
+                          context={})   # no cluster_target_ids → the object is absent on target
+    imp.run()
+    grants = imp.context.get("acl_grants") or []
+    assert grants and all(g["import_status"] == "skipped — no target object" for g in grants)
+
+
+def test_parity_match_rows_name_the_verified_present_principals():
+    """Bug 15: a `match` parity row must NAME the principals verified present, not just diffs."""
+    client = RecordingClient(get_table={
+        "api/2.0/permissions/clusters/TGT-CLU": {"access_control_list": [
+            {"group_name": "data-eng", "all_permissions": [
+                {"permission_level": "CAN_MANAGE", "inherited": False}]}]}})
+    imp, _st, _aw = _make(AclImporter, [], client,
+                          acls=[_acl("cluster", "etl", "clusters",
+                                     [_grant("data-eng", "CAN_MANAGE")])],
+                          context={"cluster_target_ids": {"etl": "TGT-CLU"}})
+    imp.run()
+    obj = (imp.context.get("acl_parity") or {})["objects"][0]
+    assert obj["verdict"] == "match"
+    assert obj["present"] == [["data-eng", "CAN_MANAGE"]], "match rows must name the principals"
 
 
 def test_workspace_content_acls_resolve_by_path_not_by_source_id():

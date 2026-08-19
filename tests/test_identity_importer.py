@@ -446,16 +446,89 @@ def test_a_failed_entitlement_patch_does_not_fail_the_identity():
 
 # ── an SP with OAuth secrets is created but flagged degraded ────────────────
 
-def test_an_sp_with_oauth_secrets_is_created_with_a_warning():
-    """The SP exists but cannot authenticate until a new secret is minted — degraded, not clean."""
+def test_an_sp_with_oauth_secrets_yields_a_created_sp_plus_a_manual_secret_task():
+    """PLAN 8 Bug 3: an OAuth-secret SP is CREATED cleanly (the object exists); the un-migratable
+    secret is its OWN standing `manual` unit — not a `created_with_warning` on the SP. That keeps it
+    out of failed_only (Bug 2) and re-emitted every run so the instruction never disappears (Bug 5)."""
     client = FakeScimClient()
     imp, _st = _importer(client, [
         _unit("service_principal", "app-1", {"displayName": "sp"},
               kind="account",
               note="OAuth client secret(s) present — NOT exportable; recreate on target manually.")])
     res = imp.run()
-    assert res.warned == 1, "an SP whose secrets can't migrate must not report as fully clean"
-    assert "CANNOT be migrated" in res.units[0]["note"]
+    sp = next(r for r in res.units if r["asset_type"] == "service_principal")
+    assert sp["import_status"] in ("created", "adopted"), \
+        "the SP object itself is created cleanly — the secret is tracked separately"
+    secret = next(r for r in res.units if r["asset_type"] == "service_principal_secret")
+    assert secret["import_status"] == "manual", "the secret is a manual task, not a warning"
+    assert "Create a new OAuth secret on target" in secret["note"]
+    assert res.manual >= 1
+
+
+def test_oauth_secret_manual_task_is_emitted_every_run_independent_of_the_sp_outcome():
+    """PLAN 8 Bug 3: the secret task is driven by the SOURCE note, not by the SP's create/skip
+    outcome, so it is re-emitted on EVERY run and never collapses to a generic 'unchanged' row."""
+    def build():
+        return _importer(FakeScimClient(), [
+            _unit("service_principal", "app-1", {"displayName": "sp"}, kind="account",
+                  note="OAuth client secret(s) present — NOT exportable; recreate on target manually.")])
+    imp, _ = build()
+    secret_units = [u for u in imp.load() if u["asset_type"] == "service_principal_secret"]
+    assert len(secret_units) == 1 and secret_units[0]["import_action"] == "manual"
+    # a second, independent run still emits it (note-driven, not state-driven)
+    imp2, _ = build()
+    assert any(u["asset_type"] == "service_principal_secret" for u in imp2.load())
+
+
+def test_identity_update_note_names_added_and_removed_entitlements():
+    """PLAN 8 Bug 5: update_one names the ACTUAL change — an entitlement added, and one removed IN
+    SOURCE that is NOT removed on target — instead of the old fixed 'entitlements/roles re-applied'."""
+    import json
+    client = FakeScimClient()
+    imp, st = _importer(client, [_unit("service_principal", "app-1", {"displayName": "sp"},
+                                       kind="account")])
+    st.record("service_principal", "app-1", action="created", fingerprint="old",
+              target_object_id="acct-app-1",
+              source_detail=json.dumps({"entitlements": ["allow-cluster-create", "workspace-access"],
+                                        "roles": []}, sort_keys=True))
+    st.flush()
+    unit = {"asset_type": "service_principal", "natural_key": "app-1",
+            "payload": {"entitlements": [{"value": "databricks-sql-access"},
+                                         {"value": "workspace-access"}]}}
+    out = imp.update_one(unit, "acct-app-1")
+    assert "entitlements added: ['databricks-sql-access']" in out["note"]
+    assert "removed in source" in out["note"] and "allow-cluster-create" in out["note"]
+    assert "databricks-sql-access" in out["source_detail"], "the new snapshot is returned for next run"
+
+
+def test_group_member_removed_in_source_is_reported_not_applied():
+    """PLAN 8 Bug 5: a ws-local group member removed on source is REPORTED (retained on target —
+    review), never silently omitted the way the old additive-only note did."""
+    import json
+    client = FakeScimClient(users=[{"userName": "keep@x", "id": "u-keep", "displayName": "Keep"},
+                                   {"userName": "drop@x", "id": "u-drop", "displayName": "Drop"}])
+    imp, st = _importer(client, [_unit("group", "g", {"displayName": "g"}, kind="workspace_local")])
+    imp.existing_keys()   # populate the display-name index so members resolve
+    st.record("group", "g", action="created", fingerprint="old", target_object_id="g-1",
+              source_detail=json.dumps({"entitlements": [], "roles": [],
+                                        "members": ["Keep", "Drop"]}, sort_keys=True))
+    st.flush()
+    unit = {"asset_type": "group", "natural_key": "g", "kind": "workspace_local",
+            "payload": {"displayName": "g", "members": [{"display": "Keep", "kind": "user"}]}}
+    out = imp.update_one(unit, "g-1")
+    assert "members removed in source (retained on target — review): ['Drop']" in out["note"]
+
+
+def test_identity_diff_degrades_gracefully_when_there_is_no_prior_snapshot():
+    """PLAN 8 Bug 5: the first run after the column was added has no prior snapshot — a neutral note,
+    never a crash on the null."""
+    client = FakeScimClient()
+    imp, st = _importer(client, [_unit("user", "u@x", {"userName": "u@x"})])
+    st.record("user", "u@x", action="created", fingerprint="old", target_object_id="u-1")  # no detail
+    st.flush()
+    unit = {"asset_type": "user", "natural_key": "u@x", "payload": {"entitlements": []}}
+    out = imp.update_one(unit, "u-1")
+    assert "prior source detail not recorded" in out["note"]
 
 
 # ── ordering + dry run ─────────────────────────────────────────────────────

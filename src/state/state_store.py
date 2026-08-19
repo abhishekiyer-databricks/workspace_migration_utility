@@ -76,15 +76,21 @@ LAST_ACTIONS = frozenset({
 })
 
 # Which `last_action` values each retry_mode picks up (D22).
-#   • `created_with_warning` sits in failed_only ON PURPOSE: those units EXIST on target but are
-#     known-degraded (e.g. a job whose notebook_path was unresolvable). After the prerequisite is
-#     fixed, re-attempting them is exactly what you want — and they'd otherwise fall through both
-#     buckets and be silently forgotten.
+#   • `failed_only` means LITERALLY failed — {ACTION_FAILED} and nothing else (PLAN 8 Bug 2). It used
+#     to also fold in `created_with_warning`, but that made the label lie: a warned-but-created unit
+#     re-selected under `failed_only` re-attempts, finds itself unchanged, and shows up as
+#     `Skipped (unchanged)` in a report the operator expected to hold ONLY outstanding failures.
+#   • `created_with_warning` (a genuinely degraded-but-created unit, e.g. a job whose notebook_path
+#     was unresolvable) rides `failed_and_skipped` — the "fix the prerequisite, then re-attempt"
+#     case — and stays visible in the report/summary, so it is never silently forgotten (PLAN 8
+#     Bug 2, leaning a+c). The permanent OAuth-secret SP is no longer modelled as a warning at all —
+#     it is `manual` (Bug 3), so it rides skipped_only/failed_and_skipped and never touches
+#     failed_only.
 #   • `manual` + `not_selected` sit in skipped_only, because a family deferred by `import_assets`
 #     or parked as `manual` IS the real "take it up later" case.
 RETRY_BUCKETS = {
     "off": frozenset(),
-    "failed_only": frozenset({ACTION_FAILED, ACTION_CREATED_WITH_WARNING}),
+    "failed_only": frozenset({ACTION_FAILED}),
     "skipped_only": frozenset({ACTION_SKIPPED, ACTION_MANUAL, ACTION_NOT_SELECTED,
                                ACTION_SKIPPED_NO_OBJECT}),
     "failed_and_skipped": frozenset({ACTION_FAILED, ACTION_CREATED_WITH_WARNING, ACTION_SKIPPED,
@@ -178,11 +184,25 @@ class StateStore:
                     last_run_id             STRING,
                     connectivity_mode       STRING,
                     tool_version            STRING,
+                    last_source_detail      STRING,
                     first_seen_utc          STRING,
                     last_seen_utc           STRING
                 ) USING DELTA
                 CLUSTER BY (asset_type)
             """)
+            # PLAN 8 Bug 5: `last_source_detail` (JSON snapshot of the last source members/
+            # entitlements/roles) is new, so a control table created by an earlier tool version
+            # lacks it — CREATE TABLE IF NOT EXISTS won't add it. Databricks SQL has NO
+            # `ADD COLUMNS IF NOT EXISTS` for columns (it is a PARSE_SYNTAX_ERROR — verified live on
+            # target_ws 2026-08-18), so idempotency is by swallowing the FIELD_ALREADY_EXISTS error
+            # on a re-run. ADD COLUMNS only appends metadata — it never drops or rewrites data — so
+            # it is safe on the live customer table.
+            try:
+                self.backend.sql(
+                    f"ALTER TABLE {self.table_fqn} ADD COLUMNS (last_source_detail STRING)")
+            except Exception as exc:  # noqa: BLE001
+                if "already exists" not in str(exc).lower():
+                    raise
             self.backend.sql(f"""
                 CREATE TABLE IF NOT EXISTS {self.identity_table_fqn} (
                     source_workspace_id STRING,
@@ -273,7 +293,7 @@ class StateStore:
     # ── recording (batched) ───────────────────────────────────────────────
     def record(self, asset_type: str, natural_key: str, *, action: str, fingerprint: str = "",
                source_object_id: str = "", target_object_id: str = "", error: str = "",
-               error_raw: str = "", failure_category: str = "") -> None:
+               error_raw: str = "", failure_category: str = "", source_detail: str = "") -> None:
         """Queue one outcome. Flushed per STATE_BATCH / phase boundary / finally (D2).
 
         A FAILURE forces a flush: the successes queued BEFORE a poison asset are exactly what must
@@ -307,6 +327,12 @@ class StateStore:
             "last_run_id": self.run_id,
             "connectivity_mode": safe_str(getattr(self.config, "connectivity_mode", "")),
             "tool_version": _tool_version(),
+            # PLAN 8 Bug 5: JSON snapshot of the last source members/entitlements/roles, so a later
+            # run can diff old-source vs new-source and NAME what changed. Carry the prior value
+            # forward when a caller omits it (like the ids above), so a non-identity record() for the
+            # same key never blanks a snapshot identity wrote.
+            "last_source_detail": safe_str(source_detail) or safe_str(
+                prior.get("last_source_detail")),
             "first_seen_utc": safe_str(prior.get("first_seen_utc")) or now,
             "last_seen_utc": now,
         }
@@ -379,7 +405,7 @@ class StateStore:
     _STATE_COLS = ("source_workspace_id", "asset_type", "natural_key", "source_object_id",
                    "target_object_id", "last_source_fingerprint", "last_action", "last_error",
                    "last_error_raw", "failure_category", "last_run_id", "connectivity_mode",
-                   "tool_version", "first_seen_utc", "last_seen_utc")
+                   "tool_version", "last_source_detail", "first_seen_utc", "last_seen_utc")
 
     _IDENTITY_COLS = ("source_workspace_id", "entity_type", "source_key", "source_id",
                       "target_key", "target_id", "classification", "action", "last_run_id",

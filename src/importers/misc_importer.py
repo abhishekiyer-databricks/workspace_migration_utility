@@ -22,8 +22,14 @@ from __future__ import annotations
 
 import json
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing
+from src.importers.base_importer import BaseImporter, PrerequisiteMissing, SkippedNoObject
+from src.state.state_store import CAT_DEPENDENCY_UNRESOLVED
 from src.utils.helpers import safe_str
+
+# Library statuses that mean "already registered on the cluster" — so an existing-check SKIP is
+# safe (Bug 16). A FAILED / UNINSTALL_ON_RESTART library is NOT present, so it still re-installs.
+_LIBRARY_PRESENT_STATES = frozenset({"INSTALLED", "PENDING", "RESOLVING", "INSTALLING",
+                                     "RESTORING"})
 
 # Workspace-conf keys this tool is willing to write. Anything else is reported rather than applied:
 # a conf key can change the workspace's SECURITY posture, and blanket-writing an unknown key from a
@@ -46,6 +52,17 @@ class MiscImporter(BaseImporter):
     # write the value — otherwise a conf key would never actually be applied.
     declarative_asset_types = ("workspace_conf",)
 
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        # Clusters WE force-started this run, to STOP ONCE at the end of the phase (Bug 1). Batching
+        # the stop to the end — rather than per library in a `finally` — is what fixes the
+        # start/stop RACE: the first library's stop used to put the cluster into Terminating while
+        # the second library's start was still trying, so only the first library on a shared cluster
+        # installed. Now the cluster is started once, ALL its libraries install, then it is stopped
+        # once. We only ever stop clusters in this set, so a cluster the customer already had running
+        # is never stopped out from under them.
+        self._force_started_clusters: set = set()
+
     def load(self) -> list[dict]:
         """Init scripts → libraries (need clusters) → conf."""
         return self.units_for("global_init_script", "cluster_library", "workspace_conf")
@@ -67,7 +84,46 @@ class MiscImporter(BaseImporter):
                 out[key] = safe_str(value)
         except Exception as exc:  # noqa: BLE001 — a conf read failure must not stop the phase
             self.log.warning("workspace-conf read failed", error=str(exc)[:200])
+
+        # Bug 16: cluster libraries had NO existence check, so `key in existing` was ALWAYS False,
+        # driving decide() to CREATE on every run — which re-attempts `libraries/install` (needs a
+        # RUNNING cluster) and spuriously FAILS on the normally-stopped cluster, even for a library
+        # that is already installed. Index the libraries ALREADY registered on their target cluster
+        # so decide() can SKIP/ADOPT them.
+        out.update(self._installed_cluster_library_keys())
         return out
+
+    def _installed_cluster_library_keys(self) -> dict:
+        """`{cluster_library natural_key: "<target_cluster>:<label>"}` for libraries already present
+        on their target cluster. Queries `libraries/cluster-status` ONCE per target cluster."""
+        out: dict = {}
+        units = self.units_by_type.get("cluster_library", []) or []
+        labels_by_cluster: dict = {}
+        for unit in units:
+            payload = unit.get("payload") or {}
+            target_cluster, _key = self.remap_id("cluster", safe_str(payload.get("cluster_id")))
+            if not target_cluster:
+                continue      # no target cluster → Bug 13 records it skipped_no_object at create
+            if target_cluster not in labels_by_cluster:
+                labels_by_cluster[target_cluster] = self._installed_library_labels(target_cluster)
+            if _library_label(payload.get("library")) in labels_by_cluster[target_cluster]:
+                out[self.natural_key(unit)] = f"{target_cluster}:{_library_label(payload.get('library'))}"
+        return out
+
+    def _installed_library_labels(self, cluster_id: str) -> set:
+        """The set of library labels registered on a target cluster (any non-failed state)."""
+        try:
+            doc = self.client.get("api/2.0/libraries/cluster-status",
+                                  params={"cluster_id": cluster_id}) or {}
+        except Exception as exc:  # noqa: BLE001 — treat "cannot read" as "none present" (safe: the
+            self.log.warning("cluster-status read failed", cluster_id=cluster_id,  # install adopts
+                             error=str(exc)[:200])                                 # on ALREADY_EXISTS
+            return set()
+        labels = set()
+        for st in doc.get("library_statuses") or []:
+            if safe_str(st.get("status")).upper() in _LIBRARY_PRESENT_STATES:
+                labels.add(_library_label(st.get("library")))
+        return labels
 
     def create_one(self, unit: dict) -> dict:
         asset_type = safe_str(unit.get("asset_type"))
@@ -117,6 +173,19 @@ class MiscImporter(BaseImporter):
             body["position"] = payload["position"]
         return body
 
+    def run(self):
+        """Run the phase, then STOP every cluster WE force-started — once each, after all its
+        libraries installed (Bug 1). Stopping here rather than per library is what removes the
+        start/stop race that let only the first library on a shared cluster install."""
+        result = super().run()
+        self._stop_force_started_clusters()
+        return result
+
+    def _stop_force_started_clusters(self) -> None:
+        for cluster_id in sorted(self._force_started_clusters):
+            self._stop_cluster(cluster_id)
+        self._force_started_clusters.clear()
+
     # ── cluster libraries (deferred by default — D6) ──────────────────────
     def _install_library(self, unit: dict) -> dict:
         payload = unit.get("payload") or {}
@@ -124,15 +193,21 @@ class MiscImporter(BaseImporter):
         src_cluster = safe_str(payload.get("cluster_id"))
         target_cluster, key = self.remap_id("cluster", src_cluster)
         if not target_cluster:
-            raise PrerequisiteMissing(
-                f"cannot install a library: source cluster {src_cluster!r}"
-                + (f" ({key!r})" if key else "")
-                + " has no target equivalent. Import the compute family first, then re-run with "
-                  "retry_mode=failed_only.")
+            # Bug 13 (LOCKED 2026-08-14): DOWNGRADE from FAILED to skipped_no_object. The library's
+            # source cluster is not in the migrated set — an ephemeral/job cluster
+            # (`compute_collector` deliberately skips those) or a cluster deleted on source. The unit
+            # stays VISIBLE (inventory is the base — don't silently drop it), but a red FAILED is
+            # wrong: there is simply no target cluster to install onto.
+            raise SkippedNoObject(
+                f"source cluster {src_cluster!r}" + (f" ({key!r})" if key else "")
+                + " is not in the migrated cluster set (ephemeral/deleted) — the library was not "
+                  "installed. It stays listed so the source library is not silently dropped.",
+                category=CAT_DEPENDENCY_UNRESOLVED)
 
-        started_by_us = False
+        # Bug 1: start the cluster AT MOST ONCE per run and DEFER the stop to the end of the phase
+        # (run()), so multiple libraries on the SAME cluster no longer race each other's start/stop.
         state = self._cluster_state(target_cluster)
-        if state != "RUNNING":
+        if state != "RUNNING" and target_cluster not in self._force_started_clusters:
             if not self.config.imports.library_force_start_clusters:
                 # Starting the cluster would spend the customer's money without being asked. So this
                 # is recorded as outstanding work with everything needed to finish it, not attempted.
@@ -143,23 +218,21 @@ class MiscImporter(BaseImporter):
                     f"stops clusters after creating them so it does not consume DBUs. Either start "
                     f"the cluster and re-run with retry_mode=failed_only, or set "
                     f"library_force_start_clusters=true to let the tool start it.")
-            # Flag is set: start the cluster, install, then stop it again so no DBUs are left
-            # burning. We remember WE started it, so a cluster the customer had already running is
-            # never stopped out from under them.
+            # Flag is set: start the cluster ONCE. It is stopped ONCE at the end of the phase
+            # (`_stop_force_started_clusters`), never per library — that is what fixes the race. We
+            # remember WE started it, so a cluster the customer already had running is never stopped.
             self._start_cluster_and_wait(target_cluster, key)
-            started_by_us = True
+            self._force_started_clusters.add(target_cluster)
 
-        try:
-            self.client.post("api/2.0/libraries/install",
-                             {"cluster_id": target_cluster, "libraries": [library]})
-        finally:
-            if started_by_us:
-                # Stop it back down even if the install raised — we only turned it on to install.
-                self._stop_cluster(target_cluster)
+        # No per-library stop: a single library's install failure is recorded per-unit by the base
+        # class and must not abort the others on this cluster, nor skip the final stop.
+        self.client.post("api/2.0/libraries/install",
+                         {"cluster_id": target_cluster, "libraries": [library]})
 
         note = f"installed on target cluster {key or target_cluster}"
-        if started_by_us:
-            note += " (cluster was force-started for the install, then stopped again — no idle DBUs)"
+        if target_cluster in self._force_started_clusters:
+            note += (" (cluster force-started for its whole library batch, then stopped once after "
+                     "all of them — no idle DBUs)")
         return {"target_id": f"{target_cluster}:{_library_label(library)}", "note": note}
 
     # How long to wait for a force-started cluster to reach RUNNING before giving up. A cold start

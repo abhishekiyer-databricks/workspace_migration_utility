@@ -299,11 +299,12 @@ def _sample_inventory():
         ],
         "lakeview_dashboard": [
             {"dashboard_id": "d1", "display_name": "KPIs", "deployed_by_dab": False,
-             "warehouse_id": "w1", "serialized_dashboard": "{}", "acl": []},
+             "warehouse_id": "w1", "serialized_dashboard": "{}", "acl": [],
+             "parent_path": "/Users/alice@corp.com"},
         ],
         "genie_space": [
             {"space_id": "gs1", "title": "Genie", "warehouse_id": "w1", "acl": [],
-             "serialized_space": '{"version":2}'},
+             "serialized_space": '{"version":2}', "parent_path": "/Users/alice@corp.com"},
             {"space_id": "gs2", "title": "NoSer", "warehouse_id": "w1", "acl": []},  # no payload
         ],
         "serving_endpoint": [
@@ -365,6 +366,10 @@ def test_build_all_asset_types_and_modes():
     genie = {g["natural_key"]: g for g in ubt["genie_space"]}
     assert genie["Genie"]["migration_mode"] == "auto"
     assert genie["Genie"]["payload"]["serialized_space"] == '{"version":2}'
+    # PLAN 8 Bug 7 (Lakeview/Genie siblings): the exported payload carries parent_path so the object
+    # is recreated in its SOURCE folder, not the API default.
+    assert ubt["lakeview_dashboard"][0]["payload"]["parent_path"] == "/Users/alice@corp.com"
+    assert genie["Genie"]["payload"]["parent_path"] == "/Users/alice@corp.com"
     assert genie["NoSer"]["migration_mode"] == "manual" and genie["NoSer"]["migratable"] is False
     # apps/lakebase manual.
     assert ubt["app"][0]["migration_mode"] == "manual"

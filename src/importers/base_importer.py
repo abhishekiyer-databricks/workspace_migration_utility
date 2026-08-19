@@ -60,6 +60,15 @@ _ERROR_MAP: tuple[tuple[str, str, str], ...] = (
      "hint: a referenced object does not exist on target — most often an unrecreated Git folder "
      "or a notebook path that was never imported. Recreate the dependency, then re-run with "
      "retry_mode=failed_only"),
+    # PLAN 8 Bug 12: a job whose run_as relies on a warehouse grant 403s at CREATE time because ACLs
+    # (the warehouse CAN_USE grant) are applied in the FINAL phase, AFTER jobs — an ORDERING artifact
+    # that self-heals on retry, NOT a missing-access defect. Matched before PERMISSION_DENIED so this
+    # precise hint wins. Filed prerequisite_missing so retry_mode=failed_only re-attempts it.
+    ("not authorized to use or monitor this sql", CAT_PREREQUISITE_MISSING,
+     "hint: EXPECTED on the first run — the run_as identity's warehouse grant (CAN_USE) is applied "
+     "in the FINAL ACL phase, AFTER jobs are created, so this 403s at create time. Re-run with "
+     "retry_mode=failed_only after the full run and it succeeds; this is NOT a missing-access defect "
+     "and the tool must not auto-grant warehouse access."),
     ("PERMISSION_DENIED", CAT_PERMISSION_DENIED,
      "hint: this is usually workspace-admin on the target, but can also be a referenced object "
      "(warehouse / UC table) the identity cannot see — read the server message above to tell "
@@ -371,6 +380,39 @@ class BaseImporter(ABC):
             return "", ""
         return safe_str(self.target_id_map(asset_type).get(key, "")), key
 
+    def remap_parent_path(self, body: dict) -> None:
+        """Preserve + remap an asset's workspace FOLDER (`parent_path`) in place (PLAN 8 Bug 7 and
+        its Lakeview/Genie siblings). Shared by SQL queries/alerts, Lakeview dashboards and Genie
+        spaces — each is otherwise created at the API DEFAULT location instead of its source folder
+        (a user-created dashboard's `.lvdash.json` must land back in the user's directory).
+
+        Normalises the read API's `/Workspace` prefix and remaps a recreated SP's home segment
+        (`/Users/<oldAppId>` → `/Users/<newAppId>`), matching the workspace-content path remap. An
+        empty/absent path is dropped so the body is clean."""
+        path = safe_str(body.get("parent_path"))
+        if not path:
+            body.pop("parent_path", None)
+            return
+        if path.startswith("/Workspace/"):
+            path = path[len("/Workspace"):]        # "/Workspace/Users/x" → "/Users/x"
+        parts = path.split("/")
+        if len(parts) >= 3 and parts[1] == "Users":
+            new_owner = (self.identity_map.get("sp_mapping") or {}).get(parts[2])
+            if new_owner and new_owner != parts[2]:
+                parts[2] = new_owner
+                path = "/".join(parts)
+        body["parent_path"] = path
+
+    def missing_parent_prerequisite(self, exc: Exception, parent_path, natural_key: str) -> None:
+        """Turn a create's "parent folder does not exist" into a clean prerequisite (the path is NOT
+        silently dropped) — shared by every folder-placed asset. Re-raise otherwise."""
+        msg = str(exc).lower()
+        if parent_path and ("does not exist" in msg or "tree node" in msg):
+            raise PrerequisiteMissing(
+                f"`{natural_key}` targets workspace folder `{parent_path}`, which does not exist on "
+                f"target yet — provision/assign its owner (a user home is created on first login) or "
+                f"import the folder's content family first, then re-run with retry_mode=failed_only.")
+
     def resolve_principal(self, principal: str, principal_type: str = "") -> str:
         """Map a SOURCE principal (email / appId / group name) to its TARGET equivalent.
 
@@ -576,7 +618,8 @@ class BaseImporter(ABC):
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
                      target_id=safe_str(out.get("target_id")),
-                     note=warning or safe_str(out.get("note")))
+                     note=warning or safe_str(out.get("note")),
+                     source_detail=safe_str(out.get("source_detail")))
 
     def _do_declarative(self, unit: dict, target_id: str) -> None:
         """Apply a declarative unit (members / grants) onto an object that already exists.
@@ -601,7 +644,8 @@ class BaseImporter(ABC):
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
                      target_id=safe_str(out.get("target_id")) or target_id,
-                     note=warning or safe_str(out.get("note")))
+                     note=warning or safe_str(out.get("note")),
+                     source_detail=safe_str(out.get("source_detail")))
 
     def _do_update(self, unit: dict, target_id: str) -> None:
         """The UPDATE path — always against the STORED target id, never a source id."""
@@ -625,7 +669,8 @@ class BaseImporter(ABC):
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_UPDATED,
                      target_id=safe_str(out.get("target_id")) or target_id,
                      note=warning or safe_str(out.get("note")) or
-                     "source changed since the last import — updated in place")
+                     "source changed since the last import — updated in place",
+                     source_detail=safe_str(out.get("source_detail")))
 
     @staticmethod
     def _dry_status(action: UpsertAction) -> str:
@@ -638,8 +683,13 @@ class BaseImporter(ABC):
 
     def _record(self, unit: dict, status: str, *, target_id: str = "", note: str = "",
                 error_raw: str = "", category: str = "", dry: bool = False,
-                checkpoint: bool = True) -> None:
-        """Record one outcome in all three places: state table, checkpoint, result rows."""
+                checkpoint: bool = True, source_detail: str = "") -> None:
+        """Record one outcome in all three places: state table, checkpoint, result rows.
+
+        `source_detail` (PLAN 8 Bug 5) is an optional JSON snapshot of the unit's source-side
+        members/entitlements/roles, carried into the state row so the NEXT run can diff and name
+        exactly what changed. Empty for asset types that don't produce one (state.record carries the
+        prior value forward, so a later record for the same key never blanks it)."""
         asset_type = safe_str(unit.get("asset_type"))
         key = self.natural_key(unit)
         row = {
@@ -666,7 +716,7 @@ class BaseImporter(ABC):
                 source_object_id=safe_str(unit.get("source_id")), target_object_id=safe_str(target_id),
                 error=note if status in (ACTION_FAILED, ACTION_CREATED_WITH_WARNING,
                                          ACTION_MANUAL, "skipped_no_object") else "",
-                error_raw=error_raw, failure_category=category)
+                error_raw=error_raw, failure_category=category, source_detail=source_detail)
 
         # The checkpoint stores the OUTCOME, not just a done-key: a resumed unit needs its
         # target_id/status back, and import_results.json (written only at the end) cannot supply

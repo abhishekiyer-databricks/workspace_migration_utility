@@ -381,6 +381,17 @@ def test_classify_error_always_surfaces_the_actual_server_message():
     cat, msg = classify_error(PrerequisiteMissing("assign user X to the workspace first"))
     assert msg == "assign user X to the workspace first"
 
+    # PLAN 8 Bug 12: a job whose run_as relies on a warehouse grant 403s at CREATE time (ACLs are
+    # applied in the FINAL phase) — an ORDERING artifact that self-heals on retry, not a defect. The
+    # message must keep the server text AND append the ordering hint, and be filed prerequisite (so
+    # retry_mode=failed_only re-attempts it), NOT permission_denied.
+    from src.importers.base_importer import CAT_PREREQUISITE_MISSING
+    wh = ("403: piyush.rohida is not authorized to use or monitor this SQL Endpoint")
+    cat, msg = classify_error(RuntimeError(wh))
+    assert cat == CAT_PREREQUISITE_MISSING, "warehouse-403 self-heals on retry — prerequisite, not perm"
+    assert "piyush.rohida" in msg, "the actual server error must survive"
+    assert "retry_mode=failed_only" in msg and "final acl phase" in msg.lower()
+
 
 def test_an_already_exists_error_is_recognised_from_the_body(monkeypatch):
     """The adopt-on-race path depends on MATCHING the body text, so it only works if the body is

@@ -43,6 +43,8 @@ by source id — source ids are meaningless on the target.
 """
 from __future__ import annotations
 
+import json
+
 from src.importers.base_importer import (BaseImporter, PrerequisiteMissing, SkippedNoObject,
                                          CAT_NOT_SUPPORTED)
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
@@ -133,7 +135,43 @@ class IdentityImporter(BaseImporter):
         `group_membership` units come last because they PATCH members onto groups that must already
         exist (the built-in `admins`/`users`, which are never created).
         """
-        return self.units_for("user", "service_principal", "group", "group_membership")
+        units = self.units_for("user", "service_principal", "group", "group_membership")
+        units += self._oauth_secret_manual_units(units)
+        return units
+
+    def _oauth_secret_manual_units(self, units: list) -> list:
+        """PLAN 8 Bug 3: an SP whose SOURCE had OAuth client secret(s) — or where the check could
+        not run — is a STANDING manual task: no API ever returns a secret value, so the tool can
+        NEVER migrate it. Model it as its OWN `manual` unit rather than a `created_with_warning` on
+        the SP:
+
+          • the SP itself still counts as created/adopted (the object IS created);
+          • the secret task is `manual`, so it rides skipped_only / failed_and_skipped and NEVER
+            failed_only (Bug 2), and is re-emitted every run (never collapses to a generic
+            'unchanged' row that loses the instruction — Bug 5);
+          • it is keyed by the source applicationId, separate asset_type, so it sits beside the SP
+            in the report without colliding with the SP's own state row.
+        """
+        out = []
+        for u in units:
+            if safe_str(u.get("asset_type")) != "service_principal":
+                continue
+            note = safe_str(u.get("note"))
+            if not note:      # export sets a note ONLY when has_secrets is True or unknown
+                continue
+            app_id = self.natural_key(u)
+            out.append({
+                "asset_type": "service_principal_secret",
+                "natural_key": app_id,
+                "source_id": safe_str(u.get("source_id")),
+                "import_action": "manual",
+                "export_status": "success",
+                "fingerprint": "",
+                "note": (f"service principal `{app_id}`: {note} Create a new OAuth secret on target "
+                         f"and update whatever authenticates with it — a secret VALUE is never "
+                         f"readable via any API, so the tool cannot migrate it."),
+            })
+        return out
 
     # ── existence checks (paginated — a truncated list would DUPLICATE) ───
     def existing_keys(self) -> dict:
@@ -244,19 +282,32 @@ class IdentityImporter(BaseImporter):
         if asset_type in ("user", "service_principal"):
             resource = "Users" if asset_type == "user" else "ServicePrincipals"
             self._apply_entitlements(resource, target_id, payload)
-            return {"target_id": target_id, "note": "entitlements/roles re-applied"}
+            # PLAN 8 Bug 5: name the ACTUAL change (entitlement/role added, or removed-in-source and
+            # NOT removed on target) instead of the old fixed "entitlements/roles re-applied" string,
+            # which hid both a secret change (now a manual unit, Bug 3) and an entitlement removal.
+            return {"target_id": target_id, "note": self._diff_note(asset_type, unit, payload),
+                    "source_detail": self._snapshot_json(asset_type, payload)}
         if asset_type == "group":
             self._apply_entitlements("Groups", target_id, payload)
             if _kind_of(unit) == KIND_ACCOUNT:
                 # Never re-sync an account group's members: account-global (§multi-workspace) and
                 # Entra would revert it. Permissions ARE re-checked, since ADMIN/USER can change.
                 self._ensure_assignment(target_id, unit, self.natural_key(unit))
+                note = self._diff_note("group", unit, payload, include_members=False)
                 return {"target_id": target_id,
-                        "note": "entitlements + workspace permissions re-applied; members are "
-                                "account-owned and were not modified"}
-            note = self._sync_members(target_id, payload.get("members") or [])
-            return {"target_id": target_id, "note": f"entitlements re-applied; {note}",
-                    "warning": note if "could not resolve" in note else ""}
+                        "note": f"{note}; workspace permissions re-applied; members are "
+                                f"account-owned and were not modified",
+                        "source_detail": self._snapshot_json("group", payload,
+                                                             include_members=False)}
+            member_note = self._sync_members(target_id, payload.get("members") or [])
+            # The additive PATCH (member_note) says what was ADDED/unresolved; the diff names what
+            # was removed IN SOURCE — which is REPORTED, not applied (the removed member stays on
+            # target for review), per the "report, don't act" stance for source-side removals.
+            diff = self._diff_note("group", unit, payload)
+            note = f"{diff}; {member_note}" if diff else member_note
+            return {"target_id": target_id, "note": note,
+                    "warning": member_note if "could not resolve" in member_note else "",
+                    "source_detail": self._snapshot_json("group", payload)}
         if asset_type == "group_membership":
             return self._add_builtin_members(unit)
         return {"target_id": target_id}
@@ -293,7 +344,8 @@ class IdentityImporter(BaseImporter):
         # admin would otherwise land on target as a plain USER.
         self._ensure_assignment(target_id, unit, key)
         return {"target_id": target_id,
-                "note": f"adopted/created the account user `{key}` (userName preserved)"}
+                "note": f"adopted/created the account user `{key}` (userName preserved)",
+                "source_detail": self._snapshot_json("user", payload)}
 
     # ── service principals ────────────────────────────────────────────────
     def _create_sp(self, unit: dict) -> dict:
@@ -335,7 +387,8 @@ class IdentityImporter(BaseImporter):
             self._apply_entitlements("ServicePrincipals", existing_id, payload)
             return {"target_id": existing_id,
                     "note": f"adopted the existing account service principal {source_app_id} "
-                            f"(applicationId preserved)"}
+                            f"(applicationId preserved)",
+                    "source_detail": self._snapshot_json("service_principal", payload)}
 
         target_id = safe_str(created.get("id"))
         new_app_id = safe_str(created.get("applicationId"))
@@ -364,12 +417,13 @@ class IdentityImporter(BaseImporter):
             note = f"applicationId {new_app_id or source_app_id} preserved from source"
 
         if safe_str(unit.get("note")):
-            # OAuth client secrets are never exportable: the SP exists but cannot authenticate until
-            # someone mints a new secret — degraded, not clean.
-            warning = (f"{note}. OAuth client secret(s) existed on the SOURCE SP and CANNOT be "
-                       f"migrated (no API returns a secret) — create a new secret on target and "
-                       f"update whatever authenticates with it")
-        return {"target_id": target_id, "note": note, "warning": warning}
+            # OAuth client secrets are never exportable. This is NOT a warning on the SP (the SP is
+            # created fine) — it is a standing MANUAL task tracked as its own `service_principal_secret`
+            # unit (Bug 3), emitted every run. Here we only cross-reference it in the SP's note.
+            note = (f"{note}. NOTE: this SP had OAuth client secret(s) on source — see the separate "
+                    f"manual action for `{source_app_id}` (a secret value can never be migrated).")
+        return {"target_id": target_id, "note": note, "warning": warning,
+                "source_detail": self._snapshot_json("service_principal", payload)}
 
     def _lookup_sp_id(self, app_id: str) -> str:
         """Target SCIM id for an applicationId, re-reading SCIM (the local map may predate it)."""
@@ -439,7 +493,8 @@ class IdentityImporter(BaseImporter):
         # against the groups created SO FAR, so a parent listed before its child would silently
         # lose the child — which is the exact failure two-pass exists to prevent.
         self._defer_members(name, target_id, payload.get("members") or [], unit)
-        return {"target_id": target_id, "note": "group created empty; members applied in pass 2"}
+        return {"target_id": target_id, "note": "group created empty; members applied in pass 2",
+                "source_detail": self._snapshot_json("group", payload)}
 
     def _defer_members(self, name: str, target_id: str, members: list, unit: dict) -> None:
         """Queue a group's membership for pass 2 (after EVERY group exists)."""
@@ -475,7 +530,8 @@ class IdentityImporter(BaseImporter):
             self._ensure_assignment(target_id, unit, name)
             return {"target_id": target_id,
                     "note": "account group already assigned; entitlements re-applied "
-                            "(members are account-owned and were not modified)"}
+                            "(members are account-owned and were not modified)",
+                    "source_detail": self._snapshot_json("group", payload, include_members=False)}
 
         account_id = self._resolve_account_group_id(unit, name)
         if not account_id:
@@ -508,7 +564,8 @@ class IdentityImporter(BaseImporter):
         self._apply_entitlements("Groups", account_id, payload)
         return {"target_id": account_id,
                 "note": f"assigned the existing account group (id {account_id} preserved); members "
-                        f"are account-owned and were not modified"}
+                        f"are account-owned and were not modified",
+                "source_detail": self._snapshot_json("group", payload, include_members=False)}
 
     def _resolve_account_group_id(self, unit: dict, name: str) -> str:
         """The TARGET ACCOUNT's id for this group — by displayName, else externalId.
@@ -730,7 +787,8 @@ class IdentityImporter(BaseImporter):
         self._record_identity_row("group", name, target_id, name, unit, ACTION_ADOPTED)
         note = self._sync_members(target_id, payload.get("members") or [])
         return {"target_id": target_id, "note": f"members added to the existing group: {note}",
-                "warning": note if "could not resolve" in note else ""}
+                "warning": note if "could not resolve" in note else "",
+                "source_detail": self._snapshot_json("group", payload)}
 
     # ── entitlements + roles (SEPARATE PATCH passes after create) ──────────
     def _apply_entitlements(self, resource: str, target_id: str, payload: dict) -> None:
@@ -773,6 +831,69 @@ class IdentityImporter(BaseImporter):
                 self.result.warnings.append(
                     f"{resource}/{target_id}: could not set {attribute} "
                     f"{[e.get('value') for e in entries]}: {str(exc)[:160]}")
+
+    # ── source snapshot + cross-run diff (PLAN 8 Bug 5) ───────────────────
+    @staticmethod
+    def _value_of(x) -> str:
+        return safe_str(x.get("value") if isinstance(x, dict) else x)
+
+    def _source_snapshot(self, asset_type: str, payload: dict,
+                         include_members: bool = True) -> dict:
+        """The migration-relevant SOURCE state we persist per run and diff on the next: entitlements
+        + roles (all identity types) and members (groups only). Each is a sorted list of stable
+        string keys, so the diff is deterministic."""
+        snap: dict = {
+            "entitlements": sorted({self._value_of(e) for e in (payload.get("entitlements") or [])
+                                    if self._value_of(e)}),
+            "roles": sorted({self._value_of(r) for r in (payload.get("roles") or [])
+                             if self._value_of(r)}),
+        }
+        if asset_type == "group" and include_members:
+            snap["members"] = sorted({safe_str(m.get("display"))
+                                      for m in (payload.get("members") or [])
+                                      if isinstance(m, dict) and safe_str(m.get("display"))})
+        return snap
+
+    def _snapshot_json(self, asset_type: str, payload: dict, include_members: bool = True) -> str:
+        return json.dumps(self._source_snapshot(asset_type, payload, include_members),
+                          sort_keys=True)
+
+    @staticmethod
+    def _parse_snapshot(raw) -> dict:
+        try:
+            return json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def _diff_note(self, asset_type: str, unit: dict, payload: dict,
+                   include_members: bool = True) -> str:
+        """Name exactly what changed since the last run: what was ADDED, and what was REMOVED IN
+        SOURCE (reported, not applied — the object on target keeps it, per the additive stance).
+
+        First run after this column was added has no prior snapshot — degrade to a neutral note
+        rather than crash on the null (the baseline is captured this run and diffs work thereafter).
+        """
+        prior = {}
+        if self.state is not None:
+            row = self.state.row(asset_type, self.natural_key(unit)) or {}
+            prior = self._parse_snapshot(row.get("last_source_detail"))
+        if not prior:
+            return "re-applied; prior source detail not recorded (baseline captured this run)"
+        cur = self._source_snapshot(asset_type, payload, include_members)
+        parts = []
+        for field, label, retained in (
+                ("entitlements", "entitlements", "not removed on target"),
+                ("roles", "roles", "not removed on target"),
+                ("members", "members", "retained on target")):
+            if field not in cur and field not in prior:
+                continue
+            p, c = set(prior.get(field) or []), set(cur.get(field) or [])
+            added, removed = sorted(c - p), sorted(p - c)
+            if added:
+                parts.append(f"{label} added: {added}")
+            if removed:
+                parts.append(f"{label} removed in source ({retained} — review): {removed}")
+        return "; ".join(parts) if parts else "re-applied; no source-side change detected"
 
     # ── the identity map row ──────────────────────────────────────────────
     def _record_identity_row(self, entity_type: str, source_key: str, target_id: str,

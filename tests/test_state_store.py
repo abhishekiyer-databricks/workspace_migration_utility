@@ -277,15 +277,68 @@ def test_retry_buckets_pick_up_exactly_the_documented_actions():
 
     assert st.retry_keys("off") is None, "off means 'everything', not 'nothing'"
     failed = st.retry_keys("failed_only")
-    # created_with_warning belongs in failed_only: those units exist but are known-degraded, and
-    # would otherwise fall through BOTH buckets.
-    assert failed == {("job", "failed-one"), ("job", "warned-one")}
+    # PLAN 8 Bug 2: failed_only means LITERALLY failed — created_with_warning is NOT in it (it used
+    # to be, which made the label lie: a warned-but-created unit re-selected under failed_only came
+    # back as `Skipped (unchanged)` in a report meant to hold only outstanding failures).
+    assert failed == {("job", "failed-one")}
+    assert ("job", "warned-one") not in failed
     skipped = st.retry_keys("skipped_only")
     assert skipped == {("job", "skipped-one"), ("repo", "manual-one"),
                        ("genie_space", "deferred-one")}
-    assert st.retry_keys("failed_and_skipped") == failed | skipped
+    # created_with_warning rides failed_and_skipped (the "fix the prerequisite, then re-attempt"
+    # case) and stays visible there, so it is never silently forgotten.
+    both = st.retry_keys("failed_and_skipped")
+    assert ("job", "warned-one") in both
+    assert both == failed | skipped | {("job", "warned-one")}
     for bucket in (failed, skipped):
         assert ("job", "happy-one") not in bucket, "a clean unit must never be retried"
+
+
+def test_source_detail_column_round_trips_and_is_carried_forward():
+    """PLAN 8 Bug 5: last_source_detail persists through the MERGE, and a later record that omits it
+    does NOT blank it (carry-forward, like the ids) — so a non-identity re-record can't lose the
+    snapshot identity wrote."""
+    st, _ = _store()
+    st.record("group", "g", action=ACTION_CREATED, fingerprint="f", target_object_id="g1",
+              source_detail='{"members": ["a", "b"]}')
+    st.flush()
+    st.load(force=True)
+    assert st.row("group", "g")["last_source_detail"] == '{"members": ["a", "b"]}'
+    # a later record for the same key that omits source_detail keeps the prior snapshot
+    st.record("group", "g", action=ACTION_SKIPPED, fingerprint="f", target_object_id="g1")
+    st.flush()
+    st.load(force=True)
+    assert st.row("group", "g")["last_source_detail"] == '{"members": ["a", "b"]}'
+
+
+def test_ensure_table_adds_the_source_detail_column_with_supported_syntax():
+    """PLAN 8 Bug 5: the live control table gains last_source_detail via `ADD COLUMNS (...)` —
+    NOT `ADD COLUMNS IF NOT EXISTS`, which is a PARSE_SYNTAX_ERROR on Databricks SQL (verified live
+    2026-08-18). Never a drop/recreate."""
+    st, backend = _store()
+    alters = [s for s in backend.statements if s.strip().startswith("ALTER")]
+    assert any("ADD COLUMNS (last_source_detail STRING)" in s for s in alters), \
+        "ensure_table must ALTER with the SUPPORTED ADD COLUMNS syntax"
+    assert not any("IF NOT EXISTS" in s for s in alters), \
+        "ADD COLUMNS IF NOT EXISTS is unsupported for columns and would PARSE_SYNTAX_ERROR live"
+
+
+def test_ensure_table_is_idempotent_when_the_column_already_exists():
+    """PLAN 8 Bug 5: a re-run's ALTER hits FIELD_ALREADY_EXISTS — that is swallowed (idempotent),
+    while any OTHER DDL failure still surfaces as the catalog/permissions guidance."""
+    cfg = Config.from_dict({"role": "target", "source_workspace_id": "111", "run_id": "r1",
+                            "target_staging_location": "/Volumes/a/b/c", "dry_run": False,
+                            "imports": {"state_catalog": "cat", "state_schema": "sch"}})
+
+    class AlterAlreadyExistsBackend(FakeBackend):
+        def sql(self, statement):
+            if statement.strip().startswith("ALTER"):
+                raise RuntimeError("[FIELD_ALREADY_EXISTS] Cannot add column, because "
+                                   "`last_source_detail` already exists. SQLSTATE: 42710")
+            return super().sql(statement)
+
+    st = StateStore(AlterAlreadyExistsBackend(), cfg)
+    st.ensure_table()   # must NOT raise — the duplicate-column error is benign on a re-run
 
 
 # ── prerequisite satisfaction (§5) — what makes phase-at-a-time work ───────

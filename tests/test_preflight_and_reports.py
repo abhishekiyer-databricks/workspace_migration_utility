@@ -552,3 +552,84 @@ def test_deleted_in_source_is_reported_as_review_not_deletion():
     md = open(os.path.join(aw.root, BP.MANUAL_ACTIONS_IMPORT_MD)).read()
     assert "Deleted in source" in md and "retired-job" in md
     assert "allow_deletes=true" in md, "the report must say deletion did NOT happen"
+
+
+def _summary_sheet_text(path):
+    """Every non-empty cell value of the Import Summary sheet, as one searchable blob."""
+    from openpyxl import load_workbook
+    ws = load_workbook(path)["Import Summary"]
+    return "\n".join(str(c.value) for row in ws.iter_rows() for c in row if c.value is not None)
+
+
+def test_deleted_in_source_appears_in_the_xlsx_summary():
+    """Bug 4: a deletion must be visible in the WORKBOOK — a roll-up count + its own section — not
+    only in the markdown runbook, and across every asset family (identity AND e.g. jobs)."""
+    cfg, aw = _bundle(dry_run=False)
+    results = [_result_with_rows([_row("cluster", "etl", "created")])]
+    deleted = {"service_principal": ["03a150c0"], "group": ["old-grp"], "job": ["new_wsmig_job"]}
+    write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                                   "run_status": "completed", "totals": {}, "per_phase": []},
+                         results, {"deleted_in_source": deleted})
+    blob = _summary_sheet_text(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+    assert "Deleted in source" in blob, "roll-up cell missing"
+    assert "Deleted in source — review (3)" in blob, "section header + count missing"
+    for key in ("03a150c0", "old-grp", "new_wsmig_job"):
+        assert key in blob, f"{key} (deleted) missing from the xlsx"
+    assert "allow_deletes=true" in blob, "the xlsx must say deletion did NOT happen"
+
+
+def test_no_deleted_section_when_nothing_was_deleted():
+    """The section is omitted when there are no deletions; the roll-up cell still shows a 0."""
+    cfg, aw = _bundle(dry_run=False)
+    write_import_reports(aw, cfg, {"run_id": "r1", "dry_run": False, "run_status": "completed",
+                                   "totals": {}, "per_phase": []},
+                         [_result_with_rows([_row("cluster", "etl", "created")])], {})
+    blob = _summary_sheet_text(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+    assert "Deleted in source — review" not in blob, "empty deleted section must be omitted"
+    assert "Deleted in source" in blob, "the roll-up cell should still be present (count 0)"
+
+
+def test_account_level_acl_disclaimer_appears_in_xlsx_and_runbook():
+    """Bug 6: a one-time static disclaimer so account-level manager/can-use/can-manage grants
+    showing as `unchanged` are not mistaken for a defect."""
+    cfg, aw = _bundle(dry_run=False)
+    write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                                   "run_status": "completed", "totals": {}, "per_phase": []},
+                         [_result_with_rows([_row("service_principal", "sp1", "skipped")])], {})
+    blob = _summary_sheet_text(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX)).lower()
+    assert "not tracked by this workspace-scoped tool" in blob
+    md = open(os.path.join(aw.root, BP.MANUAL_ACTIONS_IMPORT_MD)).read().lower()
+    assert "account-level access-control" in md and "rule-sets" in md
+
+
+def test_import_acl_sheet_mirrors_inventory_and_carries_per_grant_status():
+    """Bug 15: the import ACL sheet must be ONE ROW per object×principal×permission (like the
+    inventory ACL sheet) with a per-grant Import Status + source/target id — NOT a single collapsed
+    `acl` row + a count."""
+    from openpyxl import load_workbook
+    from src.reports.inventory_view import _LABELS
+    cfg, aw = _bundle(dry_run=False)
+    results = [_result_with_rows([_row("acl", "clusters:etl", "created")])]
+    acl_grants = [
+        {"perm_object_type": "clusters", "object": "etl", "source_id": "0227-x",
+         "target_id": "0817-y", "principal": "mintu@ril.com", "principal_type": "user",
+         "permission": "CAN_RESTART", "inherited": False, "import_status": "applied"},
+        {"perm_object_type": "clusters", "object": "etl", "source_id": "0227-x",
+         "target_id": "0817-y", "principal": "ghost-sp", "principal_type": "service_principal",
+         "permission": "CAN_MANAGE", "inherited": False,
+         "import_status": "dropped — principal not on target"},
+    ]
+    write_import_reports(aw, cfg, {"run_id": "r1", "source_workspace_id": "111", "dry_run": False,
+                                   "run_status": "completed", "totals": {}, "per_phase": []},
+                         results, {"acl_grants": acl_grants})
+    wb = load_workbook(os.path.join(aw.root, BP.IMPORT_STATUS_XLSX))
+    sheet_name = _LABELS["object_permissions"][:31]
+    assert sheet_name in wb.sheetnames, "the dedicated per-grant ACL sheet is missing"
+    ws = wb[sheet_name]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    assert {"Object Type", "Object", "Principal", "Permission", "Inherited",
+            "Import Status"} <= set(header), f"columns must mirror inventory: {header}"
+    body = "\n".join(str(c.value) for row in ws.iter_rows(min_row=2) for c in row if c.value)
+    assert "mintu@ril.com" in body and "CAN_RESTART" in body
+    assert "ghost-sp" in body and "dropped — principal not on target" in body
+    assert "0817-y" in body, "the target id must be on the row for an API cross-check"

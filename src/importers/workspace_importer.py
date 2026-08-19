@@ -201,6 +201,50 @@ class WorkspaceImporter(BaseImporter):
         return remapped, (f"service-principal home remapped {owner} → {new_app_id} "
                           f"(the SP was recreated with a new applicationId on target)")
 
+    # ── home-presence guard (PLAN 8 Bug 8/14) ────────────────────────────
+    def _home_present(self, home_root: str) -> bool:
+        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?
+
+        One `get-status` per DISTINCT home root, cached — far cheaper than letting every descendant
+        attempt an API call and 400 with DIRECTORY_PROTECTED / parent-missing."""
+        if not home_root:
+            return True
+        cache = getattr(self, "_home_present_cache", None)
+        if cache is None:
+            cache = self._home_present_cache = {}
+        if home_root not in cache:
+            owner = home_owner(home_root)
+            sp_map = self.identity_map.get("sp_mapping") or {}
+            if sp_map.get(owner):
+                # An SP in the identity map (created/adopted this run) has its home auto-provisioned
+                # at SP-create (verified live), so its content lands — don't gate it on a get-status
+                # that could race provisioning. Users are NOT here: a user home appears only on first
+                # login, so it must be probed.
+                cache[home_root] = True
+            else:
+                remapped, _ = self._remap_home_path(home_root)
+                cache[home_root] = bool(self._get_status(remapped))
+        return cache[home_root]
+
+    def _guard_home_present(self, path: str) -> None:
+        """Short-circuit a DESCENDANT of a user/SP home that is ABSENT on target with ONE clean
+        `prerequisite_missing` (Bug 8/14), instead of the raw DIRECTORY_PROTECTED / "parent folder
+        does not exist" errors that swamped the failure list. The home ROOT itself is handled in
+        `_create_directory`; this covers everything BENEATH it (subdirs, notebooks, files)."""
+        owner = home_owner(path)
+        if not owner:
+            return                                   # not under /Users — not a home descendant
+        home_root = f"/Users/{owner}"
+        if safe_str(path).rstrip("/") == home_root:  # the root itself, handled elsewhere
+            return
+        if self._home_present(home_root):
+            return
+        raise PrerequisiteMissing(
+            f"`{path}` lives under `{home_root}`, whose owner is not present on target yet — a home "
+            f"is provisioned only once its owner is assigned / logs in. Provision/assign `{owner}` "
+            f"(identity phase / Entra SCIM), then re-run with retry_mode=failed_only; ALL content "
+            f"under this home imports once it exists.")
+
     # ── directories ───────────────────────────────────────────────────────
     def _create_directory(self, unit: dict) -> dict:
         path = self.natural_key(unit)
@@ -246,6 +290,9 @@ class WorkspaceImporter(BaseImporter):
                 f"`{owner}` is provisioned on this workspace. Assign that user (identity phase / "
                 f"Entra SCIM), then re-run with retry_mode=failed_only; the notebooks beneath it "
                 f"import once it exists.")
+        # Content BELOW a home whose owner is absent on target → one clean prerequisite, not a raw
+        # DIRECTORY_PROTECTED / parent-missing error (Bug 8/14).
+        self._guard_home_present(path)
         # Content BELOW a home: remap the SP-home prefix so it lands in the SP's real target home.
         remapped, note = self._remap_home_path(path)
         self.client.post("api/2.0/workspace/mkdirs", {"path": remapped})
@@ -267,6 +314,9 @@ class WorkspaceImporter(BaseImporter):
             return {"target_id": path,
                     "note": "inside a platform-internal directory — owned by Databricks, not "
                             "recreated by this tool"}
+        # A descendant of a home whose owner is absent on target → one clean prerequisite (Bug 8/14),
+        # rather than the raw parent-missing / DIRECTORY_PROTECTED error per notebook/file.
+        self._guard_home_present(path)
         # A notebook/file under a recreated SP's home must follow the home to its NEW appId path
         # (IMP-6), or it would try to write into a `/Users/<oldAppId>` tree that cannot exist.
         path, home_note = self._remap_home_path(path)

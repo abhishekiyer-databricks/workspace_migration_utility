@@ -21,11 +21,16 @@ mapping applies. What DOES apply, and is easy to get wrong:
 """
 from __future__ import annotations
 
+import json
+
 from src.importers.base_importer import BaseImporter
 from src.utils.helpers import safe_str
 
 # Clusters the platform creates for a run and destroys with it — never migrated.
 _EPHEMERAL_PREFIXES = ("job-", "dlt-execution-", "mlflow-model-")
+
+# Cluster-policy definition keys that pin an instance-pool id (a SOURCE id must be remapped, Bug 9).
+_POLICY_POOL_KEYS = ("instance_pool_id", "driver_instance_pool_id")
 
 # Fields the pool dictates; sending them alongside instance_pool_id is rejected.
 _POOL_CONFLICTS = ("node_type_id", "driver_node_type_id", "enable_elastic_disk")
@@ -108,8 +113,9 @@ class ComputeImporter(BaseImporter):
             body = {"policy_id": target_id, "name": safe_str(payload.get("name"))}
             if payload.get("definition") is not None:
                 body["definition"] = payload["definition"]
+            warns = self._remap_policy_body_ids(body)   # Bug 9: remap pinned pool ids on update too
             self.client.post("api/2.0/policies/clusters/edit", body)
-            return {"target_id": target_id}
+            return {"target_id": target_id, "warning": "; ".join(warns) if warns else ""}
         if asset_type == "cluster":
             body = self._cluster_body(unit)
             body["cluster_id"] = target_id
@@ -136,10 +142,63 @@ class ComputeImporter(BaseImporter):
                       "policy_family_id", "policy_family_definition_overrides"):
             if payload.get(field) is not None:
                 body[field] = payload[field]
+        warns = self._remap_policy_body_ids(body)
         created = self.client.post("api/2.0/policies/clusters/create", body)
         policy_id = safe_str(created.get("policy_id"))
         self.context.setdefault("cluster_policy_target_ids", {})[self.natural_key(unit)] = policy_id
-        return {"target_id": policy_id}
+        return {"target_id": policy_id, "warning": "; ".join(warns) if warns else ""}
+
+    def _remap_policy_body_ids(self, body: dict) -> list[str]:
+        """Remap SOURCE object ids pinned inside the policy `definition`/overrides (Bug 9).
+
+        A policy that FIXES `instance_pool_id` to a SOURCE pool id rejects every (correctly remapped)
+        cluster or job under it — `INVALID_PARAMETER_VALUE: the value must be <target-pool> (is
+        "<source-pool>")`. So the ids INSIDE the definition must be remapped through the same pool map
+        the cluster/job importers use, not just the ids in the cluster spec."""
+        warns: list[str] = []
+        for field in ("definition", "policy_family_definition_overrides"):
+            if body.get(field) is not None:
+                body[field], w = self._remap_policy_definition(body[field])
+                warns.extend(w)
+        return warns
+
+    def _remap_policy_definition(self, definition):
+        """Remap pool ids inside a policy definition (a JSON string OR a dict). Returns
+        `(remapped_definition_same_type, warnings)`; leaves an unparseable definition verbatim."""
+        as_string = isinstance(definition, str)
+        try:
+            doc = json.loads(definition) if as_string else definition
+        except (TypeError, ValueError):
+            return definition, []
+        if not isinstance(doc, dict):
+            return definition, []
+        doc = dict(doc)
+        warns: list[str] = []
+        for key in _POLICY_POOL_KEYS:
+            constraint = doc.get(key)
+            if not isinstance(constraint, dict):
+                continue
+            constraint = dict(constraint)
+            for sub in ("value", "defaultValue"):
+                src = safe_str(constraint.get(sub))
+                if not src:
+                    continue
+                target_id, nk = self.remap_id("instance_pool", src)
+                if target_id:
+                    constraint[sub] = target_id
+                else:
+                    warns.append(
+                        f"cluster policy pins {key}.{sub}={src!r}"
+                        + (f" ({nk!r})" if nk else "")
+                        + " which has no target pool — clusters/jobs under this policy will fail "
+                          "validation until the pool is imported; re-run retry_mode=failed_only "
+                          "after the compute family lands.")
+            vals = constraint.get("values")
+            if isinstance(vals, list):
+                constraint["values"] = [self.remap_id("instance_pool", safe_str(v))[0] or v
+                                        for v in vals]
+            doc[key] = constraint
+        return (json.dumps(doc) if as_string else doc), warns
 
     # ── clusters ──────────────────────────────────────────────────────────
     def _create_cluster(self, unit: dict) -> dict:

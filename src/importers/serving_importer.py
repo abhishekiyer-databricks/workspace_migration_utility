@@ -119,4 +119,25 @@ class ServingImporter(BaseImporter):
         for field in ("config_version", "state", "creation_timestamp", "last_updated_timestamp",
                       "creator", "id", "endpoint_url"):
             body.pop(field, None)
+        # PLAN 8 Bug 11: the API rejects a config carrying BOTH `served_models` (deprecated) and
+        # `served_entities` ("Both served_models and served_entities cannot be provided"). Send ONLY
+        # served_entities: when both are present, drop the deprecated served_models; when only
+        # served_models exists, promote it (renaming model_name/model_version → entity_*).
+        if body.get("served_entities"):
+            body.pop("served_models", None)
+        elif body.get("served_models"):
+            body["served_entities"] = [ServingImporter._model_to_entity(m)
+                                       for m in body.pop("served_models")]
         return body
+
+    @staticmethod
+    def _model_to_entity(model) -> dict:
+        """Map a deprecated `served_models` entry to the current `served_entities` shape."""
+        if not isinstance(model, dict):
+            return model
+        entity = dict(model)
+        if "model_name" in entity:
+            entity["entity_name"] = entity.pop("model_name")
+        if "model_version" in entity:
+            entity["entity_version"] = entity.pop("model_version")
+        return entity
