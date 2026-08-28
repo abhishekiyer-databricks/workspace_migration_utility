@@ -64,6 +64,15 @@ dbutils.widgets.dropdown("library_force_start_clusters", "false", ["true", "fals
                          "Start stopped clusters to install libraries (consumes DBUs)")
 dbutils.widgets.text("account_id", "", "Account id (optional; enables account-level checks)")
 
+# PLAN 9: an orphaned home is content under `/Users/<owner>` whose owner was DELETED in source (so
+# it is absent from the roster and never created on target). Rather than failing it as a
+# prerequisite, divert it to a top-level backup folder, preserving the sub-tree, so no bytes are
+# lost and an operator can reassign them. Flip to false to restore the prerequisite behaviour.
+dbutils.widgets.dropdown("workspace_home_backup", "true", ["true", "false"],
+                         "Back up orphaned (deleted-in-source) home content instead of failing it")
+dbutils.widgets.text("workspace_home_backup_root", "/Users_Backup",
+                     "Top-level folder for orphaned home backups")
+
 # `direct`-mode only — how to reach the SOURCE. The secret is EITHER a scope pointer (preferred:
 # a widget value is visible on the run page and kept in run history) OR spn_secret_value.
 dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
@@ -167,6 +176,7 @@ print(f"Connectivity     : {cfg.connectivity_mode}")
 print(f"Mode             : {'DRY RUN — nothing will be written' if cfg.dry_run else 'LIVE'}")
 print(f"Families         : {', '.join(cfg.imports.selected_families)}")
 print(f"Retry mode       : {cfg.imports.retry_mode}")
+print(f"Home backup      : {'ON → ' + cfg.imports.workspace_home_backup_root if cfg.imports.workspace_home_backup else 'OFF (orphaned homes fail as prerequisite)'}")
 
 # COMMAND ----------
 
@@ -280,6 +290,14 @@ for _u in _failed[:40]:
 print(f"\n=== CREATED BUT DEGRADED ({len(_warned)}) — they exist, but verify before use ===")
 for _u in _warned[:25]:
     print(f"  {_u['asset_type']}/{_u['natural_key']}: {str(_u.get('note'))[:180]}")
+
+# PLAN 9: orphaned-home diversions are created_with_warning rows whose note names the backup path.
+_home_backups = [u for u in _warned if "deleted in source" in str(u.get("note", ""))]
+if _home_backups:
+    print(f"\n=== HOME BACKUPS ({len(_home_backups)}) — orphaned (deleted-in-source) content "
+          f"preserved under {cfg.imports.workspace_home_backup_root} ===")
+    for _u in _home_backups[:25]:
+        print(f"  {_u['natural_key']}  →  {_u.get('target_id')}")
 
 print(f"\n=== MANUAL STEPS ({len(_manual)}) ===")
 for _u in _manual[:25]:

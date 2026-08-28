@@ -94,6 +94,8 @@
           "force_full_import": "false",
           "allow_deletes": "false",
           "library_force_start_clusters": "false",
+          "workspace_home_backup": "true",
+          "workspace_home_backup_root": "/Users_Backup",
           "account_id": "",
           "user_domain_mapping": "",
           "user_id_mapping": "",

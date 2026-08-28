@@ -156,6 +156,12 @@ class ImportOptions:
     force_full_import: bool = False
     allow_deletes: bool = False              # D5 — deletes are never automatic
     library_force_start_clusters: bool = False   # D6 — never burn DBUs by default
+    # PLAN 9: divert orphaned (deleted-in-source) home content to a top-level backup root instead
+    # of failing it as prerequisite_missing. On by default; False restores the prerequisite
+    # behaviour. The root defaults to /Users_Backup (a top-level create is allowed; only /Users is
+    # protected) — normalised in validate() (leading /, no trailing /).
+    workspace_home_backup: bool = True
+    workspace_home_backup_root: str = "/Users_Backup"
     # Warehouse used by the state store when it runs OUTSIDE a notebook (no `spark`), e.g. the
     # live test harness driving the Statement Execution API. Blank in a notebook, where spark.sql
     # is used instead.
@@ -346,6 +352,9 @@ class Config:
             library_force_start_clusters=parse_bool(
                 w("library_force_start_clusters", "false"), False),
             state_warehouse_id=w("state_warehouse_id"),
+            workspace_home_backup=parse_bool(w("workspace_home_backup", "true"), True),
+            workspace_home_backup_root=w("workspace_home_backup_root", "/Users_Backup")
+            or "/Users_Backup",
         )
 
         source = SourceConnection(
@@ -415,6 +424,13 @@ class Config:
         if self.imports.retry_mode not in RETRY_MODES:
             raise ValueError(f"`retry_mode` must be one of {RETRY_MODES}, "
                              f"got {self.imports.retry_mode!r}")
+
+        # Normalise the home-backup root: a leading /, no trailing / (PLAN 9 §5). A blank value
+        # falls back to the default rather than becoming "" (which would build paths at the root).
+        root = (self.imports.workspace_home_backup_root or "/Users_Backup").strip().rstrip("/")
+        if not root.startswith("/"):
+            root = "/" + root
+        self.imports.workspace_home_backup_root = root or "/Users_Backup"
 
         unknown = [f for f in self.imports.import_assets
                    if f.strip().lower() not in IMPORT_FAMILIES + ("all",)]

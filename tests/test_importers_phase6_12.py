@@ -1018,3 +1018,32 @@ def test_workspace_content_acls_resolve_by_path_not_by_source_id():
     put = [c for c in client.calls if c[0] == "PUT"]
     assert put and "TARGET-12345" in put[0][1], \
         "the ACL must be applied to the TARGET object id resolved by path"
+
+
+def test_acl_for_diverted_content_resolves_via_path_remap_and_never_hard_fails():
+    """PLAN 9 §4.5: when workspace content was diverted (SP-home remap or an orphaned home backed
+    up to /Users_Backup), the workspace importer publishes `workspace_path_remap`. The ACL phase
+    must resolve the object at its ACTUAL target path — attaching the grant to the backup object —
+    rather than 404ing on the vanished source path, and must never hard-fail."""
+    src_path = "/Users/gone@x.com/nb"
+    backup_path = "/Users_Backup/gone@x.com/nb"
+    client = RecordingClient()
+    imp, st, _aw = _make(AclImporter, [], client,
+                         acls=[_acl("notebook", src_path, "notebooks",
+                                    [_grant("data-eng", "CAN_READ")])],
+                         context={"workspace_path_remap": {src_path: backup_path}})
+
+    def fake_get(path, params=None):
+        client.calls.append(("GET", path, params))
+        if path == "api/2.0/workspace/get-status":
+            # Only the RESOLVED (backup) path exists on target — the source path is gone.
+            if (params or {}).get("path") == backup_path:
+                return {"path": backup_path, "object_id": "TGT-BACKUP-77"}
+            return {}
+        return {}
+    imp.client.get = fake_get
+    res = imp.run()
+    assert res.failed == 0, "an ACL on diverted content must never hard-fail"
+    put = [c for c in client.calls if c[0] == "PUT"]
+    assert put and "TGT-BACKUP-77" in put[0][1], \
+        "the grant must attach to the backup object resolved via workspace_path_remap"

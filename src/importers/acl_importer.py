@@ -322,7 +322,13 @@ class AclImporter(BaseImporter):
         target id, which is what lets an object imported in an EARLIER session still get its ACL.
         """
         if perm_type in ("directories", "notebooks", "files"):
-            status = self._get_status(object_key)
+            # Workspace content may have been diverted from its source path — a recreated SP's home
+            # (IMP-6) or an orphaned owner's home backed up to /Users_Backup (PLAN 9 §4.5). The
+            # workspace importer published `workspace_path_remap` for exactly these, so the ACL
+            # attaches to the object's ACTUAL target path rather than 404ing on the source path.
+            remap = self.context.get("workspace_path_remap") or {}
+            resolved = remap.get(object_key, object_key)
+            status = self._get_status(resolved)
             return safe_str(status.get("object_id")) if status else ""
         if perm_type == "secret-scope":
             # A scope's NAME is its identifier, so "resolving" it means confirming the scope EXISTS

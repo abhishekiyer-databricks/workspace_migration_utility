@@ -112,11 +112,13 @@ class RecordingClient:
 
 
 def _make(importer_cls, units, client, dry_run=False, context=None, staging_files=None,
-          identity_map=None):
+          identity_map=None, imports_extra=None):
     d = tempfile.mkdtemp()
+    imports = {"state_catalog": "c", "state_schema": "s"}
+    imports.update(imports_extra or {})
     cfg = Config.from_dict({"role": "target", "source_workspace_id": "111", "run_id": "r1",
                             "target_staging_location": d, "dry_run": dry_run,
-                            "imports": {"state_catalog": "c", "state_schema": "s"}})
+                            "imports": imports})
     aw = ArtifactWriter(cfg)
     aw.ensure_output_path()
     for rel, data in (staging_files or {}).items():
@@ -385,15 +387,210 @@ def test_orphan_sp_home_message_distinguishes_not_migrated_from_deleted():
     assert "present in the source roster" in row["last_error"]
     assert "deleted in source" not in row["last_error"]
 
-    # (b) appId ABSENT from the roster → "deleted in source".
+    # (b) appId ABSENT from the roster, with backup DISABLED → "deleted in source" prerequisite.
+    #     (With backup enabled — the default — an absent owner is diverted to /Users_Backup instead;
+    #     that path is covered by test_orphaned_sp_home_content_diverted_to_backup below.)
     client2 = RecordingClient()
     imp2, st2 = _make(WorkspaceImporter, [
         _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client2,
-        identity_map={"sp_mapping": {}})
+        identity_map={"sp_mapping": {}}, imports_extra={"workspace_home_backup": False})
     _write_classification(imp2.staging, ["some-other-appid-1234-5678-9abc-def012345678"])
     imp2.run()
     row2 = st2.row("directory", f"/Users/{_OLD_APP}")
     assert "deleted in source" in row2["last_error"]
+
+
+# ═══════════════════ PLAN 9 — orphaned-home backup (/Users_Backup) ═══════════════════
+
+def _write_roster(aw, *, users=(), sps=()):
+    """Write identity_classification.json with the given user home-owners (userName/email) and SP
+    applicationIds — the SOURCE roster the divert decision reads."""
+    from src.exporters import bundle_paths as BP
+    idents = [{"identity_type": "user", "userName": u,
+               "email": (u if "@" in u else f"{u}@corp.com")} for u in users]
+    idents += [{"identity_type": "service_principal", "applicationId": a} for a in sps]
+    aw.write_json(BP.IDENTITY_CLASSIFICATION_JSON, {"identities": idents})
+
+
+def test_orphaned_user_home_content_diverted_to_backup():
+    """PLAN 9: a user DELETED in source (absent from the roster) leaves orphaned home content — it
+    cannot be recreated under /Users/, so it is diverted to /Users_Backup/<owner>/… and recorded
+    created_with_warning, so no bytes are dropped."""
+    client = RecordingClient()   # nothing exists on target; get-status raises
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", "/Users/gone@x.com", {"path": "/Users/gone@x.com"}),
+        _unit("directory", "/Users/gone@x.com/proj", {"path": "/Users/gone@x.com/proj"}),
+        _unit("notebook", "/Users/gone@x.com/proj/nb",
+              {"path": "/Users/gone@x.com/proj/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, users=["someone.else@x.com"])   # gone@x.com is NOT in the roster
+    res = imp.run()
+    assert res.failed == 0, "orphaned content must be diverted, never failed"
+    assert res.warned == 3, "root + subdir + notebook all diverted as created_with_warning"
+    mkdirs = [b["path"] for b in client.bodies_to("workspace/mkdirs")]
+    assert "/Users_Backup/gone@x.com" in mkdirs
+    assert "/Users_Backup/gone@x.com/proj" in mkdirs
+    assert imp.client.bodies_to("workspace/import")[0]["path"] == "/Users_Backup/gone@x.com/proj/nb"
+    row = st.row("notebook", "/Users/gone@x.com/proj/nb")   # keyed by SOURCE path (idempotency)
+    assert row["last_action"] == "created_with_warning"
+    assert row["target_object_id"] == "/Users_Backup/gone@x.com/proj/nb"
+    assert "deleted in source" in row["last_error"]
+
+
+def test_orphaned_sp_home_content_diverted_to_backup():
+    """An SP deleted in source (absent appId) has the SAME divert — /Users_Backup/<appId>/…."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("workspace_file", f"/Users/{_OLD_APP}/f",
+              {"path": f"/Users/{_OLD_APP}/f"}, content_ref="c/f.txt"),
+    ], client, staging_files={"c/f.txt": b"data"}, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, sps=["11110000-0000-0000-0000-000000000000"])   # not _OLD_APP
+    res = imp.run()
+    assert res.failed == 0 and res.warned == 1
+    assert client.bodies_to("workspace/import")[0]["path"] == f"/Users_Backup/{_OLD_APP}/f"
+
+
+def test_home_owner_in_roster_but_import_failed_stays_prerequisite():
+    """PLAN 9 §2: an owner PRESENT in the roster whose home is merely absent on target this run
+    (identity import failed/pending) must NOT be diverted — it recovers into the REAL home on
+    retry_mode=failed_only. Diverting it would scatter a live user's files."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/live@x.com/nb",
+              {"path": "/Users/live@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, users=["live@x.com"])   # owner IS in the roster
+    res = imp.run()
+    assert res.failed == 1 and res.warned == 0
+    assert client.posts_to("workspace/mkdirs") == [], "must not divert an in-roster owner"
+    row = st.row("notebook", "/Users/live@x.com/nb")
+    assert row["failure_category"] == "prerequisite_missing"
+    assert "owner is not present on target" in row["last_error"]
+
+
+def test_recreated_sp_home_still_remaps_to_new_appid_not_backup():
+    """sp_mapping wins over backup: a recreated SP's home follows its NEW appId (IMP-6), never the
+    backup root, even if the OLD appId is absent from the roster."""
+    client = RecordingClient()
+    imp, _st = _make(WorkspaceImporter, [
+        _unit("notebook", f"/Users/{_OLD_APP}/proj/nb",
+              {"path": f"/Users/{_OLD_APP}/proj/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"},
+        identity_map={"sp_mapping": {_OLD_APP: _NEW_APP}})
+    _write_roster(imp.staging, sps=[])   # OLD appId absent, but sp_mapping still wins
+    res = imp.run()
+    assert res.failed == 0 and res.warned == 0
+    path = client.bodies_to("workspace/import")[0]["path"]
+    assert path == f"/Users/{_NEW_APP}/proj/nb"
+    assert "Users_Backup" not in path
+
+
+def test_present_user_home_uses_real_home_not_backup():
+    """When the owner's home IS provisioned on target, content lands there — never diverted, even
+    if the owner is absent from the roster (present beats roster)."""
+    client = RecordingClient(status_paths={"/Users/real@x.com"})   # the real home exists
+    imp, _st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/real@x.com/nb",
+              {"path": "/Users/real@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, users=[])
+    res = imp.run()
+    assert res.failed == 0 and res.warned == 0
+    assert client.bodies_to("workspace/import")[0]["path"] == "/Users/real@x.com/nb"
+
+
+def test_workspace_home_backup_false_preserves_current_prerequisite_behaviour():
+    """With the flag OFF, an orphaned home reverts to today's prerequisite_missing (no divert)."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/gone@x.com/nb",
+              {"path": "/Users/gone@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}},
+        imports_extra={"workspace_home_backup": False})
+    _write_roster(imp.staging, users=[])   # gone@x.com absent → would divert if flag were on
+    res = imp.run()
+    assert res.failed == 1 and res.warned == 0
+    assert client.posts_to("workspace/mkdirs") == []
+    assert st.row("notebook", "/Users/gone@x.com/nb")["failure_category"] == "prerequisite_missing"
+
+
+def test_unknown_roster_does_not_silently_divert():
+    """No/garbled classification file → roster 'unknown' → prerequisite, NEVER a silent backup: we
+    must not scatter a possibly-live user's files on a missing roster."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/ghost@x.com/nb",
+              {"path": "/Users/ghost@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    # deliberately DO NOT write identity_classification.json
+    res = imp.run()
+    assert res.failed == 1 and res.warned == 0
+    assert client.posts_to("workspace/mkdirs") == []
+    assert st.row("notebook", "/Users/ghost@x.com/nb")["failure_category"] == "prerequisite_missing"
+
+
+def test_backup_root_is_configurable_and_normalised():
+    """A custom backup root is honoured, and validate() normalises a trailing/leading slash."""
+    client = RecordingClient()
+    imp, _st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/gone@x.com/nb",
+              {"path": "/Users/gone@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}},
+        imports_extra={"workspace_home_backup_root": "/Shared/HomeBackups"})
+    _write_roster(imp.staging, users=[])
+    imp.run()
+    assert client.bodies_to("workspace/import")[0]["path"] == "/Shared/HomeBackups/gone@x.com/nb"
+    # normalisation happens in validate(): leading / added, trailing / stripped.
+    cfg = Config.from_dict({"role": "target", "source_workspace_id": "1",
+                            "target_staging_location": "/Volumes/c/s/v", "dry_run": True,
+                            "imports": {"workspace_home_backup_root": "Users_Backup/"}})
+    cfg.validate()
+    assert cfg.imports.workspace_home_backup_root == "/Users_Backup"
+
+
+def test_backup_subtree_hierarchy_preserved():
+    """Nested orphaned dirs land parents-first under the backup root (depth-sorted load)."""
+    client = RecordingClient()
+    imp, _st = _make(WorkspaceImporter, [
+        _unit("directory", "/Users/gone@x.com/a/b", {"path": "/Users/gone@x.com/a/b"}),
+        _unit("directory", "/Users/gone@x.com", {"path": "/Users/gone@x.com"}),
+        _unit("directory", "/Users/gone@x.com/a", {"path": "/Users/gone@x.com/a"}),
+    ], client, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, users=[])
+    imp.run()
+    mkdirs = [b["path"] for b in client.bodies_to("workspace/mkdirs")]
+    assert mkdirs.index("/Users_Backup/gone@x.com") < mkdirs.index("/Users_Backup/gone@x.com/a")
+    assert mkdirs.index("/Users_Backup/gone@x.com/a") < mkdirs.index("/Users_Backup/gone@x.com/a/b")
+
+
+def test_rerun_adopts_backup_copy_not_duplicated():
+    """existing_keys probes the RESOLVED (backup) path, so a re-run ADOPTS the backup copy rather
+    than re-uploading it — idempotency with natural_key=source path, target_id=backup path."""
+    client = RecordingClient(status_paths={"/Users_Backup/gone@x.com/nb"})
+    imp, st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Users/gone@x.com/nb",
+              {"path": "/Users/gone@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
+    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+    _write_roster(imp.staging, users=[])
+    res = imp.run()
+    assert client.bodies_to("workspace/import") == [], "an existing backup copy must be adopted, not re-uploaded"
+    assert res.adopted == 1
+    assert st.row("notebook", "/Users/gone@x.com/nb")["target_object_id"] == "/Users_Backup/gone@x.com/nb"
+
+
+def test_roster_status_indexes_users_by_username_and_email_and_sps_by_appid():
+    """_roster_status resolves a home owner by SP applicationId AND by user userName/email."""
+    client = RecordingClient()
+    imp, _st = _make(WorkspaceImporter, [], client, identity_map={"sp_mapping": {}})
+    from src.exporters import bundle_paths as BP
+    imp.staging.write_json(BP.IDENTITY_CLASSIFICATION_JSON, {"identities": [
+        {"identity_type": "user", "userName": "alice", "email": "alice@corp.com"},
+        {"identity_type": "service_principal", "applicationId": _OLD_APP},
+    ]})
+    assert imp._roster_status("alice") == "in_roster"
+    assert imp._roster_status("alice@corp.com") == "in_roster"
+    assert imp._roster_status(_OLD_APP) == "in_roster"
+    assert imp._roster_status("nobody@corp.com") == "absent"
 
 
 def test_workspace_roots_are_skipped_not_created():
