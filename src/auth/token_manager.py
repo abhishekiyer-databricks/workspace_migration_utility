@@ -370,8 +370,10 @@ class ApiClient:
     def put(self, path: str, body: dict) -> Any:
         return self._request("PUT", path, json_body=body)
 
-    def patch(self, path: str, body: dict) -> Any:
-        return self._request("PATCH", path, json_body=body)
+    def patch(self, path: str, body: dict, params: Optional[dict] = None) -> Any:
+        # `params` carries query args some PATCH endpoints REQUIRE — notably Alerts V2
+        # (`/api/2.0/alerts/{id}`) rejects a body-only PATCH with "update_mask is required".
+        return self._request("PATCH", path, params=params, json_body=body)
 
     def delete(self, path: str, params: Optional[dict] = None) -> Any:
         return self._request("DELETE", path, params=params)

@@ -123,7 +123,12 @@ class SqlImporter(BaseImporter):
             return {"target_id": target_id}
         if asset_type == "alert_v2":
             body, _res = self._alert_v2_body(payload)
-            self.client.patch(f"api/2.0/alerts/{target_id}", body)
+            # Alerts V2 PATCH REQUIRES `update_mask` (a query arg) naming the fields to write —
+            # a body-only PATCH 400s "update_mask is required" (caught live, PLAN 11 Run 2). Without
+            # this the BUG-1 fix routed a changed alert to UPDATE correctly but the call itself
+            # failed, so the alert stayed stale — the very failure mode BUG-1 set out to kill.
+            self.client.patch(f"api/2.0/alerts/{target_id}", body,
+                              params={"update_mask": self._alert_v2_update_mask(body)})
             return {"target_id": target_id}
         return {"target_id": target_id}
 
@@ -233,6 +238,20 @@ class SqlImporter(BaseImporter):
         res = self.remap_parent_path(body)
         self._remap_warehouse(body, referenced_by=f"alert `{safe_str(body.get('display_name'))}`")
         return body, res
+
+    # Fields Alerts V2 lets you PATCH. The mask must name only settable fields present in the body:
+    # server-owned ones (id/create_time/lifecycle_state/owner/effective_run_as/state) are read-only
+    # and `parent_path` doesn't move an existing alert — including any of them makes the PATCH 400.
+    _ALERT_V2_UPDATABLE = (
+        "display_name", "query_text", "warehouse_id", "evaluation", "schedule",
+        "custom_summary", "custom_description", "seconds_to_retrigger", "run_as_user_name")
+
+    def _alert_v2_update_mask(self, body: dict) -> str:
+        """Comma-joined `update_mask` of the settable top-level fields actually present in `body`.
+        Falls back to `evaluation` (the field a threshold change always touches) so a sparse body
+        still produces a non-empty mask rather than the "must contain a subfield" rejection."""
+        fields = [f for f in self._ALERT_V2_UPDATABLE if f in body]
+        return ",".join(fields) if fields else "evaluation"
 
     # ── shared ────────────────────────────────────────────────────────────
     def _remap_warehouse(self, body: dict, referenced_by: str = "") -> None:

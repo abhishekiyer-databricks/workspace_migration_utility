@@ -362,14 +362,16 @@ def test_build_all_asset_types_and_modes():
     serv = {s["natural_key"]: s for s in ubt["serving_endpoint"]}
     assert serv["ext-ep"]["migration_mode"] == "auto" and serv["ext-ep"]["migratable"] is True
     assert serv["uc-ep"]["migration_mode"] == "manual" and serv["uc-ep"]["migratable"] is False
-    # genie: auto when serialized_space present, manual when absent.
+    # genie: auto when serialized_space present, manual when absent. PLAN 11 Finding-9: the natural
+    # key is the FULL PATH (`<parent_path>/<title>`), so the space with a folder keys on it; a space
+    # with NO parent_path falls back to the bare title.
     genie = {g["natural_key"]: g for g in ubt["genie_space"]}
-    assert genie["Genie"]["migration_mode"] == "auto"
-    assert genie["Genie"]["payload"]["serialized_space"] == '{"version":2}'
+    assert genie["/Users/alice@corp.com/Genie"]["migration_mode"] == "auto"
+    assert genie["/Users/alice@corp.com/Genie"]["payload"]["serialized_space"] == '{"version":2}'
     # PLAN 8 Bug 7 (Lakeview/Genie siblings): the exported payload carries parent_path so the object
     # is recreated in its SOURCE folder, not the API default.
     assert ubt["lakeview_dashboard"][0]["payload"]["parent_path"] == "/Users/alice@corp.com"
-    assert genie["Genie"]["payload"]["parent_path"] == "/Users/alice@corp.com"
+    assert genie["/Users/alice@corp.com/Genie"]["payload"]["parent_path"] == "/Users/alice@corp.com"
     assert genie["NoSer"]["migration_mode"] == "manual" and genie["NoSer"]["migratable"] is False
     # apps/lakebase manual.
     assert ubt["app"][0]["migration_mode"] == "manual"

@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from src.transform.transforms import fingerprint, strip_runtime
-from src.utils.helpers import safe_str
+from src.utils.helpers import folder_natural_key, safe_str
 
 # migration_mode → default export_status (the fetcher/runner may override for content/skip).
 # `covered` = the object is the on-disk twin of an asset already exported via its NATIVE API
@@ -753,8 +753,15 @@ def _lakeview_units(records: list[dict]) -> list[dict]:
     for r in records:
         name = safe_str(r.get("display_name"))
         did = safe_str(r.get("dashboard_id"))
+        # PLAN 11 Finding-9: the natural key is the FULL PATH (`<parent_path>/<display_name>`), never
+        # the bare display_name — two same-named dashboards in different folders must not collapse
+        # onto one target (the 2nd would silently overwrite the 1st = data loss). The collector's
+        # `natural_key()` already computes this for the report; the export UNIT (which is what flows
+        # into the state table + import) MUST match, or the importer's full-path `existing_keys`
+        # never lines up. Falls back to the bare name when parent_path is genuinely absent.
+        nk = folder_natural_key(r.get("parent_path"), name)
         if r.get("deployed_by_dab"):
-            out.append(_make_unit("lakeview_dashboard", name, did, None, mode="dab",
+            out.append(_make_unit("lakeview_dashboard", nk, did, None, mode="dab",
                                   migratable=False, note="handled by DAB redeploy"))
         else:
             # PLAN 8 Bug 7 (Lakeview sibling): carry `parent_path` so a user-created dashboard's
@@ -762,7 +769,7 @@ def _lakeview_units(records: list[dict]) -> list[dict]:
             payload = {"display_name": name, "warehouse_id": safe_str(r.get("warehouse_id")),
                        "serialized_dashboard": r.get("serialized_dashboard"),
                        "parent_path": safe_str(r.get("parent_path"))}
-            out.append(_make_unit("lakeview_dashboard", name, did, payload, mode="auto"))
+            out.append(_make_unit("lakeview_dashboard", nk, did, payload, mode="auto"))
     return out
 
 
@@ -772,6 +779,10 @@ def _genie_units(records: list[dict]) -> list[dict]:
         name = safe_str(r.get("title"))
         sid = safe_str(r.get("space_id"))
         serialized = r.get("serialized_space")
+        # PLAN 11 Finding-9: full-path natural key (`<parent_path>/<title>`), never the bare title,
+        # so two same-named Genie spaces in different folders don't collapse onto one target. Matches
+        # the collector's `natural_key()` and the importer's full-path `existing_keys`.
+        nk = folder_natural_key(r.get("parent_path"), name)
         if serialized:
             # AUTO-migratable (verified): create-ready body = serialized_space + title +
             # description + warehouse_id. Target calls create_space/update_space, remapping the
@@ -781,7 +792,7 @@ def _genie_units(records: list[dict]) -> list[dict]:
             # bundle owns. The collector already flags it from parent_path (`.bundle/`); honour it.
             if r.get("deployed_by_dab"):
                 out.append(_make_unit(
-                    "genie_space", name, sid, None, mode="dab", migratable=False,
+                    "genie_space", nk, sid, None, mode="dab", migratable=False,
                     note="handled by DAB redeploy (bundle `genie_spaces` resource)"))
                 continue
             # PLAN 8 Bug 7 (Genie sibling): carry `parent_path` so the space is recreated in its
@@ -791,7 +802,7 @@ def _genie_units(records: list[dict]) -> list[dict]:
                        "serialized_space": serialized,
                        "parent_path": safe_str(r.get("parent_path"))}
             out.append(_make_unit(
-                "genie_space", name, sid, payload, mode="auto",
+                "genie_space", nk, sid, payload, mode="auto",
                 note="recreate via Genie create_space/update_space; remap warehouse_id; "
                      "serialized_space may reference UC tables that must pre-exist on target"))
         else:
@@ -799,7 +810,7 @@ def _genie_units(records: list[dict]) -> list[dict]:
             payload = {"title": name, "description": safe_str(r.get("description")),
                        "warehouse_id": safe_str(r.get("warehouse_id"))}
             out.append(_make_unit(
-                "genie_space", name, sid, payload, mode="manual", migratable=False,
+                "genie_space", nk, sid, payload, mode="manual", migratable=False,
                 note="serialized_space unavailable (not returned by the API) — recreate manually"))
     return out
 

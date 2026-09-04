@@ -92,8 +92,10 @@ class RecordingClient:
             raise RuntimeError("INVALID_PARAMETER_VALUE: rejected")
         return {}
 
-    def patch(self, path, body):
-        self.calls.append(("PATCH", path, body))
+    def patch(self, path, body, params=None):
+        # `params` carries query args (e.g. Alerts V2 `update_mask`); kept at index 3 so existing
+        # assertions on the body (index 2) are unaffected.
+        self.calls.append(("PATCH", path, body, params))
         if path in self.fail_paths:
             raise RuntimeError("INVALID_PARAMETER_VALUE: rejected")
         return {}

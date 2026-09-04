@@ -498,34 +498,30 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         current_run = safe_str(summary.get("run_id"))
         osheet = wb.create_sheet("Outstanding")
         osheet.sheet_view.showGridLines = False
-        # Scoped to genuine PROBLEMS only (customer 2026-09-04): failed + created_with_warning. The
-        # state query (OUTSTANDING_ACTIONS) already excludes manual + skipped_no_object noise, but
-        # count defensively here too so the banner never mislabels.
-        _oa_counts = {"failed": 0, "created_with_warning": 0}
-        for r in outstanding:
-            a = safe_str(r.get("last_action"))
-            if a in _oa_counts:
-                _oa_counts[a] += 1
-        total_out = sum(_oa_counts.values())
+        # Scoped to FAILURES ONLY (customer 2026-09-04): the sheet must hold nothing but things that
+        # actually failed. The state query (OUTSTANDING_ACTIONS) already returns only `failed`, but
+        # count defensively here too so a stray non-failed row can never inflate the banner.
+        failed_out = sum(1 for r in outstanding
+                         if safe_str(r.get("last_action")) == "failed")
+        total_out = failed_out
         osheet.merge_cells("A1:I1")
         c = osheet["A1"]
-        c.value = (f"{total_out} outstanding: {_oa_counts['failed']} failed, "
-                   f"{_oa_counts['created_with_warning']} created-with-warning")
+        c.value = f"{total_out} outstanding — failures only"
         c.font = font(bold=True, color="FFFFFF", size=12)
-        c.fill = fill("B91C1C" if _oa_counts["failed"] else "1E3A5F")
+        c.fill = fill("B91C1C" if total_out else "1E3A5F")
         c.alignment = centre
         osheet.row_dimensions[1].height = 26
         osheet.merge_cells("A2:I2")
         legend = osheet["A2"]
         legend.value = (
-            "Cumulative PROBLEMS from the migration state table across ALL runs for this workspace "
-            "pair — items that FAILED or were created-but-DEGRADED and still need a fix. failed = "
-            "create/update errored; created_with_warning = created but a reference could not be "
-            "fully resolved (fix the prerequisite + re-run with retry_mode=failed_only). Deliberately "
-            "EXCLUDES routine by-design items so this stays scannable: manual steps (AKV scope, "
-            "repos, secret values — see the Manual table + runbook), skipped_no_object ACLs (see the "
-            "ACL sheet), up-to-date items (skipped/created/updated/adopted), deferred families "
-            "(not_selected), and deletes (Summary sheet).")
+            "Cumulative FAILURES from the migration state table across ALL runs for this workspace "
+            "pair — items whose create/update actually errored and still need a fix (re-run with "
+            "retry_mode=failed_only after fixing the cause). Deliberately EXCLUDES everything that is "
+            "not a failure so this stays scannable: created-with-warning (created but degraded — on "
+            "its per-asset-type tab), manual steps (AKV scope, repos, secret values — Manual table + "
+            "runbook), skipped_no_object ACLs (ACL sheet), up-to-date items "
+            "(skipped/created/updated/adopted), deferred families (not_selected), and deletes "
+            "(Summary sheet).")
         legend.font = font(italic=True, color="475569", size=9)
         legend.alignment = left_wrap
         osheet.row_dimensions[2].height = 66
@@ -541,11 +537,12 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             cc.border = box
             cc.alignment = centre
             osheet.column_dimensions[get_column_letter(col)].width = w
-        # Failures first, then by (asset_type, natural_key); newest-outstanding-first within is fine.
+        # FAILURES ONLY, defensively (customer 2026-09-04): the state query already returns only
+        # `failed`, but filter the DISPLAYED rows too so a stray non-failed row passed in by any
+        # caller can never show up on this sheet.
         ordered_out = sorted(
-            outstanding,
-            key=lambda r: (safe_str(r.get("last_action")) != "failed",
-                           safe_str(r.get("asset_type")), safe_str(r.get("natural_key"))))
+            [r for r in outstanding if safe_str(r.get("last_action")) == "failed"],
+            key=lambda r: (safe_str(r.get("asset_type")), safe_str(r.get("natural_key"))))
         for i, r in enumerate(ordered_out, start=4):
             status = safe_str(r.get("last_action"))
             _label, colour = _STATUS_STYLE.get(status, (status, "FFFFFF"))

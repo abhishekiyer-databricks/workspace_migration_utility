@@ -77,6 +77,65 @@ def test_folder_natural_key_helper():
     assert folder_natural_key(None, "solo") == "solo"
 
 
+def test_lakeview_and_genie_export_units_use_full_path_natural_key():
+    """Finding-9 (Run-2 regression): the EXPORT unit builders for lakeview dashboards and Genie
+    spaces must stamp the FULL-PATH natural key, not the bare display_name/title. The collectors
+    and the importer's `existing_keys` already key on the full path; when the export unit kept the
+    bare name, two same-named dashboards in different folders collapsed onto ONE target on import
+    (the 2nd silently UPDATED the 1st = data loss). Caught live in PLAN 11 Run 2."""
+    from src.exporters.asset_export import _lakeview_units, _genie_units
+    dash = _lakeview_units([
+        {"display_name": "dupe", "dashboard_id": "d1",
+         "parent_path": "/Users/a@x.com/folderA", "serialized_dashboard": "{}"},
+        {"display_name": "dupe", "dashboard_id": "d2",
+         "parent_path": "/Users/a@x.com/folderB", "serialized_dashboard": "{}"},
+    ])
+    keys = {u["natural_key"] for u in dash}
+    assert keys == {"/Users/a@x.com/folderA/dupe", "/Users/a@x.com/folderB/dupe"}, \
+        "same-named dashboards in different folders must get DISTINCT full-path keys"
+    genie = _genie_units([
+        {"title": "space", "space_id": "g1", "parent_path": "/Users/a@x.com/f1",
+         "serialized_space": "{}"},
+        {"title": "space", "space_id": "g2", "parent_path": "/Users/a@x.com/f2",
+         "serialized_space": "{}"},
+    ])
+    gkeys = {u["natural_key"] for u in genie}
+    assert gkeys == {"/Users/a@x.com/f1/space", "/Users/a@x.com/f2/space"}
+
+
+def test_alert_v2_update_sends_update_mask_query_param():
+    """Finding-9/BUG-1 (Run-2 regression): the Alerts V2 PATCH REQUIRES an `update_mask` query arg.
+    A body-only PATCH 400s "update_mask is required", so a changed alert (BUG-1 correctly routed it
+    to UPDATE) still failed and stayed stale. The mask must name the settable fields present in the
+    body — and nothing read-only (id/create_time/owner/…), which would also 400."""
+    client = RecordingClient(paginated={"api/2.0/alerts": [
+        {"display_name": "wsmig_test_alert_v2", "id": "A1"}]})
+    key = "/Users/a@x.com/wsmig_test_alert_v2"
+    imp, st = _make(SqlImporter, [
+        _unit("alert_v2", key,
+              {"display_name": "wsmig_test_alert_v2", "warehouse_id": "SRC-WH",
+               "evaluation": {"threshold": {"value": {"double_value": 5}}},
+               "schedule": {"quartz_cron_schedule": "0 0 9 * * ?"},
+               "id": "A1", "create_time": "2026-01-01", "owner_user_name": "a@x.com"},
+              fingerprint="sha256:new")], client)
+    st.record("alert_v2", key, action="created", fingerprint="sha256:old", target_object_id="A1")
+    # the warehouse ref must resolve, or _remap_warehouse hard-fails before the PATCH
+    imp.units_by_type["sql_warehouse"] = [
+        _unit("sql_warehouse", "wh", {"name": "wh"}, source_id="SRC-WH")]
+    imp.context["sql_warehouse_target_ids"] = {"wh": "TGT-WH"}
+    res = imp.run()
+    patches = [c for c in client.calls if c[0] == "PATCH" and "alerts/A1" in c[1]]
+    assert patches, "a changed alert_v2 must PATCH /api/2.0/alerts/{id}"
+    params = patches[0][3] or {}
+    mask = params.get("update_mask", "")
+    assert mask, "the Alerts V2 PATCH MUST carry a non-empty update_mask query arg"
+    masked = set(mask.split(","))
+    assert "evaluation" in masked and "warehouse_id" in masked
+    assert not (masked & {"id", "create_time", "owner_user_name"}), \
+        "read-only fields must never appear in the update_mask (they 400 the PATCH)"
+    assert res.updated == 1
+
+
 # ═══════════════════════════ BUG-1 — create-race adopt heals ════════════════════════════════
 
 class _RacyImporter(BaseImporter):
@@ -295,29 +354,31 @@ def _render(rows, outstanding=None, deleted=None, run_id="RUN-2"):
 def test_outstanding_sheet_is_driven_from_state_with_origin_column():
     """Finding-4: a cumulative Outstanding sheet, sourced from the state table (not this run's
     units), with an Origin column (new this run vs carried over) and the totals banner. Scoped to
-    genuine problems (failed + created_with_warning) — customer 2026-09-04."""
+    FAILURES ONLY — customer 2026-09-04 ("should only have failures")."""
     outstanding = [
         {"asset_type": "job", "natural_key": "j1", "last_action": "failed",
          "failure_category": "api_error", "last_error": "boom", "last_run_id": "RUN-2",
          "first_seen": "t0", "last_seen": "t2"},
-        {"asset_type": "dlt_pipeline", "natural_key": "p1", "last_action": "created_with_warning",
-         "failure_category": "", "last_error": "degraded ref", "last_run_id": "RUN-1",
+        {"asset_type": "job", "natural_key": "j2", "last_action": "failed",
+         "failure_category": "api_error", "last_error": "boom2", "last_run_id": "RUN-1",
          "first_seen": "t0", "last_seen": "t1"},
     ]
     wb = _render([], outstanding=outstanding)
     assert "Outstanding" in wb.sheetnames
     ws = wb["Outstanding"]
     text = "\n".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
-    assert "2 outstanding" in text and "1 failed" in text and "created-with-warning" in text
-    assert "manual" not in text.lower().split("legend")[0][:120]  # not in the banner
+    assert "2 outstanding" in text and "failures only" in text
+    # nothing but failures in the banner/legend framing
+    banner = str(ws["A1"].value)
+    assert "created-with-warning" not in banner and "manual" not in banner
     assert "new this run" in text and "carried over" in text
-    assert "j1" in text and "p1" in text
+    assert "j1" in text and "j2" in text
 
 
-def test_outstanding_state_query_excludes_manual_and_skipped_no_object():
-    """Finding-4 (trimmed): the state-table Outstanding query returns only failed +
-    created_with_warning — manual, skipped_no_object, not_selected, skipped are NOT outstanding
-    problems (they made the sheet unreadable)."""
+def test_outstanding_state_query_is_failures_only():
+    """Finding-4 (customer 2026-09-04): the state-table Outstanding query returns ONLY `failed`.
+    created_with_warning, manual, skipped_no_object, not_selected, skipped are NOT outstanding here
+    (created_with_warning stays on its per-asset-type tab; the rest are by-design/elsewhere)."""
     import tempfile
     cfg = Config.from_dict({"role": "target", "source_workspace_id": "111", "run_id": "r",
                             "target_staging_location": tempfile.mkdtemp(), "dry_run": False,
@@ -331,8 +392,7 @@ def test_outstanding_state_query_excludes_manual_and_skipped_no_object():
     st.record("cluster", "c1", action="skipped", fingerprint="f")
     st.flush(); st.load(force=True)
     keys = {(r["asset_type"], r["natural_key"]) for r in st.outstanding_rows()}
-    assert keys == {("job", "j1"), ("dlt_pipeline", "p1")}, \
-        "only failed + created_with_warning are outstanding problems"
+    assert keys == {("job", "j1")}, "only failed rows are outstanding (failures only)"
 
 
 def test_deleted_in_source_shows_inline_on_the_asset_type_tab():
