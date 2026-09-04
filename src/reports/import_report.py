@@ -529,8 +529,8 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         ocols = [("Asset Type", "asset_type", 24), ("Natural Key", "natural_key", 56),
                  ("Status", "last_action", 20), ("Origin", "_origin", 16),
                  ("Failure Category", "failure_category", 20), ("Last Error", "last_error", 70),
-                 ("Last Run", "last_run_id", 20), ("First Seen", "first_seen_utc", 26),
-                 ("Last Seen", "last_seen_utc", 26)]
+                 ("Last Run", "last_run_id", 20), ("First Seen", "first_seen", 26),
+                 ("Last Seen", "last_seen", 26)]
         for col, (h, _k, w) in enumerate(ocols, 1):
             cc = osheet.cell(row=3, column=col, value=h)
             cc.font = font(bold=True, color="FFFFFF", size=10)
@@ -551,8 +551,8 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             values = {"asset_type": r.get("asset_type"), "natural_key": r.get("natural_key"),
                       "last_action": _label, "_origin": origin,
                       "failure_category": r.get("failure_category"), "last_error": r.get("last_error"),
-                      "last_run_id": r.get("last_run_id"), "first_seen_utc": r.get("first_seen_utc"),
-                      "last_seen_utc": r.get("last_seen_utc")}
+                      "last_run_id": r.get("last_run_id"), "first_seen": r.get("first_seen"),
+                      "last_seen": r.get("last_seen")}
             for col, (_h, key, _w) in enumerate(ocols, 1):
                 cc = osheet.cell(row=i, column=col, value=safe_str(values.get(key)))
                 cc.border = box

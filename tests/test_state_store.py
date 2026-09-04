@@ -225,9 +225,9 @@ def test_a_later_row_never_blanks_a_known_target_id():
 def test_first_seen_is_preserved_across_updates():
     st, _ = _store()
     st.record("job", "j1", action=ACTION_CREATED, fingerprint="v1", target_object_id="9")
-    first = st.row("job", "j1")["first_seen_utc"]
+    first = st.row("job", "j1")["first_seen"]
     st.record("job", "j1", action=ACTION_UPDATED, fingerprint="v2", target_object_id="9")
-    assert st.row("job", "j1")["first_seen_utc"] == first
+    assert st.row("job", "j1")["first_seen"] == first
 
 
 # ── the 100+-pair guarantee: every read filtered by source_workspace_id ────

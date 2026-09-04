@@ -284,10 +284,10 @@ def test_outstanding_sheet_is_driven_from_state_with_origin_column():
     outstanding = [
         {"asset_type": "job", "natural_key": "j1", "last_action": "failed",
          "failure_category": "api_error", "last_error": "boom", "last_run_id": "RUN-2",
-         "first_seen_utc": "t0", "last_seen_utc": "t2"},
+         "first_seen": "t0", "last_seen": "t2"},
         {"asset_type": "cluster_library", "natural_key": "c:lib", "last_action": "manual",
          "failure_category": "", "last_error": "hand-install", "last_run_id": "RUN-1",
-         "first_seen_utc": "t0", "last_seen_utc": "t1"},
+         "first_seen": "t0", "last_seen": "t1"},
     ]
     wb = _render([], outstanding=outstanding)
     assert "Outstanding" in wb.sheetnames

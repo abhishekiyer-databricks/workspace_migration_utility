@@ -134,8 +134,8 @@ def main() -> int:
               rows and rows[0]["last_action"] == "updated"
               and rows[0]["last_source_fingerprint"] == "sha256:v2")
         check("first_seen preserved across the update",
-              rows and rows[0]["first_seen_utc"] and rows[0]["first_seen_utc"] <
-              rows[0]["last_seen_utc"])
+              rows and rows[0]["first_seen"] and rows[0]["first_seen"] <
+              rows[0]["last_seen"])
 
         # 3. a batch bigger than one statement
         print("\n== 3. batched MERGE of many rows ==")

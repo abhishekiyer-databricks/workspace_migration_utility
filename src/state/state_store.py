@@ -193,8 +193,8 @@ class StateStore:
                     connectivity_mode       STRING,
                     tool_version            STRING,
                     last_source_detail      STRING,
-                    first_seen_utc          STRING,
-                    last_seen_utc           STRING
+                    first_seen          STRING,
+                    last_seen           STRING
                 ) USING DELTA
                 CLUSTER BY (asset_type)
             """)
@@ -222,8 +222,8 @@ class StateStore:
                     classification      STRING,
                     action              STRING,
                     last_run_id         STRING,
-                    first_seen_utc      STRING,
-                    last_seen_utc       STRING
+                    first_seen      STRING,
+                    last_seen       STRING
                 ) USING DELTA
             """)
         except Exception as exc:  # noqa: BLE001
@@ -341,8 +341,8 @@ class StateStore:
             # same key never blanks a snapshot identity wrote.
             "last_source_detail": safe_str(source_detail) or safe_str(
                 prior.get("last_source_detail")),
-            "first_seen_utc": safe_str(prior.get("first_seen_utc")) or now,
-            "last_seen_utc": now,
+            "first_seen": safe_str(prior.get("first_seen")) or now,
+            "last_seen": now,
         }
         self._cache[key] = row
         self._pending.append(row)
@@ -374,8 +374,8 @@ class StateStore:
             "classification": safe_str(classification) or safe_str(prior.get("classification")),
             "action": safe_str(action),
             "last_run_id": self.run_id,
-            "first_seen_utc": safe_str(prior.get("first_seen_utc")) or now,
-            "last_seen_utc": now,
+            "first_seen": safe_str(prior.get("first_seen")) or now,
+            "last_seen": now,
         }
         self._identity_cache[key] = row
         self._pending_identity.append(row)
@@ -413,11 +413,11 @@ class StateStore:
     _STATE_COLS = ("source_workspace_id", "asset_type", "natural_key", "source_object_id",
                    "target_object_id", "last_source_fingerprint", "last_action", "last_error",
                    "last_error_raw", "failure_category", "last_run_id", "connectivity_mode",
-                   "tool_version", "last_source_detail", "first_seen_utc", "last_seen_utc")
+                   "tool_version", "last_source_detail", "first_seen", "last_seen")
 
     _IDENTITY_COLS = ("source_workspace_id", "entity_type", "source_key", "source_id",
                       "target_key", "target_id", "classification", "action", "last_run_id",
-                      "first_seen_utc", "last_seen_utc")
+                      "first_seen", "last_seen")
 
     @staticmethod
     def _values_clause(rows: list[dict], cols: tuple) -> str:
