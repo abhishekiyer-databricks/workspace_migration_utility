@@ -16,14 +16,16 @@ import.
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, safe_str
+from src.utils.helpers import dab_path_info, folder_natural_key, safe_str
 
 
 class GenieCollector(BaseCollector):
     object_type = "genie_space"
 
     def natural_key(self, obj: dict) -> str:
-        return safe_str(obj.get("title"))
+        # PLAN 11 Finding-9: full path (`<parent_path>/<title>`), not the bare title, so two
+        # same-named spaces in different folders don't collapse onto one target object.
+        return folder_natural_key(obj.get("parent_path"), obj.get("title"))
 
     def discover(self) -> list[dict]:
         raw = self.client.get_paginated(
@@ -36,7 +38,8 @@ class GenieCollector(BaseCollector):
             detail = self._space_detail(sid)
             # Genie spaces expose no deployment field; the list carries only `parent_path`
             # (coarser than dashboards' `path`), so DAB detection keys off that `.bundle/` folder.
-            dab = dab_path_info(detail.get("parent_path") or s.get("parent_path"))
+            dab = dab_path_info(detail.get("parent_path") or s.get("parent_path"),
+                                getattr(self.config, "dab_bundle_roots", None))
             items.append({
                 "space_id": sid,
                 "title": safe_str(detail.get("title") or s.get("title")),

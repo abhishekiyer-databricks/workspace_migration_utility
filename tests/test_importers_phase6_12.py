@@ -86,16 +86,21 @@ def test_query_warehouse_id_is_remapped_to_the_target_warehouse():
     assert "parent_path" not in body
 
 
-def test_an_unmappable_warehouse_falls_back_to_an_existing_one_and_says_so():
-    """A query attached to a working warehouse can be re-pointed; one with a dead id just errors."""
+def test_an_unmappable_warehouse_fails_loud_never_substitutes(  # noqa: PT002
+        ):
+    """PLAN 11 Finding-10: a query whose warehouse is NOT in the bundle FAILS LOUD — the old
+    "point it at any existing warehouse to keep it runnable" substitution made the query look
+    migrated while it silently queried a DIFFERENT warehouse. Lift-and-shift never substitutes."""
     client = RecordingClient(get_table={"api/2.0/sql/warehouses": {
         "warehouses": [{"id": "TGT-EXISTING", "name": "target-only-wh"}]}})
-    imp, _st, _aw = _make(SqlImporter, [
+    imp, st, _aw = _make(SqlImporter, [
         _unit("legacy_query", "q1", {"display_name": "q1", "warehouse_id": "GONE"})], client)
     res = imp.run()
-    body = client.bodies_to("sql/queries")[0]["query"]
-    assert body["warehouse_id"] == "TGT-EXISTING"
-    assert any("runnable" in w for w in res.warnings)
+    assert client.posts_to("sql/queries") == [], "the query must NOT be created against a substitute"
+    assert res.created == 0 and res.failed == 1
+    row = st.row("legacy_query", "q1")
+    assert row["failure_category"] == "dependency_unresolved"
+    assert "not available on source" in row["last_error"]
 
 
 def _condition(op="GREATER_THAN", column="v", value="0"):
@@ -123,6 +128,7 @@ def test_a_legacy_alert_condition_is_translated_to_the_v1_options_shape():
     """
     client = RecordingClient()
     imp, _st, _aw = _make(SqlImporter, [
+        _unit("legacy_query", "q1", {"display_name": "q1"}, source_id="q"),
         _unit("legacy_alert", "a1", {"name": "a1", "query_id": "q",
                                      "condition": _condition("GREATER_THAN", "total", "42")})],
         client)
@@ -130,13 +136,14 @@ def test_a_legacy_alert_condition_is_translated_to_the_v1_options_shape():
     body = client.bodies_to("sql/alerts")[0]
     assert body["options"] == {"column": "total", "op": ">", "value": "42"}
     assert "condition" not in body, "the v1 API does not understand the modern condition block"
-    assert res.created == 1
+    assert res.created == 2, "the referenced query and the alert both create"
 
 
 def test_an_untranslatable_legacy_alert_is_not_supported_rather_than_a_bare_400():
     """An alert's TRIGGER must never be approximated — if it doesn't map, say so."""
     client = RecordingClient()
     imp, st, _aw = _make(SqlImporter, [
+        _unit("legacy_query", "q1", {"display_name": "q1"}, source_id="q"),
         _unit("legacy_alert", "weird", {"name": "weird", "query_id": "q",
                                         "condition": {"op": "SOMETHING_EXOTIC"}})], client)
     res = imp.run()
@@ -212,6 +219,7 @@ def test_alert_v2_create_body_carries_evaluation_and_schedule():
                   "comparison_operator": "GREATER_THAN", "threshold": {"value": {"double_value": 5}}}
     schedule = {"quartz_cron_schedule": "0 0 9 * * ?", "timezone_id": "UTC"}
     imp, _st, _aw = _make(SqlImporter, [
+        _unit("sql_warehouse", "wh", {"name": "wh", "cluster_size": "Small"}, source_id="SRC-WH"),
         _unit("alert_v2", "a2", {"display_name": "a2", "query_text": "select count(*) c from t",
                                  "warehouse_id": "SRC-WH", "evaluation": evaluation,
                                  "schedule": schedule})], client)

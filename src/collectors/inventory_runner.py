@@ -159,8 +159,14 @@ class InventoryRunner:
                     continue
                 if reg.owns(asset_type, rec.get(id_field)):
                     rec["deployed_by_dab"] = True
-                    rec["dab_scope"] = ("shared" if "/Shared/" in reg.bundle_of(
-                        asset_type, rec.get(id_field)) else "user")
+                    # Finding-12: scope from the bundle root (Shared → shared, else user), honouring
+                    # a configurable directory root the same way `dab_path_info` does.
+                    from src.utils.helpers import dab_path_info
+                    root = reg.bundle_of(asset_type, rec.get(id_field))
+                    _cfg = getattr(self, "config", None)
+                    rec["dab_scope"] = dab_path_info(
+                        root, getattr(_cfg, "dab_bundle_roots", None)).get("dab_scope") \
+                        or ("shared" if "/Shared/" in safe_str(root) else "user")
                     stamped += 1
         _LOG.info("DAB ownership stamped", bundles=len(reg.bundles),
                   resources=len(reg), assets_flagged=stamped)

@@ -26,11 +26,16 @@ class GenieImporter(BaseImporter):
         return self.units_for("genie_space")
 
     def existing_keys(self) -> dict:
-        """`{title: space_id}` for spaces already on target."""
+        """`{source full-path: space_id}` for spaces already on target.
+
+        PLAN 11 Finding-9: keyed by full path (`<parent_path>/<title>`); the LIST omits
+        parent_path, so matching goes through `folder_existing_keys` (id-anchor via state +
+        collapse-safe unique-name adoption) — two same-named spaces in different folders no longer
+        resolve to one target.
+        """
         spaces = self.client.get_paginated("api/2.0/genie/spaces", "spaces",
                                            params={"page_size": 100})
-        found = {safe_str(s.get("title")): safe_str(s.get("space_id"))
-                 for s in spaces if s.get("title")}
+        found = self.folder_existing_keys("genie_space", spaces, "title", "space_id")
         self.context.setdefault("genie_space_target_ids", {}).update(found)
         return found
 
@@ -40,9 +45,10 @@ class GenieImporter(BaseImporter):
         # home. Verified live that Genie create HONORS parent_path. Only on CREATE — an update
         # doesn't move an existing space.
         parent = safe_str((unit.get("payload") or {}).get("parent_path"))
+        res = None
         if parent:
             body["parent_path"] = parent
-            self.remap_parent_path(body)
+            res = self.remap_parent_path(body)
         try:
             created = self.client.post("api/2.0/genie/spaces", body)
         except Exception as exc:  # noqa: BLE001
@@ -50,6 +56,10 @@ class GenieImporter(BaseImporter):
             raise
         sid = safe_str(created.get("space_id"))
         self.context.setdefault("genie_space_target_ids", {})[self.natural_key(unit)] = sid
+        # PLAN 11 Finding-8: an orphaned owner's Genie space is preserved under the backup root as
+        # created_with_warning (parity with notebooks), never a hard prerequisite_missing failure.
+        if res is not None and res.kind == "backup":
+            return {"target_id": sid, "warning": f"{res.note} {note}"}
         return {"target_id": sid, "note": note}
 
     def update_one(self, unit: dict, target_id: str) -> dict:
@@ -71,17 +81,10 @@ class GenieImporter(BaseImporter):
         notes = []
         src_wh = safe_str(payload.get("warehouse_id"))
         if src_wh:
-            target_wh, key = self.remap_id("sql_warehouse", src_wh)
-            if not target_wh:
-                target_wh = next(
-                    iter((self.context.get("sql_warehouse_target_ids") or {}).values()), "")
-                if target_wh:
-                    notes.append(f"source warehouse {src_wh!r}"
-                                 + (f" ({key!r})" if key else "")
-                                 + f" is not on target, so the space was attached to an existing "
-                                   f"warehouse ({target_wh}) — re-point it if that is wrong")
-            if target_wh:
-                body["warehouse_id"] = target_wh
+            # PLAN 11 Finding-10: exact-or-fail-loud — no silent substitution to "any warehouse".
+            body["warehouse_id"] = self.require_remap(
+                "sql_warehouse", src_wh,
+                referenced_by=f"genie space `{safe_str(payload.get('title'))}`")
 
         notes.append("serialized_space carried verbatim. NOTE it references Unity Catalog tables by "
                      "fully-qualified name, and UC is OUT OF SCOPE for this utility — the space "

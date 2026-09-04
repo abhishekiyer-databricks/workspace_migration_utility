@@ -75,6 +75,14 @@ LAST_ACTIONS = frozenset({
     ACTION_DELETED_IN_SOURCE,
 })
 
+# The `last_action` values that mean "NOT yet successfully migrated" — the cumulative Outstanding
+# view (PLAN 11 Finding-4). `not_selected` is deliberately EXCLUDED (a deferred family is a choice,
+# not outstanding work); `deleted_in_source` has its own section; everything else here is a real
+# item an operator must still resolve.
+OUTSTANDING_ACTIONS = frozenset({
+    ACTION_FAILED, ACTION_CREATED_WITH_WARNING, ACTION_MANUAL, ACTION_SKIPPED_NO_OBJECT,
+})
+
 # Which `last_action` values each retry_mode picks up (D22).
 #   • `failed_only` means LITERALLY failed — {ACTION_FAILED} and nothing else (PLAN 8 Bug 2). It used
 #     to also fold in `created_with_warning`, but that made the label lie: a warned-but-created unit
@@ -589,6 +597,22 @@ class StateStore:
         return {nk: safe_str(r.get("target_object_id"))
                 for (at, nk), r in self._cache.items()
                 if at == asset_type and safe_str(r.get("target_object_id"))}
+
+    def outstanding_rows(self) -> list:
+        """Every row for THIS pair that is NOT yet successfully migrated — the cumulative
+        "Outstanding" view (PLAN 11 Finding-4), across ALL runs, independent of whether this run
+        touched it. The STATE TABLE is the cumulative source of truth, so a persistent failure that
+        stops being re-attempted (a stale row, exactly BUG-1) never silently drops off future reports.
+
+        Includes `failed` / `created_with_warning` / `manual` / `skipped_no_object`. Excludes items
+        that are up-to-date (`skipped`/`created`/`updated`/`adopted`) and `deleted_in_source` (its own
+        section). Returns the raw state rows (dicts) so the report can render + derive Origin.
+        """
+        if not self.enabled:
+            return []
+        self.load()
+        return [dict(r) for r in self._cache.values()
+                if safe_str(r.get("last_action")) in OUTSTANDING_ACTIONS]
 
     def summary(self) -> dict:
         """`{last_action: count}` for this pair — the change report's raw material."""

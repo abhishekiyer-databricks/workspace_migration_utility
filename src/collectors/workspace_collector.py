@@ -11,7 +11,7 @@ inventory script). natural_key = workspace path.
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, safe_str
+from src.utils.helpers import dab_path_info, is_bundle_root_path, safe_str
 
 # /Projects is not inventoried as workspace content. /Repos IS descended (to discover git
 # folders) but its container dirs are not emitted as content — see _walk.
@@ -94,7 +94,7 @@ class WorkspaceCollector(BaseCollector):
             # each item records whether it lives under a `.bundle/` folder and, if so, whether
             # the bundle is shared (/Shared/.bundle — current staging + all prod) or user-scoped
             # (/Users/<email>/.bundle or /Workspace/<uuid>/.bundle — legacy staging pattern).
-            dab = dab_path_info(p)
+            dab = dab_path_info(p, getattr(self.config, "dab_bundle_roots", None))
             record = {
                 "path": p,
                 "object_type": otype,
@@ -116,7 +116,11 @@ class WorkspaceCollector(BaseCollector):
             # id it created, which is the only reliable way to tell that a PATHLESS asset (a
             # cluster, warehouse, pool, secret scope, serving endpoint) is DAB-managed. See
             # src/collectors/dab_registry.py for why tag-sniffing can't be used.
-            if otype == "FILE" and "/.bundle/" in p and "/state/" in p \
+            # PLAN 11 Finding-12: honour configurable bundle roots so a Team-B directory-root bundle
+            # (no `.bundle` segment) still has its `<root>/**/state/resources.json` discovered → the
+            # registry claims that bundle's pathless clusters/warehouses/pools/scopes too.
+            if otype == "FILE" and "/state/" in p \
+                    and is_bundle_root_path(p, getattr(self.config, "dab_bundle_roots", None)) \
                     and p.rsplit("/", 1)[-1] in ("resources.json", "terraform.tfstate"):
                 self.bundle_state_paths.add(p)
 

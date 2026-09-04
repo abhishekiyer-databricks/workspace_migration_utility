@@ -173,10 +173,14 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     # present, the workbook renders a dedicated "Object Permissions (ACLs)" sheet mirroring inventory
     # instead of collapsing each object to one `acl` row + a count.
     acl_grants = context.get("acl_grants")
+    # PLAN 11 Finding-4: the cumulative outstanding items from the STATE TABLE (across all runs),
+    # for the "Outstanding" sheet. Empty when state is disabled (a first-look dry run).
+    outstanding = context.get("outstanding") or []
     try:
         path = aw.write_text_local_then_copy(
             xlsx_rel,
-            lambda local: _render_xlsx(local, config, summary, rows, parity, acl_grants))
+            lambda local: _render_xlsx(local, config, summary, rows, parity, acl_grants,
+                                       outstanding))
         if path:
             written["xlsx"] = xlsx_rel
     except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
@@ -236,8 +240,9 @@ def _counts_by_asset_type(rows: list[dict]) -> dict:
 # ── Excel ───────────────────────────────────────────────────────────────────
 
 def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
-                 parity: dict = None, acl_grants: list = None) -> str:
-    """Import Summary sheet + one sheet per asset type + an "Object Permissions (ACLs)" sheet
+                 parity: dict = None, acl_grants: list = None, outstanding: list = None) -> str:
+    """Import Summary sheet + one sheet per asset type (with `deleted_in_source` shown INLINE,
+    Finding-3) + a cumulative "Outstanding" sheet (Finding-4) + an "Object Permissions (ACLs)" sheet
     (per-grant, Bug 15) + an ACL Parity sheet (D-1). Rendered locally (openpyxl needs seeks)."""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -433,6 +438,22 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
     for x in rows:
         by_card.setdefault(_card_for_asset_type(x.get("asset_type")), []).append(x)
 
+    # PLAN 11 Finding-3: show `deleted_in_source` INLINE on each asset-type tab as a first-class
+    # status (not only on the Summary sheet), so e.g. the Jobs tab reads created / updated / skipped
+    # / deleted_in_source in one place. Synthetic rows are injected from the deleted map (sourced
+    # from the state table's last_action=deleted_in_source), so a tab reflects them even on a run
+    # that didn't otherwise touch that type. The Summary roll-up table keeps its own deleted section
+    # (belt-and-suspenders); these injected rows are counted only in the per-type tab.
+    _del_inline_note = ("on target but no longer in the source bundle — NOT deleted (set "
+                        "allow_deletes=true to remove); a source rename shows as this old name "
+                        "deleted + the new name created")
+    for at, keys in (summary.get("deleted_in_source") or {}).items():
+        for key in sorted(keys):
+            by_card.setdefault(_card_for_asset_type(at), []).append({
+                "asset_type": at, "natural_key": key, "import_status": "deleted_in_source",
+                "action_taken": "Deleted in source", "note": _del_inline_note,
+                "target_id": "", "source_id": "", "failure_category": "", "error_raw": ""})
+
     # Inventory card order first (so tabs line up with the other workbooks), then any leftover
     # cards not in the canonical list (defensive — a new importer type still gets a tab).
     ordered_cards = [k for k in _SUMMARY_CARD_KEYS if k in by_card]
@@ -467,6 +488,81 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
                     cc.fill = fill(colour)
                     cc.value = _label
         sheet.freeze_panes = "A2"
+
+    # ── Outstanding — not yet successfully migrated (cumulative, from the STATE TABLE) ──────────
+    # PLAN 11 Finding-4: driven from the state table for this pair (NOT this run's units), so it
+    # always shows EVERY currently-unresolved item — old carry-overs AND new — whether or not this
+    # run touched it. A persistent failure that stops being re-attempted (a stale row, exactly
+    # BUG-1) would otherwise silently drop off future reports.
+    if outstanding is not None:
+        current_run = safe_str(summary.get("run_id"))
+        osheet = wb.create_sheet("Outstanding")
+        osheet.sheet_view.showGridLines = False
+        _oa_counts = {"failed": 0, "created_with_warning": 0, "manual": 0, "skipped_no_object": 0}
+        for r in outstanding:
+            a = safe_str(r.get("last_action"))
+            if a in _oa_counts:
+                _oa_counts[a] += 1
+        total_out = sum(_oa_counts.values())
+        osheet.merge_cells("A1:I1")
+        c = osheet["A1"]
+        c.value = (f"{total_out} outstanding: {_oa_counts['failed']} failed, "
+                   f"{_oa_counts['created_with_warning']} warning, {_oa_counts['manual']} manual, "
+                   f"{_oa_counts['skipped_no_object']} skipped_no_object")
+        c.font = font(bold=True, color="FFFFFF", size=12)
+        c.fill = fill("B91C1C" if _oa_counts["failed"] else "1E3A5F")
+        c.alignment = centre
+        osheet.row_dimensions[1].height = 26
+        osheet.merge_cells("A2:I2")
+        legend = osheet["A2"]
+        legend.value = (
+            "Cumulative outstanding items from the migration state table across ALL runs for this "
+            "workspace pair — everything not yet successfully migrated. failed = create/update "
+            "errored; created_with_warning = created but degraded (fix the prerequisite + re-run); "
+            "manual = must be done by hand (AKV scope, legacy alert/dashboard, workspace-local SP "
+            "secret, repos); skipped_no_object = a declarative unit whose target object isn't present "
+            "yet. Excludes items that are up-to-date (skipped/created/updated/adopted) and deferred "
+            "families (not_selected). Deletes are listed on the Summary sheet.")
+        legend.font = font(italic=True, color="475569", size=9)
+        legend.alignment = left_wrap
+        osheet.row_dimensions[2].height = 54
+        ocols = [("Asset Type", "asset_type", 24), ("Natural Key", "natural_key", 56),
+                 ("Status", "last_action", 20), ("Origin", "_origin", 16),
+                 ("Failure Category", "failure_category", 20), ("Last Error", "last_error", 70),
+                 ("Last Run", "last_run_id", 20), ("First Seen", "first_seen_utc", 26),
+                 ("Last Seen", "last_seen_utc", 26)]
+        for col, (h, _k, w) in enumerate(ocols, 1):
+            cc = osheet.cell(row=3, column=col, value=h)
+            cc.font = font(bold=True, color="FFFFFF", size=10)
+            cc.fill = fill("1E3A5F")
+            cc.border = box
+            cc.alignment = centre
+            osheet.column_dimensions[get_column_letter(col)].width = w
+        # Failures first, then by (asset_type, natural_key); newest-outstanding-first within is fine.
+        ordered_out = sorted(
+            outstanding,
+            key=lambda r: (safe_str(r.get("last_action")) != "failed",
+                           safe_str(r.get("asset_type")), safe_str(r.get("natural_key"))))
+        for i, r in enumerate(ordered_out, start=4):
+            status = safe_str(r.get("last_action"))
+            _label, colour = _STATUS_STYLE.get(status, (status, "FFFFFF"))
+            origin = ("new this run" if safe_str(r.get("last_run_id")) == current_run
+                      else "carried over")
+            values = {"asset_type": r.get("asset_type"), "natural_key": r.get("natural_key"),
+                      "last_action": _label, "_origin": origin,
+                      "failure_category": r.get("failure_category"), "last_error": r.get("last_error"),
+                      "last_run_id": r.get("last_run_id"), "first_seen_utc": r.get("first_seen_utc"),
+                      "last_seen_utc": r.get("last_seen_utc")}
+            for col, (_h, key, _w) in enumerate(ocols, 1):
+                cc = osheet.cell(row=i, column=col, value=safe_str(values.get(key)))
+                cc.border = box
+                cc.font = font(size=9)
+                cc.alignment = left_wrap
+                if key == "last_action":
+                    cc.fill = fill(colour)
+                elif key == "_origin":
+                    cc.fill = fill("FEF3C7" if origin == "carried over" else "E0F2FE")
+        osheet.freeze_panes = "A4"
 
     # ── Object Permissions (ACLs) — one row per object×principal×permission (Bug 15) ──
     # MIRRORS the inventory ACL sheet (Object Type · Object · Principal · Permission · Inherited) so

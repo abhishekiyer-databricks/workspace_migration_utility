@@ -158,8 +158,7 @@ class ExportRunner:
                     u["export_status"] = "skip"
                     u["note"] = f"toggle migrate_{toggle_name}=false"
 
-    @staticmethod
-    def _refresh_import_actions(units_by_type: dict) -> None:
+    def _refresh_import_actions(self, units_by_type: dict) -> None:
         for units in units_by_type.values():
             for u in units:
                 u["import_action"] = derive_import_action(u)
@@ -168,7 +167,8 @@ class ExportRunner:
                 # units that still carry the DAB action (a toggled-off or failed one reads
                 # `none`/`manual`, and its own note is the more useful message).
                 if u["import_action"] == _ACTION_DAB and is_dab_content_path(
-                        u.get("asset_type"), u.get("natural_key")):
+                        u.get("asset_type"), u.get("natural_key"),
+                        getattr(self.config, "dab_bundle_roots", None)):
                     u["note"] = DAB_CONTENT_NOTE
 
     # ── content fetch (parallel, resumable) ────────────────────────────────
@@ -373,11 +373,12 @@ class ExportRunner:
             lines.append("")
         # Bundle roots: one line per BUNDLE, not per file (44 file rows would bury the actual
         # instruction, which is a single redeploy per bundle).
+        dab_roots = getattr(self.config, "dab_bundle_roots", None)
         roots: dict[str, int] = {}
         for units in units_by_type.values():
             for u in units:
-                if is_dab_content_path(u.get("asset_type"), u.get("natural_key")):
-                    root = dab_bundle_root(u["natural_key"])
+                if is_dab_content_path(u.get("asset_type"), u.get("natural_key"), dab_roots):
+                    root = dab_bundle_root(u["natural_key"], dab_roots)
                     if root:
                         roots[root] = roots.get(root, 0) + 1
         if roots:

@@ -206,6 +206,13 @@ class Config:
     max_scim: int = 0
     max_workspace_items: int = 0
     max_ws_api_calls: int = 0
+    # PLAN 11 Finding-12: DAB bundle-root indicators for PATH-based DAB detection. Each entry is
+    # either a folder-name glob (e.g. `.bundle`, `*.bundle`) or an absolute directory prefix (e.g.
+    # `/Users/dab-deployer@corp.com`). Default `.bundle` = the CLI standard, byte-identical to the
+    # pre-Finding-12 tool. Set on the SOURCE side (inventory/export); import consumes the STAMPED
+    # `deployed_by_dab` flag but also carries this for any residual path re-derivation. Jobs/DLT
+    # pipelines are UNAFFECTED (they use `deployment.kind`, the reliable field signal).
+    dab_bundle_roots: list = field(default_factory=lambda: [".bundle"])
 
     # ── mode helpers ──────────────────────────────────────────────────────
     @property
@@ -381,6 +388,8 @@ class Config:
             max_scim=int(w("max_scim", "0") or 0),
             max_workspace_items=int(w("max_workspace_items", "0") or 0),
             max_ws_api_calls=int(w("max_ws_api_calls", "0") or 0),
+            # Finding-12: CSV of bundle-root matchers; alias-accepts a single value. Default .bundle.
+            dab_bundle_roots=parse_csv(w("dab_bundle_roots", ".bundle")) or [".bundle"],
         )
         cfg.ctx.account_id = w("account_id")
 
@@ -467,6 +476,7 @@ class Config:
             max_scim=d.get("max_scim", 0),
             max_workspace_items=d.get("max_workspace_items", 0),
             max_ws_api_calls=d.get("max_ws_api_calls", 0),
+            dab_bundle_roots=d.get("dab_bundle_roots", [".bundle"]),
         )
         cfg.ctx = WorkspaceContext(**d.get("ctx", {}))
         return cfg

@@ -218,15 +218,36 @@ def test_cluster_policy_definition_pool_id_is_remapped():
     assert got["spark_version"]["value"] == "13.3.x", "non-id fields are untouched"
 
 
-def test_cluster_policy_with_an_unresolvable_pinned_pool_warns():
-    """A policy pinning a pool with no target equivalent is reported degraded, not silently wrong."""
+def test_cluster_policy_pinning_a_pool_not_in_the_bundle_fails_loud():
+    """PLAN 11 Finding-10: a policy pinning a pool that is NOT in the bundle FAILS LOUD — never the
+    old "keep the source pool id + warn" (which let the policy reject every cluster under it), and
+    never a silent substitution. Lift-and-shift only remaps to the pool we recreated."""
     client = RecordingClient()
     definition = json.dumps({"driver_instance_pool_id": {"type": "fixed", "value": "GONE"}})
-    imp, _st = _make(ComputeImporter, [
+    imp, st = _make(ComputeImporter, [
         _unit("cluster_policy", "std", {"name": "std", "definition": definition})], client)
     res = imp.run()
-    assert res.warned == 1
-    assert "no target pool" in res.units[0]["note"]
+    assert res.created == 0 and res.failed == 1
+    row = st.row("cluster_policy", "std")
+    assert row["failure_category"] == "dependency_unresolved"
+    assert "not available on source" in row["last_error"]
+
+
+def test_cluster_policy_pinning_an_in_bundle_pool_not_yet_created_is_retryable():
+    """PLAN 11 Finding-10: a pinned pool that IS in the bundle but not yet on target is a RETRYABLE
+    prerequisite (heals on retry_mode=failed_only), distinct from the hard not-in-bundle case."""
+    client = RecordingClient()
+    definition = json.dumps({"driver_instance_pool_id": {"type": "fixed", "value": "SRC-POOL"}})
+    imp, st = _make(ComputeImporter, [
+        _unit("instance_pool", "pool-a", {"instance_pool_name": "pool-a"}, source_id="SRC-POOL"),
+        _unit("cluster_policy", "std", {"name": "std", "definition": definition})], client)
+    # The pool IS in the bundle (so source_id → natural_key resolves) but is NOT created this run
+    # (narrowed out of the work list), so it has no target id yet — the in-bundle-not-yet case.
+    imp.retry_keys = {("cluster_policy", "std")}
+    res = imp.run()
+    row = st.row("cluster_policy", "std")
+    assert row["failure_category"] == "prerequisite_missing"
+    assert "retry_mode=failed_only" in row["last_error"]
 
 
 def test_node_types_are_stripped_when_a_pool_is_set():
@@ -245,16 +266,19 @@ def test_node_types_are_stripped_when_a_pool_is_set():
         assert field not in body, f"{field} must not be sent with instance_pool_id"
 
 
-def test_a_dangling_pool_reference_is_dropped_with_a_warning_not_a_failure():
-    """A working cluster + an explicit warning beats an opaque create failure."""
+def test_a_cluster_pool_not_in_the_bundle_fails_loud_not_dropped():
+    """PLAN 11 Finding-10: a cluster whose pool is NOT in the bundle FAILS LOUD — the old behaviour
+    silently DROPPED the pool and created a mis-configured cluster. Lift-and-shift never drops a
+    reference; it recreates the object or fails."""
     client = RecordingClient()
-    imp, _st = _make(ComputeImporter, [
+    imp, st = _make(ComputeImporter, [
         _unit("cluster", "etl", {"cluster_name": "etl", "instance_pool_id": "GONE"})], client)
     res = imp.run()
-    body = client.bodies_to("clusters/create")[0]
-    assert "instance_pool_id" not in body
-    assert res.warned == 1, "a cluster missing its pool must be reported degraded, not clean"
-    assert "DROPPED" in res.units[0]["note"]
+    assert client.bodies_to("clusters/create") == [], "the cluster must NOT be created mis-configured"
+    assert res.created == 0 and res.failed == 1
+    row = st.row("cluster", "etl")
+    assert row["failure_category"] == "dependency_unresolved"
+    assert "not available on source" in row["last_error"]
 
 
 def test_the_source_creator_is_preserved_as_a_tag():

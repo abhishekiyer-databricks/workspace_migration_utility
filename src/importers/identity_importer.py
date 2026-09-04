@@ -140,17 +140,22 @@ class IdentityImporter(BaseImporter):
         return units
 
     def _oauth_secret_manual_units(self, units: list) -> list:
-        """PLAN 8 Bug 3: an SP whose SOURCE had OAuth client secret(s) — or where the check could
-        not run — is a STANDING manual task: no API ever returns a secret value, so the tool can
-        NEVER migrate it. Model it as its OWN `manual` unit rather than a `created_with_warning` on
-        the SP:
+        """PLAN 8 Bug 3 + PLAN 11 Finding-7: an SP whose SOURCE had OAuth client secret(s) is a
+        STANDING manual task ONLY when the SP does NOT keep its account-level identity on target.
 
-          • the SP itself still counts as created/adopted (the object IS created);
-          • the secret task is `manual`, so it rides skipped_only / failed_and_skipped and NEVER
-            failed_only (Bug 2), and is re-emitted every run (never collapses to a generic
-            'unchanged' row that loses the instruction — Bug 5);
-          • it is keyed by the source applicationId, separate asset_type, so it sits beside the SP
-            in the report without colliding with the SP's own state row.
+        The manual `service_principal_secret` unit is KIND-scoped:
+          • **workspace-local Databricks-managed SP** — recreated on target with a NEW applicationId,
+            so its source secret cannot come across (write-only + new identity) → genuine `manual`
+            re-issue. Keyed by the source applicationId, separate asset_type, so it sits beside the
+            SP in the report; `manual` so it rides skipped_only/failed_and_skipped, never failed_only.
+          • **account-level SP (account db-managed / UMI / Entra), adopted same-account** — the
+            applicationId is stable and the OAuth secret / UMI credential lives at the ACCOUNT level
+            and is intact; assigning the SP carries the identity, so there is NOTHING to migrate.
+            Emitting a `manual` step here is false work that would sit in the cumulative Outstanding
+            sheet forever (a manual row never clears) → SUPPRESSED (no unit at all). Cross-account
+            re-provisioning is an account-admin task the preflight already flags, not this unit's job.
+        This also fixes the has_secrets==unknown conservatism for account SPs: an inconclusive check
+        must never manufacture a false outstanding manual task on an account-owned identity.
         """
         out = []
         for u in units:
@@ -158,6 +163,10 @@ class IdentityImporter(BaseImporter):
                 continue
             note = safe_str(u.get("note"))
             if not note:      # export sets a note ONLY when has_secrets is True or unknown
+                continue
+            # Finding-7: only a workspace-local SP (new applicationId on target) needs a re-issue.
+            # An account-owned SP keeps its appId + account-level credential → nothing to migrate.
+            if _kind_of(u) != KIND_WORKSPACE_LOCAL:
                 continue
             app_id = self.natural_key(u)
             out.append({
@@ -167,9 +176,10 @@ class IdentityImporter(BaseImporter):
                 "import_action": "manual",
                 "export_status": "success",
                 "fingerprint": "",
-                "note": (f"service principal `{app_id}`: {note} Create a new OAuth secret on target "
-                         f"and update whatever authenticates with it — a secret VALUE is never "
-                         f"readable via any API, so the tool cannot migrate it."),
+                "note": (f"service principal `{app_id}` was recreated with a NEW applicationId on "
+                         f"target: {note} Create a new OAuth secret on target and update whatever "
+                         f"authenticates with it — a secret VALUE is never readable via any API, so "
+                         f"the tool cannot migrate it."),
             })
         return out
 
@@ -292,13 +302,14 @@ class IdentityImporter(BaseImporter):
             if _kind_of(unit) == KIND_ACCOUNT:
                 # Never re-sync an account group's members: account-global (§multi-workspace) and
                 # Entra would revert it. Permissions ARE re-checked, since ADMIN/USER can change.
+                # PLAN 11 Finding-2: the member delta IS named for detection/reporting
+                # (members_applied=False), and the snapshot now INCLUDES members so a later run can
+                # diff a membership-only change (the fingerprint already moves on one).
                 self._ensure_assignment(target_id, unit, self.natural_key(unit))
-                note = self._diff_note("group", unit, payload, include_members=False)
+                note = self._diff_note("group", unit, payload, members_applied=False)
                 return {"target_id": target_id,
-                        "note": f"{note}; workspace permissions re-applied; members are "
-                                f"account-owned and were not modified",
-                        "source_detail": self._snapshot_json("group", payload,
-                                                             include_members=False)}
+                        "note": f"{note}; workspace entitlements/permissions re-applied",
+                        "source_detail": self._snapshot_json("group", payload)}
             member_note = self._sync_members(target_id, payload.get("members") or [])
             # The additive PATCH (member_note) says what was ADDED/unresolved; the diff names what
             # was removed IN SOURCE — which is REPORTED, not applied (the removed member stays on
@@ -531,7 +542,9 @@ class IdentityImporter(BaseImporter):
             return {"target_id": target_id,
                     "note": "account group already assigned; entitlements re-applied "
                             "(members are account-owned and were not modified)",
-                    "source_detail": self._snapshot_json("group", payload, include_members=False)}
+                    # Finding-2: snapshot INCLUDES members (for detection only) so a later run can
+                    # diff a membership-only change and name the delta.
+                    "source_detail": self._snapshot_json("group", payload)}
 
         account_id = self._resolve_account_group_id(unit, name)
         if not account_id:
@@ -565,7 +578,8 @@ class IdentityImporter(BaseImporter):
         return {"target_id": account_id,
                 "note": f"assigned the existing account group (id {account_id} preserved); members "
                         f"are account-owned and were not modified",
-                "source_detail": self._snapshot_json("group", payload, include_members=False)}
+                # Finding-2: snapshot INCLUDES members (detection only) for a later membership diff.
+                "source_detail": self._snapshot_json("group", payload)}
 
     def _resolve_account_group_id(self, unit: dict, name: str) -> str:
         """The TARGET ACCOUNT's id for this group — by displayName, else externalId.
@@ -866,9 +880,17 @@ class IdentityImporter(BaseImporter):
             return {}
 
     def _diff_note(self, asset_type: str, unit: dict, payload: dict,
-                   include_members: bool = True) -> str:
+                   include_members: bool = True, members_applied: bool = True) -> str:
         """Name exactly what changed since the last run: what was ADDED, and what was REMOVED IN
         SOURCE (reported, not applied — the object on target keeps it, per the additive stance).
+
+        PLAN 11 Finding-2: the member component is now computed for ACCOUNT/Entra groups too (for
+        DETECTION/reporting — `members_applied=False` for them, since account/Entra-group membership
+        is account-managed and the tool does NOT migrate it). The account branch used to drop the
+        member component entirely, so a membership-only change fell through to the false
+        "no source-side change detected" string — which contradicted the `updated` status that the
+        moved fingerprint had already produced. The granularity needed already exists in
+        `last_source_detail`; no new data is captured.
 
         First run after this column was added has no prior snapshot — degrade to a neutral note
         rather than crash on the null (the baseline is captured this run and diffs work thereafter).
@@ -881,18 +903,40 @@ class IdentityImporter(BaseImporter):
             return "re-applied; prior source detail not recorded (baseline captured this run)"
         cur = self._source_snapshot(asset_type, payload, include_members)
         parts = []
-        for field, label, retained in (
-                ("entitlements", "entitlements", "not removed on target"),
-                ("roles", "roles", "not removed on target"),
-                ("members", "members", "retained on target")):
+        for field, label in (("entitlements", "entitlements"), ("roles", "roles")):
             if field not in cur and field not in prior:
                 continue
             p, c = set(prior.get(field) or []), set(cur.get(field) or [])
             added, removed = sorted(c - p), sorted(p - c)
             if added:
-                parts.append(f"{label} added: {added}")
+                parts.append(f"{label} added: {added} — applied on target (workspace-scoped)")
             if removed:
-                parts.append(f"{label} removed in source ({retained} — review): {removed}")
+                parts.append(f"{label} removed in source ({removed}) — not removed on target (review)")
+        if include_members and ("members" in cur or "members" in prior):
+            p, c = set(prior.get("members") or []), set(cur.get("members") or [])
+            added, removed = sorted(c - p), sorted(p - c)
+            if members_applied:
+                # Workspace-local group: ADDED members are applied (the PATCH-add pass); REMOVED
+                # ones are REPORTED, not applied (retained on target — the additive stance).
+                if added:
+                    parts.append(f"members added: {added} — applied on target")
+                if removed:
+                    parts.append(
+                        f"members removed in source (retained on target — review): {removed}")
+            elif added or removed:
+                # Account/Entra group: the membership change IS detected (this is why the
+                # fingerprint moved and the status is `updated`), but account/Entra-group membership
+                # is account-managed and NOT migrated by this tool.
+                delta = []
+                if added:
+                    delta.append(f"added: {added}")
+                if removed:
+                    delta.append(f"removed: {removed}")
+                parts.append(
+                    f"membership changed in source ({'; '.join(delta)}); account/Entra-group "
+                    f"membership is account-managed — NOT migrated by the tool (present via the "
+                    f"account group in the same account; cross-account, provision via SCIM/Entra). "
+                    f"Workspace entitlements/ACLs re-applied.")
         return "; ".join(parts) if parts else "re-applied; no source-side change detected"
 
     # ── the identity map row ──────────────────────────────────────────────

@@ -7,14 +7,16 @@ List is cursor-paginated (/api/2.0/lakeview/dashboards); per-dashboard detail ca
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, safe_str
+from src.utils.helpers import dab_path_info, folder_natural_key, safe_str
 
 
 class DashboardsCollector(BaseCollector):
     object_type = "lakeview_dashboard"
 
     def natural_key(self, obj: dict) -> str:
-        return safe_str(obj.get("display_name"))
+        # PLAN 11 Finding-9: full path (`<parent_path>/<display_name>`), not the bare display_name,
+        # so two same-named dashboards in different folders don't collapse onto one target object.
+        return folder_natural_key(obj.get("parent_path"), obj.get("display_name"))
 
     def discover(self) -> list[dict]:
         raw = self.client.get_paginated(
@@ -31,7 +33,8 @@ class DashboardsCollector(BaseCollector):
                 self.log.warning("dashboard detail failed", dashboard_id=did, error=str(exc))
             # AI/BI dashboards have NO deployment.kind field (unlike jobs/pipelines); the only
             # DAB signal is the workspace `path` sitting under a `.bundle/` folder (verified live).
-            dab = dab_path_info(full.get("path") or full.get("parent_path"))
+            dab = dab_path_info(full.get("path") or full.get("parent_path"),
+                                getattr(self.config, "dab_bundle_roots", None))
             items.append({
                 "dashboard_id": did,
                 "display_name": safe_str(full.get("display_name") or d.get("display_name")),

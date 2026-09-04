@@ -446,14 +446,14 @@ def test_a_failed_entitlement_patch_does_not_fail_the_identity():
 
 # ── an SP with OAuth secrets is created but flagged degraded ────────────────
 
-def test_an_sp_with_oauth_secrets_yields_a_created_sp_plus_a_manual_secret_task():
-    """PLAN 8 Bug 3: an OAuth-secret SP is CREATED cleanly (the object exists); the un-migratable
-    secret is its OWN standing `manual` unit — not a `created_with_warning` on the SP. That keeps it
-    out of failed_only (Bug 2) and re-emitted every run so the instruction never disappears (Bug 5)."""
+def test_a_workspace_local_sp_with_oauth_secrets_yields_a_created_sp_plus_a_manual_secret_task():
+    """PLAN 8 Bug 3 + PLAN 11 Finding-7: a WORKSPACE-LOCAL SP (recreated with a NEW applicationId)
+    that had a secret is CREATED cleanly; the un-migratable secret is its OWN standing `manual`
+    unit — kept out of failed_only (Bug 2) and re-emitted every run (Bug 5)."""
     client = FakeScimClient()
     imp, _st = _importer(client, [
         _unit("service_principal", "app-1", {"displayName": "sp"},
-              kind="account",
+              kind="workspace_local",
               note="OAuth client secret(s) present — NOT exportable; recreate on target manually.")])
     res = imp.run()
     sp = next(r for r in res.units if r["asset_type"] == "service_principal")
@@ -465,12 +465,29 @@ def test_an_sp_with_oauth_secrets_yields_a_created_sp_plus_a_manual_secret_task(
     assert res.manual >= 1
 
 
+def test_an_account_sp_with_oauth_secrets_emits_NO_manual_secret_task():
+    """PLAN 11 Finding-7: an ACCOUNT-level SP keeps its applicationId and its account-level OAuth
+    secret / UMI credential is intact — assigning it carries the identity, so there is NOTHING to
+    re-issue. A `manual` step here is false work that would sit in the Outstanding sheet forever, so
+    NO `service_principal_secret` unit is emitted (True or unknown has_secrets)."""
+    for note in ("OAuth client secret(s) present — NOT exportable; recreate on target manually.",
+                 "could not verify OAuth secrets (proxy unreachable)"):
+        client = FakeScimClient()
+        imp, _st = _importer(client, [
+            _unit("service_principal", "acct-app", {"displayName": "sp"}, kind="account", note=note)])
+        res = imp.run()
+        assert not any(r["asset_type"] == "service_principal_secret" for r in res.units), \
+            "an account SP must NOT get a manual OAuth-secret task"
+        assert res.manual == 0
+
+
 def test_oauth_secret_manual_task_is_emitted_every_run_independent_of_the_sp_outcome():
-    """PLAN 8 Bug 3: the secret task is driven by the SOURCE note, not by the SP's create/skip
-    outcome, so it is re-emitted on EVERY run and never collapses to a generic 'unchanged' row."""
+    """PLAN 8 Bug 3: the secret task (for a workspace-local SP) is driven by the SOURCE note, not by
+    the SP's create/skip outcome, so it is re-emitted on EVERY run and never collapses to a generic
+    'unchanged' row."""
     def build():
         return _importer(FakeScimClient(), [
-            _unit("service_principal", "app-1", {"displayName": "sp"}, kind="account",
+            _unit("service_principal", "app-1", {"displayName": "sp"}, kind="workspace_local",
                   note="OAuth client secret(s) present — NOT exportable; recreate on target manually.")])
     imp, _ = build()
     secret_units = [u for u in imp.load() if u["asset_type"] == "service_principal_secret"]

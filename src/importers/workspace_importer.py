@@ -31,19 +31,14 @@ from __future__ import annotations
 import base64
 import os
 import posixpath
-from collections import namedtuple
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing
-from src.utils.helpers import safe_str
+from src.importers.base_importer import BaseImporter, HomeResolution, PrerequisiteMissing
+from src.utils.helpers import home_owner, looks_like_app_id, safe_str
 
-# The single decision a `/Users/<owner>/...` path resolves to (PLAN 9). `kind` ∈:
-#   "not_home"      – not under /Users → the caller proceeds unchanged
-#   "skip_root"     – the /Users/<owner> ROOT itself, provisioned not created (no-op)
-#   "remapped_sp"   – owner is a recreated SP (sp_mapping) → /Users/<newAppId>/… (IMP-6)
-#   "normal_home"   – owner's real home exists on target → use it as-is
-#   "backup"        – divert to <backup_root>/<owner>/… (this plan)
-#   "prerequisite"  – owner absent on target and NOT eligible for backup → PrerequisiteMissing
-HomeResolution = namedtuple("HomeResolution", ["target_path", "kind", "note"])
+# The home-resolution seam (`_resolve_home_target`, `_roster_status`, `_home_present`,
+# `_remap_home_path`, `_backup_path`, `_note_path_remap`, `_get_status`) and the HomeResolution
+# tuple now live in base_importer (PLAN 11 Finding-8) so the folder-placed importers share the SAME
+# decision. This importer keeps only the workspace-content-specific `_raise_home_prerequisite`.
 
 # Roots that must never be created: they exist by construction, or are not ours to make.
 _SKIP_ROOTS = ("/Repos", "/Users", "/Shared", "/Workspace")
@@ -85,22 +80,6 @@ def is_user_home(path: str) -> bool:
     return len(parts) == 2 and parts[0] == "Users"
 
 
-def home_owner(path: str) -> str:
-    """The `<principal>` segment of a `/Users/<principal>[/...]` path, else "".
-
-    A service principal's home is `/Users/<applicationId>` (a bare UUID), a user's is
-    `/Users/<email>`. Used to remap an SP home when the SP was recreated with a NEW applicationId.
-    """
-    parts = [seg for seg in safe_str(path).split("/") if seg]
-    return parts[1] if len(parts) >= 2 and parts[0] == "Users" else ""
-
-
-def _looks_like_app_id(owner: str) -> bool:
-    """A UUID-shaped owner is a service principal home; an email is a user home."""
-    o = safe_str(owner)
-    return "@" not in o and o.count("-") == 4 and len(o) >= 32
-
-
 class WorkspaceImporter(BaseImporter):
     component = "workspace"
     asset_types = ("directory", "notebook", "workspace_file", "repo")
@@ -140,13 +119,6 @@ class WorkspaceImporter(BaseImporter):
                 self.context.setdefault("workspace_paths", set()).add(target_path)
         return found
 
-    def _get_status(self, path: str) -> dict:
-        """`workspace/get-status` for a path, or {} if absent. Never raises — absent 404s."""
-        try:
-            return self.client.get("api/2.0/workspace/get-status", params={"path": path}) or {}
-        except Exception:  # noqa: BLE001
-            return {}
-
     # ── create ────────────────────────────────────────────────────────────
     def create_one(self, unit: dict) -> dict:
         asset_type = safe_str(unit.get("asset_type"))
@@ -163,166 +135,6 @@ class WorkspaceImporter(BaseImporter):
                     "note": "a directory has no mutable attributes — nothing to update"}
         return self._upload_content(unit, overwrite=True)
 
-    def _roster_status(self, owner: str) -> str:
-        """Whether a home `owner` segment appears in the SOURCE identity roster (A2, PLAN 9). Cached.
-
-        Reads `identity_classification.json` from the bundle (written at inventory time) once and
-        indexes it by BOTH kinds of home-owner segment: a service principal's applicationId, and a
-        user's `userName` + every email (a user home is `/Users/<userName>`, usually the email).
-        Returns "in_roster" (the identity existed on source but wasn't migrated this run), "absent"
-        (deleted in source — its home content has nowhere to land under /Users/), or "unknown" (the
-        classification file is missing/unreadable, so we cannot tell — never a silent divert).
-        """
-        if not hasattr(self, "_roster_cache"):
-            roster: set[str] = set()
-            have_roster = False
-            try:
-                from src.exporters import bundle_paths as _BP
-                doc = self.staging.read_json(_BP.IDENTITY_CLASSIFICATION_JSON) or {}
-                identities = doc.get("identities")
-                if identities is not None:
-                    have_roster = True
-                    for ident in identities:
-                        itype = safe_str(ident.get("identity_type"))
-                        if itype == "service_principal":
-                            aid = safe_str(ident.get("applicationId"))
-                            if aid:
-                                roster.add(aid)
-                        elif itype == "user":
-                            for k in (ident.get("userName"), ident.get("email")):
-                                if safe_str(k):
-                                    roster.add(safe_str(k))
-                            for e in ident.get("emails") or []:
-                                val = safe_str(e.get("value") if isinstance(e, dict) else e)
-                                if val:
-                                    roster.add(val)
-            except Exception:  # noqa: BLE001 — a missing/garbled file just means "unknown"
-                have_roster = False
-            self._roster_cache = (roster if have_roster else None)
-        cache = self._roster_cache
-        if cache is None:
-            return "unknown"
-        return "in_roster" if safe_str(owner) in cache else "absent"
-
-    def _remap_home_path(self, path: str) -> tuple[str, str]:
-        """Remap a service-principal HOME path from the source appId to the target appId (IMP-6).
-
-        A Databricks-managed SP is recreated on target with a NEW applicationId, but its home path
-        `/Users/<oldAppId>/...` was captured against the source id. Rewrite the owner segment to the
-        new appId (via `sp_mapping`), so the SP's files/notebooks land inside the SP's REAL home on
-        target instead of a `/Users/<oldAppId>` directory that can never exist (that was the two
-        failed dirs). Returns `(remapped_path, note)`; `note` is "" when nothing was remapped.
-
-        Account SPs and users keep their identifier (email / preserved appId), so they never appear
-        in `sp_mapping` and pass through unchanged — only genuinely recreated SPs are rewritten.
-        """
-        owner = home_owner(path)
-        if not (owner and _looks_like_app_id(owner)):
-            return path, ""
-        new_app_id = (self.identity_map.get("sp_mapping") or {}).get(owner, "")
-        if not new_app_id or new_app_id == owner:
-            return path, ""
-        remapped = path.replace(f"/Users/{owner}", f"/Users/{new_app_id}", 1)
-        return remapped, (f"service-principal home remapped {owner} → {new_app_id} "
-                          f"(the SP was recreated with a new applicationId on target)")
-
-    # ── home-presence guard (PLAN 8 Bug 8/14) ────────────────────────────
-    def _home_present(self, home_root: str) -> bool:
-        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?
-
-        One `get-status` per DISTINCT home root, cached — far cheaper than letting every descendant
-        attempt an API call and 400 with DIRECTORY_PROTECTED / parent-missing."""
-        if not home_root:
-            return True
-        cache = getattr(self, "_home_present_cache", None)
-        if cache is None:
-            cache = self._home_present_cache = {}
-        if home_root not in cache:
-            owner = home_owner(home_root)
-            sp_map = self.identity_map.get("sp_mapping") or {}
-            if sp_map.get(owner):
-                # An SP in the identity map (created/adopted this run) has its home auto-provisioned
-                # at SP-create (verified live), so its content lands — don't gate it on a get-status
-                # that could race provisioning. Users are NOT here: a user home appears only on first
-                # login, so it must be probed.
-                cache[home_root] = True
-            else:
-                remapped, _ = self._remap_home_path(home_root)
-                cache[home_root] = bool(self._get_status(remapped))
-        return cache[home_root]
-
-    # ── the ONE home-target resolver (PLAN 9 §4.1) ────────────────────────
-    def _resolve_home_target(self, path: str) -> HomeResolution:
-        """Decide where a `/Users/<owner>/<rest>` path (root OR descendant) should be created.
-
-        This folds the previously-scattered home logic (SP remap IMP-6, presence guard Bug 8/14,
-        and the new orphaned-home divert) into ONE decision. Order:
-          1. owner is a recreated SP (`sp_mapping`) → remap to /Users/<newAppId>/… (IMP-6).
-          2. else owner's real home is present on target → use it as-is.
-          3. else owner absent on target:
-             - `workspace_home_backup` off → prerequisite (today's behaviour).
-             - owner ABSENT from the source roster (deleted in source) → divert to the backup root.
-             - owner in-roster / unknown (identity import failed or pending) → prerequisite; it
-               recovers into the REAL home on retry_mode=failed_only, never a silent divert.
-        """
-        owner = home_owner(path)
-        if not owner:
-            return HomeResolution(path, "not_home", "")
-        home_root = f"/Users/{owner}"
-        is_root = safe_str(path).rstrip("/") == home_root
-
-        # 1. Recreated SP — its home follows the new applicationId (IMP-6).
-        sp_map = self.identity_map.get("sp_mapping") or {}
-        if sp_map.get(owner):
-            remapped, note = self._remap_home_path(path)
-            if is_root:
-                return HomeResolution(
-                    remapped, "skip_root",
-                    f"SP home root — auto-provisioned when the SP was created; {note}"
-                    if note else "SP home root — auto-provisioned when the SP was created")
-            return HomeResolution(remapped, "remapped_sp", note)
-
-        # 2. Owner's real home already provisioned on target → land content there.
-        if self._home_present(home_root):
-            if is_root:
-                return HomeResolution(path, "skip_root",
-                                      "user home directory — already provisioned")
-            return HomeResolution(path, "normal_home", "")
-
-        # 3. Owner absent on target.
-        if not self.config.imports.workspace_home_backup:
-            return HomeResolution(path, "prerequisite", "")
-        roster = self._roster_status(owner)
-        if roster == "absent":
-            backup_path = self._backup_path(path, owner)
-            if _looks_like_app_id(owner):
-                note = (f"owner (service principal) `{owner}` was deleted in source (absent from "
-                        f"the source roster) — its home cannot be recreated under /Users/; content "
-                        f"preserved at `{backup_path}`. Reassign these files to the intended owner "
-                        f"if needed.")
-            else:
-                note = (f"owner `{owner}` was deleted in source (absent from the source roster) — "
-                        f"its home cannot be recreated under /Users/; content preserved at "
-                        f"`{backup_path}`. Reassign these files to the intended owner if needed.")
-            return HomeResolution(backup_path, "backup", note)
-        # in_roster / unknown → the identity import failed or is pending; recover into the real home
-        # on retry, never a silent divert (§2, §7.4).
-        return HomeResolution(path, "prerequisite", "")
-
-    def _note_path_remap(self, source_path: str, target_path: str) -> None:
-        """Record a source→target path divert (SP-home remap OR backup) in the shared context so
-        the ACL phase can attach an orphaned/remapped object's permissions to its ACTUAL target
-        path (PLAN 9 §4.5). Only recorded when the target differs from the source natural key."""
-        if target_path and target_path != source_path:
-            self.context.setdefault("workspace_path_remap", {})[source_path] = target_path
-
-    def _backup_path(self, path: str, owner: str) -> str:
-        """`<backup_root>/<owner>/<path-relative-to-/Users/owner>` (PLAN 9 §4.2)."""
-        home_root = f"/Users/{owner}"
-        rest = safe_str(path)[len(home_root):].lstrip("/")
-        root = safe_str(self.config.imports.workspace_home_backup_root) or "/Users_Backup"
-        return posixpath.join(root, owner, rest) if rest else posixpath.join(root, owner)
-
     def _raise_home_prerequisite(self, path: str) -> None:
         """Raise the actionable `prerequisite_missing` for a home whose owner is absent on target
         and NOT eligible for backup (Bug 8/14 + A2 messaging). Handles the ROOT (SP vs user, with
@@ -333,7 +145,7 @@ class WorkspaceImporter(BaseImporter):
             # The home ROOT itself. Say WHY the owner is missing (A2): distinguish "present in the
             # source roster but not migrated this run" from "deleted in source", because the
             # operator's next step differs.
-            if _looks_like_app_id(owner):
+            if looks_like_app_id(owner):
                 roster = self._roster_status(owner)
                 if roster == "in_roster":
                     why = ("this SP IS present in the source roster but was NOT migrated in this "

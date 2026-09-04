@@ -63,15 +63,47 @@ class MiscCollector(BaseCollector):
             })
         return items
 
+    def _all_purpose_cluster_ids(self):
+        """The set of NON-ephemeral (all-purpose) cluster ids on source, or None if the list could
+        not be read. Mirrors `compute_collector`'s ephemeral exclusion so cluster libraries match
+        how the clusters themselves are inventoried (PLAN 11 Finding-11)."""
+        from src.collectors.compute_collector import _EPHEMERAL_CLUSTER
+        try:
+            raw = self.client.get("api/2.0/clusters/list").get("clusters", []) or []
+        except Exception as exc:  # noqa: BLE001 — unknown → don't filter (keep old behaviour)
+            self.log.warning("clusters/list failed; cluster-library ephemeral filter skipped",
+                             error=str(exc))
+            return None
+        out = set()
+        for c in raw:
+            name = safe_str(c.get("cluster_name"))
+            src = c.get("cluster_source", "")
+            if _EPHEMERAL_CLUSTER.match(name) or src in ("JOB", "PIPELINE", "MODELS"):
+                continue
+            cid = safe_str(c.get("cluster_id"))
+            if cid:
+                out.add(cid)
+        return out
+
     def _cluster_libraries(self) -> list[dict]:
         try:
             raw = self.client.get("api/2.0/libraries/all-cluster-statuses").get("statuses", []) or []
         except Exception as exc:  # noqa: BLE001
             self.log.warning("all-cluster-statuses failed", error=str(exc))
             return []
+        # PLAN 11 Finding-11: `all-cluster-statuses` returns libraries for EVERY cluster, including
+        # the ephemeral job/DLT/model clusters that `compute_collector` deliberately excludes — which
+        # produced ~49 clusters × 3 libs = 147 noisy `skipped_no_object` rows at customer scale (the
+        # libraries live on ephemeral job clusters that are recreated with their own config every
+        # run / DAB redeploy — never installable as standalone). Skip any library whose cluster is
+        # not in the all-purpose set, matching how the clusters themselves are inventoried. None =
+        # the cluster list was unreadable → don't filter (never silently drop everything).
+        allpurpose = self._all_purpose_cluster_ids()
         items = []
         for st in raw:
             cid = safe_str(st.get("cluster_id"))
+            if allpurpose is not None and cid not in allpurpose:
+                continue
             for ls in st.get("library_statuses", []) or []:
                 lib = ls.get("library", {}) or {}
                 items.append({

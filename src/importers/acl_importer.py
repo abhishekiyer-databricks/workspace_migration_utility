@@ -349,7 +349,13 @@ class AclImporter(BaseImporter):
 
     def _absence_reason(self, object_asset_type: str, object_key: str) -> str:
         """WHICH of the seven cases applies — the runtime predicate, not a path check (D17)."""
-        if "/.bundle/" in object_key or object_key.endswith("/.bundle"):
+        # PLAN 11 Finding-12: honour configurable bundle roots — a Team-B bundle rooted at a plain
+        # directory (no `.bundle` segment) is still recognised as DAB-owned, so its ACL reads
+        # `dab_redeploy` (re-run after the redeploy) rather than the generic not_selected.
+        from src.utils.helpers import dab_path_info
+        if ("/.bundle/" in object_key or object_key.endswith("/.bundle")
+                or dab_path_info(object_key,
+                                 getattr(self.config, "dab_bundle_roots", None))["deployed_by_dab"]):
             return "dab_redeploy"
         if object_asset_type == "repo":
             return "repo"

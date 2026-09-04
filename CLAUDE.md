@@ -402,3 +402,28 @@ Found by the first customer-style run (source_ws → target_ws_3, direct mode). 
   joins on. (Both stub notebooks that used to hold this — `05_Validate` and `03_Transform_Review` —
   were deleted in PLAN 7 §B1 since manifest-verify + transforms already run inside `04_Import`; Plan
   4 adds a fresh notebook for the reconciliation/diff when that work is actually built.)
+
+### UC-Volume write durability at customer scale (RRL, 2026-09-03) — see PLAN_11 Finding-6
+First real customer-scale run (Reliance Retail) produced an EMPTY bundle: human reports (xlsx/md)
+present, but `export/`+`misc/` empty, `manifest files=0`, `[Errno 11]` (EAGAIN) on the Volume.
+Reproduced at BOTH 663 MB/1.1M-asset AND 76 MB/17K-asset → **root cause is the WRITE METHOD, not
+size.** All machine files are written via raw `open()` straight to the FUSE `/Volumes` path
+(`artifact_writer.write_json`/`write_bytes`); FUSE buffers and flushes to backing ADLS async, and
+under the customer's networking restrictions that flush fails/stalls → nothing lands. Outputs split
+exactly on write path: `write_text_local_then_copy` (render /tmp → byte-copy: the xlsx reports)
+SURVIVE on RRL's own mount; direct-FUSE writes do NOT. Databricks Support endorsed the local-first
+pattern (write to local disk, then copy into the volume).
+- **THE fix (PLAN_11 Finding-6, OPTIONAL/decide-later):** route EVERY Volume write through the
+  local-first path that already works (render /tmp → `dbutils.fs.cp`/Files API, synchronous commit) +
+  post-write size verification; and FAIL LOUD when inventory.json is absent/short instead of the
+  silent `read_json() or {}` (and stop export from silently re-running the whole inventory).
+- **Environmental quick fix:** the customer runs clusters behind an http_proxy; the SAME
+  `no_proxy = *.azuredatabricks.net,*.databricks.azure.com,169.254.169.254,127.0.0.1` already fixed
+  this customer's UC-Volume writes in the shipped data_processing_framework SFTP job → set it as
+  cluster **Environment variables** (NOT Spark config). Add `.dfs.core.windows.net,.blob.core.windows.net`
+  ONLY if the staging volume is EXTERNAL (managed needs nothing extra — `DESCRIBE VOLUME` to check).
+- **Streaming/sharding is NOT on the roadmap.** It would only matter for a 600 MB+/1M-asset workspace
+  on a small (16 GB) cluster, and that memory dimension is **solved by a larger driver** (64–128 GB)
+  since migrations are infrequent. Kept as a documented last-resort optimization, not planned work.
+  (Note: the ~11h runtime at 1.1M assets was the 852K SERIAL ACL calls — an API-latency problem needing
+  parallel enrichment, NOT solved by RAM and unrelated to streaming; separate future optimization.)

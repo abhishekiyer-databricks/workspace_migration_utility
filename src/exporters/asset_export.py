@@ -175,17 +175,46 @@ _DAB_ROOT_SEGMENT = "/.bundle/"
 _DAB_CONTENT_TYPES = {"notebook", "workspace_file", "directory"}
 
 
-def is_dab_content_path(asset_type: str, natural_key: str) -> bool:
+def _is_configured_bundle_root_dir(key: str, roots) -> bool:
+    """Whether `key` IS a configured bundle-root directory itself (holds bundle state) — the
+    generalisation of the `.bundle` container-dir case for PLAN 11 Finding-12's configurable roots."""
+    import fnmatch
+    from src.utils.helpers import _resolve_dab_roots, normalize_ws_path
+    norm = normalize_ws_path(key)
+    segs = [s for s in norm.split("/") if s]
+    last = segs[-1] if segs else ""
+    for m in _resolve_dab_roots(roots):
+        if m.startswith("/"):
+            if norm == m.rstrip("/"):
+                return True
+        elif last and fnmatch.fnmatch(last, m):
+            return True
+    return False
+
+
+def is_dab_content_path(asset_type: str, natural_key: str, roots=None) -> bool:
     """Whether this unit is workspace content inside a bundle's root folder (never imported).
 
-    Matches the `.bundle` container directory ITSELF as well as everything under it. Testing only
+    Matches the bundle-root container directory ITSELF as well as everything under it. Testing only
     for the `/.bundle/` segment let `/Shared/.bundle` (and `/Users/<email>/.bundle`) fall through
     to `create`, so the one directory that exists purely to hold bundle state read "CREATE on
-    target" while every file inside it correctly read "DAB REDEPLOY"."""
+    target" while every file inside it correctly read "DAB REDEPLOY".
+
+    PLAN 11 Finding-12: the default `.bundle` behaviour below is byte-identical to before; any
+    additional configured `roots` (e.g. a Team-B directory root with no `.bundle` segment) are then
+    matched via `dab_path_info` + the root-dir check, so a team that roots a bundle at a plain
+    directory has its content skipped at export just like a `.bundle` deployment."""
     if safe_str(asset_type) not in _DAB_CONTENT_TYPES:
         return False
     key = safe_str(natural_key)
-    return _DAB_ROOT_SEGMENT in key or key.endswith(_DAB_ROOT_SEGMENT.rstrip("/"))
+    # Fast path — the CLI-standard `.bundle`, unchanged.
+    if _DAB_ROOT_SEGMENT in key or key.endswith(_DAB_ROOT_SEGMENT.rstrip("/")):
+        return True
+    # Finding-12: any additional configured bundle roots (under a root, or the root dir itself).
+    from src.utils.helpers import dab_path_info
+    if dab_path_info(key, roots)["deployed_by_dab"]:
+        return True
+    return _is_configured_bundle_root_dir(key, roots)
 
 
 # Git repos: inventoried + exported as metadata, never imported (customer 2026-08-05, §6a).
@@ -198,15 +227,17 @@ DAB_CONTENT_NOTE = ("inside a DAB bundle root — exported for reference but NOT
                     "(importing bundle state would point the bundle at source-workspace ids)")
 
 
-def dab_bundle_root(natural_key: str) -> str:
+def dab_bundle_root(natural_key: str, roots=None) -> str:
     """`/Shared/.bundle/my_bundle` for any path inside it, else "" — one row per bundle in the
-    manual-actions report, rather than one per file."""
+    manual-actions report, rather than one per file. Finding-12: the default `.bundle` grouping is
+    unchanged; a configured non-`.bundle` root falls back to `dab_path_info`'s bundle_root."""
     key = safe_str(natural_key)
     idx = key.find(_DAB_ROOT_SEGMENT)
-    if idx < 0:
-        return ""
-    after = key[idx + len(_DAB_ROOT_SEGMENT):].split("/")
-    return key[:idx] + _DAB_ROOT_SEGMENT + (after[0] if after else "")
+    if idx >= 0:
+        after = key[idx + len(_DAB_ROOT_SEGMENT):].split("/")
+        return key[:idx] + _DAB_ROOT_SEGMENT + (after[0] if after else "")
+    from src.utils.helpers import dab_path_info
+    return dab_path_info(key, roots).get("bundle_root", "") or ""
 
 
 def derive_import_action(unit: dict) -> str:

@@ -294,13 +294,24 @@ def test_misc():
     from src.collectors.misc_collector import MiscCollector
     gt = {"api/2.0/global-init-scripts": {"scripts": [{"script_id": "g1", "name": "gis", "position": 0, "enabled": True}]},
           "api/2.0/global-init-scripts/g1": {"script": "ZWNobw=="},
-          "api/2.0/libraries/all-cluster-statuses": {"statuses": [{"cluster_id": "c1", "library_statuses": [{"library": {"pypi": {"package": "requests"}}, "status": "INSTALLED"}]}]},
+          # PLAN 11 Finding-11: an all-purpose cluster (c1) AND an ephemeral job cluster (c-job).
+          "api/2.0/clusters/list": {"clusters": [
+              {"cluster_id": "c1", "cluster_name": "team-etl", "cluster_source": "UI"},
+              {"cluster_id": "c-job", "cluster_name": "job-99-run-1", "cluster_source": "JOB"}]},
+          "api/2.0/libraries/all-cluster-statuses": {"statuses": [
+              {"cluster_id": "c1", "library_statuses": [{"library": {"pypi": {"package": "requests"}}, "status": "INSTALLED"}]},
+              {"cluster_id": "c-job", "library_statuses": [{"library": {"pypi": {"package": "aiohttp"}}, "status": "INSTALLED"}]}]},
           "api/2.0/workspace-conf": lambda p: {p["keys"]: "true"}}
     objs = _run_ok(MiscCollector(FakeClient(get_table=gt), _cfg()))
     # IP access lists are EXCLUDED (account-level, not a workspace asset).
     assert {o["misc_type"] for o in objs} == {"global_init_script", "cluster_library", "workspace_conf"}
     assert not any(o["misc_type"] == "ip_access_list" for o in objs)
     assert any(o["misc_type"] == "workspace_conf" and o["key"] == "enableTokensConfig" for o in objs)
+    # Finding-11: the all-purpose cluster's library is collected; the ephemeral job cluster's is NOT.
+    libs = [o for o in objs if o["misc_type"] == "cluster_library"]
+    assert len(libs) == 1 and libs[0]["cluster_id"] == "c1"
+    assert not any(o.get("cluster_id") == "c-job" for o in libs), \
+        "a library on an ephemeral job cluster must not be inventoried (Finding-11)"
 
 
 def test_workspace_special_paths_and_git_folders():

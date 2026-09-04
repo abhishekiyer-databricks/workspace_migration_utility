@@ -9,7 +9,7 @@ alert surface; legacy-alert creation is disabled): /api/2.0/alerts. natural_key 
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, safe_str
+from src.utils.helpers import dab_path_info, folder_natural_key, safe_str
 
 
 class SqlCollector(BaseCollector):
@@ -74,11 +74,16 @@ class SqlCollector(BaseCollector):
                 # GET-by-id so the query can be recreated in its SOURCE workspace folder rather than
                 # silently at the workspace root.
                 self._enrich_query_parent_path(o, oid)
+            # PLAN 11 Finding-9: key by the FULL path (`<parent_path>/<name>`), not the bare name —
+            # otherwise N distinct same-named queries (all "New query") collapse onto ONE target
+            # object and N-1 are silently lost. Falls back to name/oid when parent_path is absent
+            # (legacy alerts/dashboards from the LIST carry no path).
+            parent = o.get("parent_path") or o.get("parent")
             item = {
                 "sql_type": sql_type,   # legacy_query / legacy_alert / legacy_dashboard
                 "id": oid,
                 "name": name,
-                "_natural_key": name or oid,
+                "_natural_key": folder_natural_key(parent, name) or oid,
                 "acl": self.fetch_acl(perm_type, oid),   # ACLs (Plan 1a §1)
                 "_raw": o,
             }
@@ -86,7 +91,8 @@ class SqlCollector(BaseCollector):
             # (only Alerts V2 is) → always Manual. Legacy dashboards can be DAB-deployed and
             # carry a `parent` path, so classify those.
             if kind == "dashboards":
-                dab = dab_path_info(o.get("parent") or o.get("parent_path"))
+                dab = dab_path_info(o.get("parent") or o.get("parent_path"),
+                                    getattr(self.config, "dab_bundle_roots", None))
             else:
                 dab = {"deployed_by_dab": False, "dab_scope": ""}
             item["deployed_by_dab"] = dab["deployed_by_dab"]
@@ -134,12 +140,16 @@ class SqlCollector(BaseCollector):
             name = safe_str(full.get("display_name") or o.get("display_name") or o.get("name"))
             # Alerts V2 IS a DAB resource type; a bundle-deployed one sits under `.bundle/`
             # (exposed via `parent_path`). Hand-made alerts return no parent_path → Manual.
-            dab = dab_path_info(full.get("parent_path") or o.get("parent_path"))
+            dab = dab_path_info(full.get("parent_path") or o.get("parent_path"),
+                                getattr(self.config, "dab_bundle_roots", None))
+            parent = full.get("parent_path") or o.get("parent_path")
             items.append({
                 "sql_type": "alert",   # Alerts V2 (vs legacy_alert)
                 "id": oid,
                 "name": name,
-                "_natural_key": name or oid,
+                # Finding-9: full-path key so two same-named alerts in different folders stay
+                # distinct (falls back to name when parent_path is absent).
+                "_natural_key": folder_natural_key(parent, name) or oid,
                 "parent_path": safe_str(full.get("parent_path") or o.get("parent_path")),
                 "deployed_by_dab": dab["deployed_by_dab"],
                 "dab_scope": dab["dab_scope"],

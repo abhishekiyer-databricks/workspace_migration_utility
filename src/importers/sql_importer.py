@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.importers.base_importer import BaseImporter, UnsupportedOperation
+from src.importers.base_importer import BaseImporter, HardRemapFailure, UnsupportedOperation
 from src.utils.helpers import safe_str
 
 # The v1 alert `op` vocabulary. The modern `condition.op` uses words; v1 wants symbols.
@@ -65,16 +65,22 @@ class SqlImporter(BaseImporter):
 
         # Queries and alerts are cursor APIs, and a truncated list here means a DUPLICATE query on
         # every re-run — so both go through the paginating helper rather than a bare get.
+        # PLAN 11 Finding-9: these are keyed by the FULL PATH now, but the LIST omits parent_path,
+        # so matching goes through `folder_existing_keys` (id-anchor via state + collapse-safe
+        # unique-name adoption) rather than a `{display_name: id}` map that collapsed same-named
+        # objects onto one target.
         queries = self.client.get_paginated("api/2.0/sql/queries", "results",
                                             params={"page_size": 100})
-        q_found = {safe_str(q.get("display_name") or q.get("name")): safe_str(q.get("id"))
-                   for q in queries if (q.get("display_name") or q.get("name"))}
+        q_list = [{"_name": safe_str(q.get("display_name") or q.get("name")),
+                   "id": safe_str(q.get("id"))} for q in queries]
+        q_found = self.folder_existing_keys("legacy_query", q_list, "_name", "id")
         self.context.setdefault("legacy_query_target_ids", {}).update(q_found)
         out.update(q_found)
 
         alerts = self.client.get_paginated("api/2.0/alerts", "results", params={"page_size": 100})
-        a_found = {safe_str(a.get("display_name") or a.get("name")): safe_str(a.get("id"))
-                   for a in alerts if (a.get("display_name") or a.get("name"))}
+        a_list = [{"_name": safe_str(a.get("display_name") or a.get("name")),
+                   "id": safe_str(a.get("id"))} for a in alerts]
+        a_found = self.folder_existing_keys("alert_v2", a_list, "_name", "id")
         self.context.setdefault("alert_v2_target_ids", {}).update(a_found)
         out.update(a_found)
 
@@ -103,14 +109,21 @@ class SqlImporter(BaseImporter):
                              self._warehouse_body(payload, unit))
             return {"target_id": target_id}
         if asset_type == "legacy_query":
-            self.client.post(f"api/2.0/sql/queries/{target_id}",
-                             {"query": self._query_body(payload)})
+            # PLAN 11 Finding-9 Bug A: UPDATE is `PATCH /api/2.0/sql/queries/{id}` with an
+            # `update_mask` — the modern Queries API. `POST /api/2.0/sql/queries/{id}` (the old
+            # Redash `/preview/sql/queries/{id}` convention) does NOT exist on modern workspaces and
+            # 404s ENDPOINT_NOT_FOUND, so every legacy_query update silently failed. CREATE stays a
+            # POST with no id (correct). The mask names exactly the fields the body carries.
+            body, _res = self._query_body(payload)
+            self.client.patch(f"api/2.0/sql/queries/{target_id}",
+                              {"query": body, "update_mask": ",".join(sorted(body.keys()))})
             return {"target_id": target_id}
         if asset_type == "legacy_alert":
             self.client.put(f"api/2.0/sql/alerts/{target_id}", self._legacy_alert_body(payload))
             return {"target_id": target_id}
         if asset_type == "alert_v2":
-            self.client.patch(f"api/2.0/alerts/{target_id}", self._alert_v2_body(payload))
+            body, _res = self._alert_v2_body(payload)
+            self.client.patch(f"api/2.0/alerts/{target_id}", body)
             return {"target_id": target_id}
         return {"target_id": target_id}
 
@@ -133,7 +146,7 @@ class SqlImporter(BaseImporter):
 
     # ── legacy queries ────────────────────────────────────────────────────
     def _create_query(self, unit: dict) -> dict:
-        body = self._query_body(unit.get("payload") or {})
+        body, res = self._query_body(unit.get("payload") or {})
         try:
             created = self.client.post("api/2.0/sql/queries", {"query": body})
         except Exception as exc:  # noqa: BLE001
@@ -142,16 +155,20 @@ class SqlImporter(BaseImporter):
         qid = safe_str(created.get("id"))
         self.context.setdefault("legacy_query_target_ids", {})[self.natural_key(unit)] = qid
         parent = safe_str(body.get("parent_path"))
+        # PLAN 11 Finding-8: an orphaned owner's query is preserved under the backup root as
+        # created_with_warning (parity with notebooks), never a hard prerequisite_missing failure.
+        if res.kind == "backup":
+            return {"target_id": qid, "warning": res.note}
         return {"target_id": qid, "note": f"created in {parent}" if parent else ""}
 
-    def _query_body(self, payload: dict) -> dict:
+    def _query_body(self, payload: dict):
         body = dict(payload)
         # PLAN 8 Bug 7: PRESERVE + remap `parent_path` so the query lands in its SOURCE folder. It
         # used to be popped, which dropped every query at the workspace root (the object was
         # `Created` but never appeared in the user's/target directory tree).
-        self.remap_parent_path(body)
-        self._remap_warehouse(body)
-        return body
+        res = self.remap_parent_path(body)
+        self._remap_warehouse(body, referenced_by=f"query `{safe_str(body.get('display_name'))}`")
+        return body, res
 
     # ── alerts ────────────────────────────────────────────────────────────
     def _create_legacy_alert(self, unit: dict) -> dict:
@@ -180,26 +197,23 @@ class SqlImporter(BaseImporter):
                 "note": "legacy (v1) alert — its `condition` was translated to the v1 `options` shape"}
 
     def _legacy_alert_body(self, payload: dict) -> dict:
-        """Remap the alert's QUERY id — an alert holding a source query id is inert on target."""
+        """Remap the alert's QUERY id — an alert holding a source query id is inert on target.
+
+        Finding-10: exact-or-fail-loud. A source query in the bundle but not yet on target is a
+        retryable prerequisite; one not in the bundle at all is a hard failure — never a silent
+        keep-dangling."""
         body = dict(payload)
         src_query = safe_str(body.get("query_id"))
         if src_query:
-            target_id, key = self.remap_id("legacy_query", src_query)
-            if target_id:
-                body["query_id"] = target_id
-            else:
-                self.result.warnings.append(
-                    f"legacy alert references source query {src_query!r}"
-                    + (f" ({key!r})" if key else "")
-                    + " which has no target equivalent — import the sql family first, then re-run "
-                      "with retry_mode=failed_only")
-        self._remap_warehouse(body)
+            body["query_id"] = self.require_remap("legacy_query", src_query,
+                                                  referenced_by=f"legacy alert `{safe_str(body.get('name'))}`")
+        self._remap_warehouse(body, referenced_by=f"legacy alert `{safe_str(body.get('name'))}`")
         return body
 
     def _create_alert_v2(self, unit: dict) -> dict:
         # Verified against the SDK's `create_alert`: /api/2.0/alerts takes the AlertV2 body FLAT,
         # NOT wrapped in {"alert": ...} the way legacy queries are.
-        body = self._alert_v2_body(unit.get("payload") or {})
+        body, res = self._alert_v2_body(unit.get("payload") or {})
         try:
             created = self.client.post("api/2.0/alerts", body)
         except Exception as exc:  # noqa: BLE001
@@ -207,45 +221,43 @@ class SqlImporter(BaseImporter):
             raise
         aid = safe_str(created.get("id"))
         self.context.setdefault("alert_v2_target_ids", {})[self.natural_key(unit)] = aid
+        if res.kind == "backup":
+            return {"target_id": aid, "warning": res.note}   # Finding-8: orphan-owner divert
         return {"target_id": aid}
 
-    def _alert_v2_body(self, payload: dict) -> dict:
+    def _alert_v2_body(self, payload: dict):
         body = dict(payload)
         # PLAN 8 Bug 7: keep + remap `parent_path` (was popped) so the alert lands in its folder.
         # PLAN 8 Bug 10: `evaluation` + `schedule` (both REQUIRED by create) now travel because the
         # collector enriches the shallow LIST via GET-by-id — nothing to add here beyond remaps.
-        self.remap_parent_path(body)
-        self._remap_warehouse(body)
-        return body
+        res = self.remap_parent_path(body)
+        self._remap_warehouse(body, referenced_by=f"alert `{safe_str(body.get('display_name'))}`")
+        return body, res
 
     # ── shared ────────────────────────────────────────────────────────────
-    def _remap_warehouse(self, body: dict) -> None:
-        """Remap `warehouse_id` (and the legacy `data_source_id` spelling) onto a target warehouse.
+    def _remap_warehouse(self, body: dict, referenced_by: str = "") -> None:
+        """Remap `warehouse_id` (and the legacy `data_source_id` spelling) onto the target warehouse
+        THIS TOOL created for the source one — exact or fail loud (PLAN 11 Finding-10).
 
-        A stale source warehouse id leaves the object existing but unable to run, so an unresolvable
-        one is never left in place silently. Falling back to an existing target warehouse keeps the
-        object RUNNABLE, which is more useful than a query that errors on open — and the substitution
-        is reported so the operator can re-point it deliberately.
+        Lift-and-shift: the ONLY legitimate remap is source-warehouse → the warehouse we recreated
+        for it. A source warehouse in the bundle but not yet on target is a retryable prerequisite;
+        one NOT in the bundle is a hard failure. The old "point it at any existing warehouse to keep
+        it runnable" substitution is GONE — it made an object look migrated while silently querying a
+        DIFFERENT warehouse (exactly the row-6 alert case).
         """
+        remapped_any = False
         for field in ("warehouse_id", "data_source_id"):
+            if field not in body:
+                continue
             src = safe_str(body.get(field))
             if not src:
-                continue
-            target_id, key = self.remap_id("sql_warehouse", src)
-            if target_id:
-                body[field] = target_id
-                continue
-            fallback = next(iter((self.context.get("sql_warehouse_target_ids") or {}).values()), "")
-            if fallback:
-                body[field] = fallback
-                self.result.warnings.append(
-                    f"{field} pointed at source warehouse {src!r}"
-                    + (f" ({key!r})" if key else "")
-                    + f", which is not on target, so it was pointed at an existing warehouse "
-                      f"({fallback}) to keep the object runnable — re-point it if that is not the "
-                      f"warehouse you want.")
-            else:
-                body.pop(field, None)
-                self.result.warnings.append(
-                    f"{field}={src!r} could not be remapped and the target has NO warehouse at all "
-                    f"— the object was created without one and will not run until you attach one.")
+                continue      # empty sibling field; the no-warehouse check below decides
+            body[field] = self.require_remap("sql_warehouse", src, referenced_by=referenced_by)
+            remapped_any = True
+        # An object that CARRIES a warehouse field but it is blank has no warehouse configured on
+        # source — a conscious hard failure (row-6), not a silent create-without-a-warehouse.
+        if not remapped_any and any(f in body for f in ("warehouse_id", "data_source_id")):
+            raise HardRemapFailure(
+                f"{referenced_by or 'this object'} has an empty warehouse_id — no warehouse is "
+                f"configured on source, so there is nothing to remap. Configure it on source and "
+                f"re-export (lift-and-shift does not substitute a warehouse).")

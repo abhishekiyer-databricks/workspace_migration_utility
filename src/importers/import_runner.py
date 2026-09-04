@@ -427,6 +427,21 @@ class ImportRunner:
 
     def _write_reports(self, summary: dict) -> None:
         from src.reports.import_report import write_import_reports
+        # PLAN 11 Finding-4: hand the report the CUMULATIVE outstanding items from the STATE TABLE
+        # for this pair (across ALL runs), so the "Outstanding" sheet shows everything not yet
+        # migrated — old carry-overs AND new — regardless of whether this run touched it.
+        if self.state is not None and self.state.enabled:
+            try:
+                outstanding = self.state.outstanding_rows()
+                self.context["outstanding"] = outstanding
+                buckets: dict = {}
+                for r in outstanding:
+                    a = safe_str(r.get("last_action"))
+                    buckets[a] = buckets.get(a, 0) + 1
+                _LOG.info("outstanding (cumulative, from state table)",
+                          total=len(outstanding), **buckets)
+            except Exception as exc:  # noqa: BLE001 — reporting must not fail the run
+                _LOG.warning("could not read outstanding rows from state", error=str(exc))
         # Record the ACTUAL report paths written (they vary: dry_run / retry_<ts> / canonical) so
         # the notebook reads back the files this run produced rather than a stale canonical name.
         summary["reports"] = write_import_reports(

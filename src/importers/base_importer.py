@@ -32,8 +32,10 @@ error classification, reporting — lives here so it is written once and behaves
 """
 from __future__ import annotations
 
+import posixpath
 import time
 from abc import ABC, abstractmethod
+from collections import Counter, namedtuple
 from typing import Any, Optional
 
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
@@ -41,8 +43,21 @@ from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATE
                                    ACTION_SKIPPED, ACTION_SKIPPED_NO_OBJECT, ACTION_UPDATED,
                                    CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_SUPPORTED,
                                    CAT_PERMISSION_DENIED, CAT_PREREQUISITE_MISSING, UpsertAction)
-from src.utils.helpers import safe_str
+from src.utils.helpers import (folder_natural_key, home_owner, looks_like_app_id, normalize_ws_path,
+                               safe_str)
 from src.utils.logger import get_logger
+
+# The single decision a `/Users/<owner>/...` path resolves to (PLAN 9, lifted here in PLAN 11
+# Finding-8 so the workspace importer AND the four folder-placed importers — SQL queries/alerts,
+# Lakeview dashboards, Genie spaces — share ONE home-resolution decision instead of a second,
+# divergent copy). `kind` ∈:
+#   "not_home"      – not under /Users → the caller proceeds unchanged
+#   "skip_root"     – the /Users/<owner> ROOT itself, provisioned not created (no-op)
+#   "remapped_sp"   – owner is a recreated SP (sp_mapping) → /Users/<newAppId>/… (IMP-6)
+#   "normal_home"   – owner's real home exists on target → use it as-is
+#   "backup"        – divert to <backup_root>/<owner>/… (orphaned/deleted-in-source owner)
+#   "prerequisite"  – owner absent on target and NOT eligible for backup → wait / recover on retry
+HomeResolution = namedtuple("HomeResolution", ["target_path", "kind", "note"])
 
 # Flush the checkpoint every N units. Every write to a UC Volume is a FULL-file rewrite (verified
 # live — memory `uc-volume-file-io-limits`), so per-item flushing is O(n²) bytes; one flush at the
@@ -110,6 +125,16 @@ class PrerequisiteMissing(RuntimeError):
     """
 
 
+class HardRemapFailure(RuntimeError):
+    """A reference to an object that is NOT in the bundle at all — the `("", "")` case of
+    `remap_id`, and a HARD, non-retryable failure (PLAN 11 Finding-10, the lift-and-shift rule).
+
+    Distinct from PrerequisiteMissing so `retry_mode=failed_only` does NOT sweep it up (retrying
+    forever against an object that will never appear is noise, not recovery). Classified
+    `dependency_unresolved`; the raiser writes the actionable message, passed through verbatim.
+    """
+
+
 class SkippedNoObject(RuntimeError):
     """A declarative apply (an ACL) whose TARGET OBJECT does not exist (§6b-i, D23).
 
@@ -150,6 +175,8 @@ def classify_error(exc: Exception) -> tuple[str, str]:
     # actionable text — pass through verbatim.
     if isinstance(exc, PrerequisiteMissing):
         return CAT_PREREQUISITE_MISSING, raw
+    if isinstance(exc, HardRemapFailure):
+        return CAT_DEPENDENCY_UNRESOLVED, raw
     if isinstance(exc, UnsupportedOperation):
         return CAT_NOT_SUPPORTED, raw
     for marker, category, hint in _ERROR_MAP:
@@ -380,28 +407,84 @@ class BaseImporter(ABC):
             return "", ""
         return safe_str(self.target_id_map(asset_type).get(key, "")), key
 
-    def remap_parent_path(self, body: dict) -> None:
+    def folder_existing_keys(self, asset_type: str, target_list: list, name_key: str,
+                             id_key: str) -> dict:
+        """Collapse-proof `{source_natural_key: target_id}` for a folder-placed family whose LIST
+        API omits `parent_path` (PLAN 11 Finding-9 §3).
+
+        The natural key is the SOURCE full path (`<parent>/<name>`), but the target LIST only gives
+        a name, so matching on name would re-collapse distinct same-named objects. Two mechanisms,
+        neither of which can collapse:
+          1. **id-anchor (primary)** — the state row (keyed by the SOURCE full path) stores the
+             EXACT target object id; if that id still exists on target, the object is present.
+          2. **first-run adoption by name** — applied ONLY when the leaf name is unique on BOTH the
+             bundle side AND the target side, so it can never map two source objects to one target.
+        Everything unmatched falls through to CREATE, which (on distinct keys) yields distinct
+        objects rather than one overwrite.
+        """
+        present_ids = {safe_str(o.get(id_key)) for o in target_list if o.get(id_key)}
+        units = self.units_by_type.get(asset_type, []) or []
+        found: dict = {}
+
+        if self.state is not None:
+            for unit in units:
+                key = self.natural_key(unit)
+                tid = safe_str(self.state.get_target_id(asset_type, key))
+                if tid and tid in present_ids:
+                    found[key] = tid
+
+        def _leaf(k: str) -> str:
+            return k.rsplit("/", 1)[-1] if "/" in k else k
+
+        src_counts = Counter(_leaf(self.natural_key(u)) for u in units)
+        tgt_counts = Counter(safe_str(o.get(name_key)) for o in target_list)
+        tgt_by_name = {safe_str(o.get(name_key)): safe_str(o.get(id_key)) for o in target_list}
+        for unit in units:
+            key = self.natural_key(unit)
+            if key in found:
+                continue
+            name = _leaf(key)
+            if name and src_counts[name] == 1 and tgt_counts.get(name) == 1 and tgt_by_name.get(name):
+                found[key] = tgt_by_name[name]
+        return found
+
+    def remap_parent_path(self, body: dict) -> HomeResolution:
         """Preserve + remap an asset's workspace FOLDER (`parent_path`) in place (PLAN 8 Bug 7 and
         its Lakeview/Genie siblings). Shared by SQL queries/alerts, Lakeview dashboards and Genie
         spaces — each is otherwise created at the API DEFAULT location instead of its source folder
         (a user-created dashboard's `.lvdash.json` must land back in the user's directory).
 
-        Normalises the read API's `/Workspace` prefix and remaps a recreated SP's home segment
-        (`/Users/<oldAppId>` → `/Users/<newAppId>`), matching the workspace-content path remap. An
+        Normalises the read API's `/Workspace` prefix and routes the folder through the SAME
+        home-resolution decision as workspace content (`_resolve_home_target`, PLAN 11 Finding-8):
+          • recreated-SP home → `/Users/<newAppId>/…` (IMP-6);
+          • ORPHANED owner (deleted-in-source, absent from the roster) → diverted to the backup root,
+            the divert recorded so the create records `created_with_warning` and a re-run ADOPTS the
+            already-migrated object rather than re-creating it;
+          • an in-roster / unknown owner whose home isn't present yet → the SOURCE path is kept, so
+            the create 404s and `missing_parent_prerequisite` files a clean, retryable prerequisite
+            (unchanged reactive behaviour — never a proactive divert into backup).
+        Returns the HomeResolution so the caller can surface a backup divert as a warning. An
         empty/absent path is dropped so the body is clean."""
-        path = safe_str(body.get("parent_path"))
-        if not path:
+        raw = safe_str(body.get("parent_path"))
+        if not raw:
             body.pop("parent_path", None)
-            return
-        if path.startswith("/Workspace/"):
-            path = path[len("/Workspace"):]        # "/Workspace/Users/x" → "/Users/x"
-        parts = path.split("/")
-        if len(parts) >= 3 and parts[1] == "Users":
-            new_owner = (self.identity_map.get("sp_mapping") or {}).get(parts[2])
-            if new_owner and new_owner != parts[2]:
-                parts[2] = new_owner
-                path = "/".join(parts)
-        body["parent_path"] = path
+            return HomeResolution("", "not_home", "")
+        res = self._resolve_home_target(raw)
+        if res.kind == "backup":
+            # Divert to the backup root, ensure the folder exists (the create APIs for these
+            # families do NOT auto-provision a parent, unlike workspace/import+mkdirs), and record
+            # the source→target divert so the ACL phase / a re-run can find the object.
+            body["parent_path"] = res.target_path
+            self._ensure_folder(res.target_path)
+            self._note_path_remap(normalize_ws_path(raw), res.target_path)
+        else:
+            # not_home / normal_home / remapped_sp / skip_root / prerequisite: the resolved path IS
+            # the source path for everything except an SP-home remap; prerequisite keeps the source
+            # path on purpose so a genuinely-missing parent 404s into missing_parent_prerequisite.
+            body["parent_path"] = res.target_path or normalize_ws_path(raw)
+            if res.kind == "remapped_sp":
+                self._note_path_remap(normalize_ws_path(raw), res.target_path)
+        return res
 
     def missing_parent_prerequisite(self, exc: Exception, parent_path, natural_key: str) -> None:
         """Turn a create's "parent folder does not exist" into a clean prerequisite (the path is NOT
@@ -412,6 +495,198 @@ class BaseImporter(ABC):
                 f"`{natural_key}` targets workspace folder `{parent_path}`, which does not exist on "
                 f"target yet — provision/assign its owner (a user home is created on first login) or "
                 f"import the folder's content family first, then re-run with retry_mode=failed_only.")
+
+    # ── the shared home-target resolver (PLAN 9 / PLAN 11 Finding-8) ───────
+    # ONE copy, used by the workspace importer (content) AND the folder-placed importers (SQL
+    # queries/alerts, Lakeview dashboards, Genie spaces). The decision — SP-home remap, present-home
+    # passthrough, orphaned-home divert, or prerequisite — must be identical everywhere, or an
+    # orphaned owner's query would hard-fail while their notebook is preserved.
+    def _get_status(self, path: str) -> dict:
+        """`workspace/get-status` for a path, or {} if absent. Never raises — absent 404s."""
+        try:
+            return self.client.get("api/2.0/workspace/get-status", params={"path": path}) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _roster_status(self, owner: str) -> str:
+        """Whether a home `owner` segment appears in the SOURCE identity roster (PLAN 9 A2). Cached.
+
+        Reads `identity_classification.json` from the bundle once and indexes it by BOTH kinds of
+        home-owner segment: a service principal's applicationId, and a user's userName + every
+        email. Returns "in_roster" (existed on source, not migrated this run), "absent" (deleted in
+        source — its home content has nowhere to land under /Users/), or "unknown" (the file is
+        missing/unreadable, so we cannot tell — never a silent divert)."""
+        if not hasattr(self, "_roster_cache"):
+            roster: set = set()
+            have_roster = False
+            try:
+                from src.exporters import bundle_paths as _BP
+                doc = self.staging.read_json(_BP.IDENTITY_CLASSIFICATION_JSON) or {}
+                identities = doc.get("identities")
+                if identities is not None:
+                    have_roster = True
+                    for ident in identities:
+                        itype = safe_str(ident.get("identity_type"))
+                        if itype == "service_principal":
+                            aid = safe_str(ident.get("applicationId"))
+                            if aid:
+                                roster.add(aid)
+                        elif itype == "user":
+                            for k in (ident.get("userName"), ident.get("email")):
+                                if safe_str(k):
+                                    roster.add(safe_str(k))
+                            for e in ident.get("emails") or []:
+                                val = safe_str(e.get("value") if isinstance(e, dict) else e)
+                                if val:
+                                    roster.add(val)
+            except Exception:  # noqa: BLE001 — a missing/garbled file just means "unknown"
+                have_roster = False
+            self._roster_cache = (roster if have_roster else None)
+        cache = self._roster_cache
+        if cache is None:
+            return "unknown"
+        return "in_roster" if safe_str(owner) in cache else "absent"
+
+    def _remap_home_path(self, path: str) -> tuple:
+        """Remap a service-principal HOME path from the source appId to the target appId (IMP-6).
+
+        Returns `(remapped_path, note)`; `note` is "" when nothing was remapped. Account SPs and
+        users keep their identifier (email / preserved appId), so they never appear in `sp_mapping`
+        and pass through unchanged — membership in `sp_mapping` IS the "recreated SP" signal (a
+        genuine appId is UUID-shaped, but the map, not the shape, is what decides the remap)."""
+        owner = home_owner(path)
+        if not owner:
+            return normalize_ws_path(path), ""
+        new_app_id = (self.identity_map.get("sp_mapping") or {}).get(owner, "")
+        if not new_app_id or new_app_id == owner:
+            return normalize_ws_path(path), ""
+        remapped = normalize_ws_path(path).replace(f"/Users/{owner}", f"/Users/{new_app_id}", 1)
+        return remapped, (f"service-principal home remapped {owner} → {new_app_id} "
+                          f"(the SP was recreated with a new applicationId on target)")
+
+    def _home_present(self, home_root: str) -> bool:
+        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?"""
+        if not home_root:
+            return True
+        cache = getattr(self, "_home_present_cache", None)
+        if cache is None:
+            cache = self._home_present_cache = {}
+        if home_root not in cache:
+            owner = home_owner(home_root)
+            sp_map = self.identity_map.get("sp_mapping") or {}
+            if sp_map.get(owner):
+                cache[home_root] = True   # an SP's home is auto-provisioned at SP-create
+            else:
+                remapped, _ = self._remap_home_path(home_root)
+                cache[home_root] = bool(self._get_status(remapped))
+        return cache[home_root]
+
+    def _backup_path(self, path: str, owner: str) -> str:
+        """`<backup_root>/<owner>/<path-relative-to-/Users/owner>` (PLAN 9 §4.2)."""
+        norm = normalize_ws_path(path)
+        home_root = f"/Users/{owner}"
+        rest = norm[len(home_root):].lstrip("/")
+        root = safe_str(getattr(self.config.imports, "workspace_home_backup_root", "")) \
+            or "/Users_Backup"
+        return posixpath.join(root, owner, rest) if rest else posixpath.join(root, owner)
+
+    def _note_path_remap(self, source_path: str, target_path: str) -> None:
+        """Record a source→target path divert (SP-home remap OR backup) in the shared context so
+        the ACL phase can attach an orphaned/remapped object's permissions to its ACTUAL target
+        path (PLAN 9 §4.5). Only recorded when the target differs from the source natural key."""
+        if target_path and target_path != source_path:
+            self.context.setdefault("workspace_path_remap", {})[source_path] = target_path
+
+    def _ensure_folder(self, path: str) -> None:
+        """`mkdirs` a folder best-effort (idempotent). Used to provision a backup divert folder so a
+        folder-placed create does not 404 on a missing parent."""
+        if not path:
+            return
+        try:
+            self.client.post("api/2.0/workspace/mkdirs", {"path": path})
+        except Exception:  # noqa: BLE001 — idempotent; a real problem resurfaces on the create
+            pass
+
+    def _resolve_home_target(self, path: str) -> HomeResolution:
+        """Decide where a `/Users/<owner>/<rest>` path (root OR descendant) should be created.
+
+        Folds the home logic (SP remap IMP-6, presence guard, orphaned-home divert) into ONE
+        decision (PLAN 9 §4.1; lifted to the base class in PLAN 11 Finding-8). Order:
+          1. owner is a recreated SP (`sp_mapping`) → remap to /Users/<newAppId>/… (IMP-6).
+          2. else owner's real home is present on target → use it as-is.
+          3. else owner absent on target:
+             - `workspace_home_backup` off → prerequisite (the pre-PLAN-9 behaviour).
+             - owner ABSENT from the source roster (deleted in source) → divert to the backup root.
+             - owner in-roster / unknown → prerequisite; recovers into the REAL home on
+               retry_mode=failed_only, never a silent divert.
+        """
+        norm = normalize_ws_path(path)
+        owner = home_owner(norm)
+        if not owner:
+            return HomeResolution(norm, "not_home", "")
+        home_root = f"/Users/{owner}"
+        is_root = norm == home_root
+
+        sp_map = self.identity_map.get("sp_mapping") or {}
+        if sp_map.get(owner):
+            remapped, note = self._remap_home_path(norm)
+            if is_root:
+                return HomeResolution(
+                    remapped, "skip_root",
+                    f"SP home root — auto-provisioned when the SP was created; {note}"
+                    if note else "SP home root — auto-provisioned when the SP was created")
+            return HomeResolution(remapped, "remapped_sp", note)
+
+        if self._home_present(home_root):
+            if is_root:
+                return HomeResolution(norm, "skip_root",
+                                      "user home directory — already provisioned")
+            return HomeResolution(norm, "normal_home", "")
+
+        backup_on = bool(getattr(self.config.imports, "workspace_home_backup", False))
+        if not backup_on:
+            return HomeResolution(norm, "prerequisite", "")
+        if self._roster_status(owner) == "absent":
+            backup_path = self._backup_path(norm, owner)
+            who = "service principal" if looks_like_app_id(owner) else "user"
+            note = (f"owner ({who}) `{owner}` was deleted in source (absent from the source "
+                    f"roster) — its home cannot be recreated under /Users/; object preserved at "
+                    f"`{backup_path}`. Reassign to the intended owner if needed.")
+            return HomeResolution(backup_path, "backup", note)
+        return HomeResolution(norm, "prerequisite", "")
+
+    def require_remap(self, ref_type: str, source_id: str, referenced_by: str = "") -> str:
+        """Resolve a SOURCE object id to the TARGET object THIS TOOL created for it — exact or fail
+        loud (PLAN 11 Finding-10, the lift-and-shift rule).
+
+        The ONLY legitimate remap is `source object → the target object we recreated for it`. Never
+        substitute a different object, never silently drop the reference, never leave a dangling
+        source id. `remap_id` already returns the three outcomes that make the rule deterministic:
+          • (target_id, key)  → resolved → return it.
+          • ("", key)         → the object IS in the bundle but not yet on target (dependency order,
+                                 a deselected family, or a prior create failed) → RETRYABLE
+                                 PrerequisiteMissing that `retry_mode=failed_only` heals.
+          • ("", "")          → the object is NOT in the bundle at all (deleted on source / never
+                                 exported / out of scope) → a HARD failure; there is nothing to
+                                 remap to, and lift-and-shift does not invent a substitute.
+        `referenced_by` is folded into the message so the operator knows which asset carries the
+        reference. Returns the empty string only when `source_id` itself is blank."""
+        src = safe_str(source_id)
+        if not src:
+            return ""
+        by = f"`{referenced_by}` " if referenced_by else ""
+        target_id, key = self.remap_id(ref_type, src)
+        if target_id:
+            return target_id
+        if key:
+            raise PrerequisiteMissing(
+                f"{by}references {ref_type} `{key}` which is in the bundle but not yet created on "
+                f"target (its family is deselected, later in dependency order, or a prior create "
+                f"failed) — import that family, then re-run with retry_mode=failed_only.")
+        raise HardRemapFailure(
+            f"{by}references {ref_type} id `{src}` which is not available on source and not in this "
+            f"migration (deleted on source, never exported, or out of scope). Lift-and-shift does "
+            f"not substitute a different object — fix it on source and re-export.")
 
     def resolve_principal(self, principal: str, principal_type: str = "") -> str:
         """Map a SOURCE principal (email / appId / group name) to its TARGET equivalent.
@@ -605,8 +880,23 @@ class BaseImporter(ABC):
             return
         except Exception as exc:  # noqa: BLE001
             if is_already_exists(exc):
-                # Raced the existence check — the object exists, which is the outcome we wanted.
-                self._record(unit, ACTION_ADOPTED, target_id=safe_str(existing.get(key)),
+                # Raced the existence check (or the existence map missed it) — the object exists,
+                # which is the outcome we wanted. PLAN 11 BUG-1: this adopt path used to be a
+                # DEAD-END for a stale object — it took target_id only from the (possibly empty)
+                # existence map and NEVER updated, so a fingerprint-moved edit was silently dropped
+                # and the state row was then stamped current, defeating every later retry. Now it
+                # HEALS: resolve the real target id from the state row, and if the source fingerprint
+                # moved, update in place — mirroring the ADOPT-branch staleness check above.
+                target_id = safe_str(existing.get(key))
+                if self.state is not None and not target_id:
+                    target_id = safe_str(self.state.get_target_id(asset_type, key))
+                row = self.state.row(asset_type, key) if self.state is not None else None
+                stored_fp = safe_str((row or {}).get("last_source_fingerprint"))
+                if (target_id and asset_type not in self.declarative_asset_types
+                        and stored_fp not in ("", fingerprint)):
+                    self._do_update(unit, target_id)
+                    return
+                self._record(unit, ACTION_ADOPTED, target_id=target_id,
                              note="already existed on target (create raced the existence check) — "
                                   "adopted, not duplicated")
                 return

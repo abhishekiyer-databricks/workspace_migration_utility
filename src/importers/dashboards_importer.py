@@ -24,11 +24,17 @@ class DashboardsImporter(BaseImporter):
         return self.units_for("lakeview_dashboard")
 
     def existing_keys(self) -> dict:
-        """`{display_name: dashboard_id}` — PAGINATED (lakeview is a cursor API)."""
+        """`{source full-path: dashboard_id}` — PAGINATED (lakeview is a cursor API).
+
+        PLAN 11 Finding-9: the natural key is the full path (`<parent_path>/<display_name>`), but
+        the LIST omits parent_path, so matching goes through `folder_existing_keys` (id-anchor via
+        state + collapse-safe unique-name adoption) — two same-named dashboards in different folders
+        no longer resolve to one target.
+        """
         dashboards = self.client.get_paginated("api/2.0/lakeview/dashboards", "dashboards",
                                                params={"page_size": 100})
-        found = {safe_str(d.get("display_name")): safe_str(d.get("dashboard_id"))
-                 for d in dashboards if d.get("display_name")}
+        found = self.folder_existing_keys("lakeview_dashboard", dashboards, "display_name",
+                                          "dashboard_id")
         self.context.setdefault("lakeview_dashboard_target_ids", {}).update(found)
         return found
 
@@ -38,9 +44,10 @@ class DashboardsImporter(BaseImporter):
         # folder (a user-created dashboard belongs back in the user's directory), not the API
         # default. Only on CREATE — an update doesn't move an existing dashboard.
         parent = safe_str((unit.get("payload") or {}).get("parent_path"))
+        res = None
         if parent:
             body["parent_path"] = parent
-            self.remap_parent_path(body)
+            res = self.remap_parent_path(body)
         try:
             created = self.client.post("api/2.0/lakeview/dashboards", body)
         except Exception as exc:  # noqa: BLE001
@@ -48,6 +55,10 @@ class DashboardsImporter(BaseImporter):
             raise
         did = safe_str(created.get("dashboard_id"))
         self.context.setdefault("lakeview_dashboard_target_ids", {})[self.natural_key(unit)] = did
+        # PLAN 11 Finding-8: an orphaned owner's dashboard is preserved under the backup root as
+        # created_with_warning (parity with notebooks), never a hard prerequisite_missing failure.
+        if res is not None and res.kind == "backup":
+            return {"target_id": did, "warning": f"{res.note} {note}"}
         return {"target_id": did, "note": note}
 
     def update_one(self, unit: dict, target_id: str) -> dict:
@@ -66,19 +77,13 @@ class DashboardsImporter(BaseImporter):
         notes = []
         src_wh = safe_str(payload.get("warehouse_id"))
         if src_wh:
-            target_wh, key = self.remap_id("sql_warehouse", src_wh)
-            if not target_wh:
-                # Any warehouse beats none: a dashboard attached to a working warehouse can be
-                # re-pointed in the UI, one with a dead id shows an error on every widget.
-                target_wh = next(
-                    iter((self.context.get("sql_warehouse_target_ids") or {}).values()), "")
-                if target_wh:
-                    notes.append(f"source warehouse {src_wh!r}"
-                                 + (f" ({key!r})" if key else "")
-                                 + f" is not on target, so the dashboard was attached to an existing "
-                                   f"warehouse ({target_wh}) — re-point it if that is wrong")
-            if target_wh:
-                body["warehouse_id"] = target_wh
+            # PLAN 11 Finding-10: exact-or-fail-loud. The old "attach it to any existing warehouse"
+            # substitution made a dashboard look migrated while every widget silently queried a
+            # DIFFERENT warehouse. Now it resolves to the warehouse we recreated for the source one,
+            # or fails loud (retryable if the warehouse is in-bundle-not-yet, hard if not in bundle).
+            body["warehouse_id"] = self.require_remap(
+                "sql_warehouse", src_wh,
+                referenced_by=f"dashboard `{safe_str(payload.get('display_name'))}`")
 
         notes.append("serialized_dashboard carried verbatim. NOTE its datasets reference Unity "
                      "Catalog tables by fully-qualified name, and UC is OUT OF SCOPE for this "

@@ -179,24 +179,21 @@ class ComputeImporter(BaseImporter):
             if not isinstance(constraint, dict):
                 continue
             constraint = dict(constraint)
+            # PLAN 11 Finding-10: exact-or-fail-loud. A pinned pool id must resolve to the pool we
+            # recreated, or the policy fails (retryable if in-bundle-not-yet, hard if not in bundle)
+            # — never keep the SOURCE pool id (which rejected every cluster/job under the policy).
             for sub in ("value", "defaultValue"):
                 src = safe_str(constraint.get(sub))
-                if not src:
-                    continue
-                target_id, nk = self.remap_id("instance_pool", src)
-                if target_id:
-                    constraint[sub] = target_id
-                else:
-                    warns.append(
-                        f"cluster policy pins {key}.{sub}={src!r}"
-                        + (f" ({nk!r})" if nk else "")
-                        + " which has no target pool — clusters/jobs under this policy will fail "
-                          "validation until the pool is imported; re-run retry_mode=failed_only "
-                          "after the compute family lands.")
+                if src:
+                    constraint[sub] = self.require_remap(
+                        "instance_pool", src, referenced_by=f"cluster policy pin {key}.{sub}")
             vals = constraint.get("values")
             if isinstance(vals, list):
-                constraint["values"] = [self.remap_id("instance_pool", safe_str(v))[0] or v
-                                        for v in vals]
+                constraint["values"] = [
+                    self.require_remap("instance_pool", safe_str(v),
+                                       referenced_by=f"cluster policy pin {key}.values")
+                    if safe_str(v) else v
+                    for v in vals]
             doc[key] = constraint
         return (json.dumps(doc) if as_string else doc), warns
 
@@ -231,28 +228,18 @@ class ComputeImporter(BaseImporter):
         body = dict(payload)
         warnings: list[str] = []
 
-        # Remap through `source id → natural key → target id`. The source ids in the payload are
-        # meaningless on the target, and the natural key is the only stable link between the two.
+        # Remap through `source id → natural key → target id`. PLAN 11 Finding-10: exact-or-fail-loud
+        # — the old "drop the reference to let the cluster be created" silently changed the cluster's
+        # config. Now an unresolved pool/policy is a retryable prerequisite (in bundle, not yet on
+        # target) or a hard failure (not in bundle), never a silent drop.
         for field, ref_type in (("instance_pool_id", "instance_pool"),
                                 ("driver_instance_pool_id", "instance_pool"),
                                 ("policy_id", "cluster_policy")):
             src_id = safe_str(body.get(field))
             if not src_id:
                 continue
-            target_id, key = self.remap_id(ref_type, src_id)
-            if target_id:
-                body[field] = target_id
-                continue
-            # A dangling reference makes the create fail with an opaque id error. Dropping it yields
-            # a WORKING cluster plus an explicit warning, which is the more useful failure — and the
-            # unit is reported degraded so `retry_mode=failed_only` re-attempts it later.
-            body.pop(field, None)
-            warnings.append(
-                f"{field} pointed at source {ref_type} {src_id!r}"
-                + (f" ({key!r})" if key else ", which is not in this bundle,")
-                + " and has no target equivalent, so the reference was DROPPED to let the cluster be "
-                  "created. Import the compute family first, then re-run with "
-                  "retry_mode=failed_only to restore it.")
+            body[field] = self.require_remap(ref_type, src_id,
+                                             referenced_by=f"cluster `{self.natural_key(unit)}`")
 
         # A pool dictates the node types, so sending them alongside it is rejected outright.
         if body.get("instance_pool_id"):

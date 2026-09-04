@@ -88,7 +88,13 @@ class DltImporter(BaseImporter):
                         f"workspace family has not been imported yet.")
 
     def _remap_clusters(self, spec: dict, warnings: list) -> None:
-        """Remap policy/pool ids in each `clusters` entry; drop node types when pooled."""
+        """Remap policy/pool ids in each `clusters` entry (exact-or-fail-loud); drop node types when
+        pooled.
+
+        PLAN 11 Finding-10: the old "drop the reference to let the pipeline be created" silently
+        changed the pipeline's compute; now an unresolved pool/policy is a retryable prerequisite
+        (in bundle, not yet on target) or a hard failure (not in bundle), never a silent drop.
+        """
         for cluster in spec.get("clusters") or []:
             if not isinstance(cluster, dict):
                 continue
@@ -96,18 +102,9 @@ class DltImporter(BaseImporter):
                                     ("instance_pool_id", "instance_pool"),
                                     ("driver_instance_pool_id", "instance_pool")):
                 src = safe_str(cluster.get(field))
-                if not src:
-                    continue
-                target_id, key = self.remap_id(ref_type, src)
-                if target_id:
-                    cluster[field] = target_id
-                else:
-                    cluster.pop(field, None)
-                    warnings.append(
-                        f"a pipeline cluster's {field} pointed at source {ref_type} {src!r}"
-                        + (f" ({key!r})" if key else "")
-                        + " with no target equivalent, so the reference was dropped to let the "
-                          "pipeline be created.")
+                if src:
+                    cluster[field] = self.require_remap(
+                        ref_type, src, referenced_by=f"pipeline `{safe_str(spec.get('name'))}` cluster")
             if cluster.get("instance_pool_id"):
                 for field in ("node_type_id", "driver_node_type_id", "enable_elastic_disk"):
                     cluster.pop(field, None)
