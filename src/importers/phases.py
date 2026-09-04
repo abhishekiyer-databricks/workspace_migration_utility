@@ -22,7 +22,16 @@ from __future__ import annotations
 from typing import Optional
 
 # Phase order (Plan 3 §6). The tuple order IS the execution order.
-PHASE_ORDER = ("identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
+#
+# PLAN 11 (Finding-10 follow-up): sql + dlt run BEFORE jobs. A job task can trigger a SQL warehouse
+# (`sql_task.warehouse_id`), a DLT pipeline (`pipeline_task.pipeline_id`) or another job
+# (`run_job_task.job_id`) — i.e. jobs DEPEND on sql and dlt, never the reverse (a warehouse/pipeline
+# never references a job). With jobs after sql+dlt, those references resolve on the FIRST pass
+# instead of erroring as a (retryable) prerequisite and healing only on a retry run. Job→job
+# (`run_job_task`) is intra-phase and still resolves on the first pass when the referenced job is
+# earlier in the bundle, else on `retry_mode=failed_only` — we do not topologically sort within the
+# jobs phase.
+PHASE_ORDER = ("identity", "compute", "workspace", "secrets", "sql", "dlt", "jobs",
                "dashboards", "genie", "serving", "misc", "acls")
 
 # family → the families it needs, either selected in THIS session or already in the state table.

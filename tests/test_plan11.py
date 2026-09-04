@@ -136,6 +136,20 @@ def test_create_race_adopt_stays_adopt_when_fingerprint_unchanged():
     assert res.adopted == 1
 
 
+# ═══════════════════════════ Finding-10 — phase order: sql+dlt before jobs ══════════════════
+
+def test_sql_and_dlt_run_before_jobs():
+    """PLAN 11 Finding-10 follow-up: jobs DEPEND on sql/dlt (sql_task.warehouse_id,
+    pipeline_task.pipeline_id) — never the reverse — so sql and dlt must be created BEFORE jobs, so
+    those references resolve on the first pass instead of a retryable prerequisite."""
+    from src.importers.phases import PHASE_ORDER
+    assert PHASE_ORDER.index("sql") < PHASE_ORDER.index("jobs")
+    assert PHASE_ORDER.index("dlt") < PHASE_ORDER.index("jobs")
+    # dlt still needs sql (warehouse refs); identity first, acls last.
+    assert PHASE_ORDER.index("sql") < PHASE_ORDER.index("dlt")
+    assert PHASE_ORDER[0] == "identity" and PHASE_ORDER[-1] == "acls"
+
+
 # ═══════════════════════════ Finding-10 — jobs task references ══════════════════════════════
 
 def _job(tasks):
