@@ -498,7 +498,10 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         current_run = safe_str(summary.get("run_id"))
         osheet = wb.create_sheet("Outstanding")
         osheet.sheet_view.showGridLines = False
-        _oa_counts = {"failed": 0, "created_with_warning": 0, "manual": 0, "skipped_no_object": 0}
+        # Scoped to genuine PROBLEMS only (customer 2026-09-04): failed + created_with_warning. The
+        # state query (OUTSTANDING_ACTIONS) already excludes manual + skipped_no_object noise, but
+        # count defensively here too so the banner never mislabels.
+        _oa_counts = {"failed": 0, "created_with_warning": 0}
         for r in outstanding:
             a = safe_str(r.get("last_action"))
             if a in _oa_counts:
@@ -507,8 +510,7 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         osheet.merge_cells("A1:I1")
         c = osheet["A1"]
         c.value = (f"{total_out} outstanding: {_oa_counts['failed']} failed, "
-                   f"{_oa_counts['created_with_warning']} warning, {_oa_counts['manual']} manual, "
-                   f"{_oa_counts['skipped_no_object']} skipped_no_object")
+                   f"{_oa_counts['created_with_warning']} created-with-warning")
         c.font = font(bold=True, color="FFFFFF", size=12)
         c.fill = fill("B91C1C" if _oa_counts["failed"] else "1E3A5F")
         c.alignment = centre
@@ -516,16 +518,17 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         osheet.merge_cells("A2:I2")
         legend = osheet["A2"]
         legend.value = (
-            "Cumulative outstanding items from the migration state table across ALL runs for this "
-            "workspace pair — everything not yet successfully migrated. failed = create/update "
-            "errored; created_with_warning = created but degraded (fix the prerequisite + re-run); "
-            "manual = must be done by hand (AKV scope, legacy alert/dashboard, workspace-local SP "
-            "secret, repos); skipped_no_object = a declarative unit whose target object isn't present "
-            "yet. Excludes items that are up-to-date (skipped/created/updated/adopted) and deferred "
-            "families (not_selected). Deletes are listed on the Summary sheet.")
+            "Cumulative PROBLEMS from the migration state table across ALL runs for this workspace "
+            "pair — items that FAILED or were created-but-DEGRADED and still need a fix. failed = "
+            "create/update errored; created_with_warning = created but a reference could not be "
+            "fully resolved (fix the prerequisite + re-run with retry_mode=failed_only). Deliberately "
+            "EXCLUDES routine by-design items so this stays scannable: manual steps (AKV scope, "
+            "repos, secret values — see the Manual table + runbook), skipped_no_object ACLs (see the "
+            "ACL sheet), up-to-date items (skipped/created/updated/adopted), deferred families "
+            "(not_selected), and deletes (Summary sheet).")
         legend.font = font(italic=True, color="475569", size=9)
         legend.alignment = left_wrap
-        osheet.row_dimensions[2].height = 54
+        osheet.row_dimensions[2].height = 66
         ocols = [("Asset Type", "asset_type", 24), ("Natural Key", "natural_key", 56),
                  ("Status", "last_action", 20), ("Origin", "_origin", 16),
                  ("Failure Category", "failure_category", 20), ("Last Error", "last_error", 70),

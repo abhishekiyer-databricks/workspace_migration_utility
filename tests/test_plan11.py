@@ -294,22 +294,45 @@ def _render(rows, outstanding=None, deleted=None, run_id="RUN-2"):
 
 def test_outstanding_sheet_is_driven_from_state_with_origin_column():
     """Finding-4: a cumulative Outstanding sheet, sourced from the state table (not this run's
-    units), with an Origin column (new this run vs carried over) and the totals banner."""
+    units), with an Origin column (new this run vs carried over) and the totals banner. Scoped to
+    genuine problems (failed + created_with_warning) — customer 2026-09-04."""
     outstanding = [
         {"asset_type": "job", "natural_key": "j1", "last_action": "failed",
          "failure_category": "api_error", "last_error": "boom", "last_run_id": "RUN-2",
          "first_seen": "t0", "last_seen": "t2"},
-        {"asset_type": "cluster_library", "natural_key": "c:lib", "last_action": "manual",
-         "failure_category": "", "last_error": "hand-install", "last_run_id": "RUN-1",
+        {"asset_type": "dlt_pipeline", "natural_key": "p1", "last_action": "created_with_warning",
+         "failure_category": "", "last_error": "degraded ref", "last_run_id": "RUN-1",
          "first_seen": "t0", "last_seen": "t1"},
     ]
     wb = _render([], outstanding=outstanding)
     assert "Outstanding" in wb.sheetnames
     ws = wb["Outstanding"]
     text = "\n".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
-    assert "2 outstanding" in text and "1 failed" in text and "1 manual" in text
+    assert "2 outstanding" in text and "1 failed" in text and "created-with-warning" in text
+    assert "manual" not in text.lower().split("legend")[0][:120]  # not in the banner
     assert "new this run" in text and "carried over" in text
-    assert "j1" in text and "c:lib" in text
+    assert "j1" in text and "p1" in text
+
+
+def test_outstanding_state_query_excludes_manual_and_skipped_no_object():
+    """Finding-4 (trimmed): the state-table Outstanding query returns only failed +
+    created_with_warning — manual, skipped_no_object, not_selected, skipped are NOT outstanding
+    problems (they made the sheet unreadable)."""
+    import tempfile
+    cfg = Config.from_dict({"role": "target", "source_workspace_id": "111", "run_id": "r",
+                            "target_staging_location": tempfile.mkdtemp(), "dry_run": False,
+                            "imports": {"state_catalog": "c", "state_schema": "s"}})
+    st = StateStore(FakeBackend(), cfg)
+    st.ensure_table(); st.load()
+    st.record("job", "j1", action="failed", fingerprint="f")
+    st.record("dlt_pipeline", "p1", action="created_with_warning", fingerprint="f")
+    st.record("secret_value", "s1", action="manual", fingerprint="f")
+    st.record("acl", "clusters:etl", action="skipped_no_object", fingerprint="f")
+    st.record("cluster", "c1", action="skipped", fingerprint="f")
+    st.flush(); st.load(force=True)
+    keys = {(r["asset_type"], r["natural_key"]) for r in st.outstanding_rows()}
+    assert keys == {("job", "j1"), ("dlt_pipeline", "p1")}, \
+        "only failed + created_with_warning are outstanding problems"
 
 
 def test_deleted_in_source_shows_inline_on_the_asset_type_tab():

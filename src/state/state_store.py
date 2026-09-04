@@ -75,12 +75,15 @@ LAST_ACTIONS = frozenset({
     ACTION_DELETED_IN_SOURCE,
 })
 
-# The `last_action` values that mean "NOT yet successfully migrated" — the cumulative Outstanding
-# view (PLAN 11 Finding-4). `not_selected` is deliberately EXCLUDED (a deferred family is a choice,
-# not outstanding work); `deleted_in_source` has its own section; everything else here is a real
-# item an operator must still resolve.
+# The `last_action` values that mean "went wrong / needs a fix" — the cumulative Outstanding view
+# (PLAN 11 Finding-4). Scoped to genuine PROBLEMS (customer 2026-09-04): `failed` and
+# `created_with_warning` (created-but-degraded → fix the prerequisite + re-run). Deliberately
+# EXCLUDES the noise that made the sheet unreadable: `manual` (by-design human steps — AKV scope,
+# repos, secret values; covered by the Manual table + runbook) and `skipped_no_object` (declarative
+# ACLs whose object isn't present yet — covered by the ACL sheet). `not_selected` (deferred family)
+# and `deleted_in_source` (its own section) are excluded too.
 OUTSTANDING_ACTIONS = frozenset({
-    ACTION_FAILED, ACTION_CREATED_WITH_WARNING, ACTION_MANUAL, ACTION_SKIPPED_NO_OBJECT,
+    ACTION_FAILED, ACTION_CREATED_WITH_WARNING,
 })
 
 # Which `last_action` values each retry_mode picks up (D22).
